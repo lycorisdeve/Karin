@@ -9,14 +9,24 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 .pnpm-debug.log*
+*.log
+
+# 包管理器缓存
+.pnpm-store/
 
 # 编辑器配置
 /.idea/
 /.vscode/
+*.suo
+*.sw?
+*~
 
 # 临时文件
 logs/
 /temp/
+*.tmp
+*.temp
+*.bak
 packages/core/guide/api/types/
 
 # 配置
@@ -25,6 +35,8 @@ packages/core/plugins
 /config/
 /resources
 @karinjs
+.env.local
+.env.*.local
 
 # 依赖
 node_modules/
@@ -42,8 +54,27 @@ modules.d.ts
 /packages/types/index.d.ts
 /web
 
-#macos 文件
+# 测试与覆盖率
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+blob-report/
+
+# 工具缓存
+.cache/
+.vite/
+.turbo/
+.nx/
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+
+# 操作系统文件
 .DS_Store
+._*
+Thumbs.db
+Desktop.ini
 
 !packages/core/src/server/api/plugins
 .windsurfrules

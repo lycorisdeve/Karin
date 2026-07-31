@@ -33,3 +33,9 @@ bun.lockb
 
 !src/*
 !src/pages/dashboard/plugins
+
+# Keep OS metadata ignored after the source-directory exceptions above.
+src/.DS_Store
+src/._*
+src/Thumbs.db
+src/Desktop.ini
