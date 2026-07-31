@@ -40,6 +40,7 @@ import UpdateLogModal from '@/components/UpdateLogModal'
 import { Chip } from '@heroui/chip'
 import { Code } from '@heroui/code'
 import { FullScreenLoader } from '@/components/FullScreenLoader'
+import { useTheme } from '@/hooks/use-theme'
 
 interface IconMap {
   [key: string]: LucideIcon
@@ -197,6 +198,8 @@ interface StatusProps {
 }
 
 function Status ({ statusData, statusError, onGlobalUpdateStart, onGlobalUpdateEnd }: StatusProps) {
+  const { activeTheme } = useTheme()
+  const isClassic = activeTheme.id === 'karin-classic'
   const [isChangelogOpen, setIsChangelogOpen] = useState(false)
   const [updateTip, setUpdateTip] = useState(false)
   // 修复：使用useRef存储函数，避免每次创建新函数
@@ -315,12 +318,17 @@ function Status ({ statusData, statusError, onGlobalUpdateStart, onGlobalUpdateE
                 size='sm'
                 radius='sm'
                 classNames={{
-                  base: 'bg-gradient-to-br from-red-400 to-rose-500 border-small border-white/50 shadow-rose-500/30 select-none animate-shimmer relative overflow-hidden before:absolute before:inset-0 before:-translate-x-full before:animate-[shimmer_2s_infinite] before:bg-gradient-to-r before:from-transparent before:via-white/20 before:to-transparent flex-shrink-0',
-                  content: 'drop-shadow shadow-black text-white',
+                  base: isClassic
+                    ? 'bg-gradient-to-br from-red-400 to-rose-500 border-small border-white/50 shadow-rose-500/30 select-none animate-shimmer relative overflow-hidden before:absolute before:inset-0 before:-translate-x-full before:animate-[shimmer_2s_infinite] before:bg-gradient-to-r before:from-transparent before:via-white/20 before:to-transparent flex-shrink-0'
+                    : 'border border-danger/25 bg-danger/10 text-danger select-none flex-shrink-0',
+                  content: isClassic ? 'drop-shadow shadow-black text-white' : 'text-danger',
                 }}
                 startContent={
-                  <GrUpgrade
-                    className='text-white mt-[3px] w-3 h-3 animate-bounce'
+                  <GrUpgrade className={
+                    isClassic
+                      ? 'text-white mt-[3px] w-3 h-3 animate-bounce'
+                      : 'mt-[3px] size-3'
+                  }
                   />
                 }
                 variant='shadow'
@@ -333,7 +341,15 @@ function Status ({ statusData, statusError, onGlobalUpdateStart, onGlobalUpdateE
         )}
       </div>
     )
-  }, [data?.version, updateTip, npmLatest, shouldAnimate, animationDuration, handleTooltipClick])
+  }, [
+    data?.version,
+    updateTip,
+    npmLatest,
+    shouldAnimate,
+    animationDuration,
+    handleTooltipClick,
+    isClassic,
+  ])
 
   const stableCards = useMemo(() => {
     if (!data) return <></>
@@ -416,6 +432,8 @@ function SystemStatusCard () {
 }
 
 export default function IndexPage () {
+  const { activeTheme } = useTheme()
+  const isClassic = activeTheme.id === 'karin-classic'
   const { data, error } = useRequest(() => getKarinStatusRequest(), {
     pollingInterval: 1000,
   })
@@ -424,23 +442,42 @@ export default function IndexPage () {
 
   // 使用useMemo缓存不变的部分
   // 静态标题内容，只渲染一次
-  const staticHeaderContent = useMemo(() => (
-    <div>
-      <SplitText
-        text='Hello, Karin !'
-        className='text-4xl font-semibold text-center tracking-wider'
-        delay={100}
-        duration={0.6}
-        ease='power3.out'
-        splitType='chars'
-        from={{ opacity: 0, y: 40 }}
-        to={{ opacity: 1, y: 0 }}
-        threshold={0.1}
-        rootMargin='-100px'
-        textAlign='center'
-      />
-    </div>
-  ), [])
+  const staticHeaderContent = useMemo(() => isClassic
+    ? (
+      <div>
+        <SplitText
+          text='Hello, Karin !'
+          className='text-4xl font-semibold text-center tracking-wider'
+          delay={100}
+          duration={0.6}
+          ease='power3.out'
+          splitType='chars'
+          from={{ opacity: 0, y: 40 }}
+          to={{ opacity: 1, y: 0 }}
+          threshold={0.1}
+          rootMargin='-100px'
+          textAlign='center'
+        />
+      </div>
+    )
+    : (
+      <div className='relative overflow-hidden rounded-2xl border border-primary/20 bg-[#091419] px-5 py-6 text-white md:px-7'>
+        <div className='absolute inset-y-0 left-0 w-1 bg-primary' />
+        <div className='font-mono text-[10px] uppercase tracking-[0.22em] text-primary-300'>
+          Karin Signal Console
+        </div>
+        <h1 className='mt-2 text-2xl font-semibold tracking-tight md:text-3xl'>
+          系统运行态势
+        </h1>
+        <p className='mt-2 max-w-2xl text-sm leading-6 text-slate-300'>
+          在一个工作台中观察机器人、插件、网络与 Agent 的实时状态。
+        </p>
+        <div className='mt-5 flex items-center gap-2 text-xs text-slate-400'>
+          <span className='signal-pulse size-2 rounded-full bg-primary' />
+          实时信号已连接
+        </div>
+      </div>
+    ), [isClassic])
 
   // 动态控制按钮，根据数据更新
   const dynamicControlButtons = useMemo(() => (
@@ -457,14 +494,17 @@ export default function IndexPage () {
       {isGlobalUpdating && <FullScreenLoader />}
 
       <section className='flex flex-col gap-4'>
-        <Card shadow='sm'>
-          <CardHeader className='px-6 pt-6 pb-0'>
+        <Card
+          shadow={isClassic ? 'sm' : 'none'}
+          className={isClassic ? undefined : 'border border-border bg-card'}
+        >
+          <CardHeader className={isClassic ? 'px-6 pt-6 pb-0' : 'px-4 pt-4 pb-0 md:px-5 md:pt-5'}>
             <div className='flex flex-col flex-grow gap-4'>
               {staticHeaderContent}
               {dynamicControlButtons}
             </div>
           </CardHeader>
-          <CardBody className='px-6 py-6'>
+          <CardBody className={isClassic ? 'px-6 py-6' : 'px-4 py-5 md:px-5'}>
             <Status
               statusData={data}
               statusError={error}
@@ -671,10 +711,17 @@ export interface StatusItemProps {
 }
 
 function StatusItem ({ title, value }: StatusItemProps) {
+  const { activeTheme } = useTheme()
+  const isClassic = activeTheme.id === 'karin-classic'
   const IconComponent = iconMap[title] || Tag
   return (
     <Card
-      className='ease-in-out border cursor-pointer glass-effect active:scale-95 transition-transform relative'
+      shadow={isClassic ? undefined : 'none'}
+      className={
+        isClassic
+          ? 'ease-in-out border cursor-pointer glass-effect active:scale-95 transition-transform relative'
+          : 'relative border border-border bg-card'
+      }
     >
       <CardHeader className='px-2.5 py-1.5 md:px-2.5 md:py-2 lg:px-4 lg:py-3 flex-col items-start'>
         <div className='flex items-center gap-2'>

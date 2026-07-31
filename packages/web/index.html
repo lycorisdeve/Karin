@@ -14,6 +14,23 @@
     content="viewport-fit=cover, width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0"
     name="viewport" />
   <link href="/favicon.ico" rel="icon" />
+  <script>
+    try {
+      const cached = JSON.parse(localStorage.getItem('karin-webui-appearance') || 'null')
+      const theme = cached?.themes?.find(item => item.id === cached.activeThemeId)
+      const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+      const resolved = cached?.mode === 'dark' || (cached?.mode === 'system' && systemDark)
+        ? 'dark'
+        : 'light'
+      document.documentElement.classList.add(resolved)
+      document.documentElement.dataset.skin = theme?.skin || 'bloom'
+      document.documentElement.dataset.themeId = theme?.id || 'karin-bloom'
+      document.documentElement.dataset.density = theme?.density || 'comfortable'
+    } catch {
+      document.documentElement.classList.add('light')
+      document.documentElement.dataset.skin = 'bloom'
+    }
+  </script>
 </head>
 
 <body>

@@ -1,443 +1,282 @@
 import clsx from 'clsx'
-import { Icon } from './ui/icon'
 import toast from 'react-hot-toast'
-import { Button } from '@heroui/button'
-import { IoMenu } from 'react-icons/io5'
-import { LuLogIn } from 'react-icons/lu'
-import { Spinner } from '@heroui/spinner'
-import { useTheme } from '@/hooks/use-theme'
-import { FaChevronRight } from 'react-icons/fa6'
-import { useMediaQuery } from 'react-responsive'
-import { Moon, Sun } from 'lucide-react'
-import { RiMenuUnfold2Line, RiRefreshLine } from 'react-icons/ri'
-import { ScrollShadow } from '@heroui/scroll-shadow'
-import { Fragment, useState, useEffect, useCallback } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
-import { initSiteConfig, SiteConfigType, defaultSiteConfig } from '@/config/site'
+import { useCallback, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import TextPressure from './TextPressure'
+import { useMediaQuery } from 'react-responsive'
+import {
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  LogOut,
+  Moon,
+  RefreshCw,
+  Sun,
+  X,
+} from 'lucide-react'
+import { Icon } from './ui/icon'
+import { useTheme } from '@/hooks/use-theme'
+import { initSiteConfig, type SiteConfigType, defaultSiteConfig } from '@/config/site'
 import useDialog from '@/hooks/use-dialog'
+import ClassicSidebar from './sidebar-classic'
 
-const menuItemVariants = {
-  hidden: {
-    opacity: 0,
-    x: -20,
-  },
-  visible: {
-    opacity: 1,
-    x: 0,
-    transition: {
-      duration: 0.2,
-    },
-  },
-  exit: {
-    opacity: 0,
-    x: -20,
-    transition: {
-      duration: 0.2,
-    },
-  },
-}
-
-const subMenuVariants = {
-  hidden: {
-    height: 0,
-    opacity: 0,
-  },
-  visible: {
-    height: 'auto',
-    opacity: 1,
-    transition: {
-      type: 'tween',
-      ease: [0.00, 0.00, 0.00, 1.00],
-      duration: 0.3,
-    },
-  },
-}
-
-export interface MenuButtonProps {
-  isCollapsed: boolean
-  children: React.ReactNode
-}
 interface SidebarProps {
   isOpen: boolean
   onToggle: () => void
 }
 
-export default function Sidebar ({ isOpen, onToggle }: SidebarProps) {
-  const isNotSmallScreen = useMediaQuery({ minWidth: 768 })
-  const [expandedMenu, setExpandedMenu] = useState<string | null>(null)
-  const [pluginsLoading, setPluginsLoading] = useState(true)
-  const [isCollapsed, setIsCollapsed] = useState(false)
-  const [siteConfigState, setSiteConfigState] = useState<SiteConfigType>({ ...defaultSiteConfig })
+function BloomSidebar ({ isOpen, onToggle }: SidebarProps) {
+  const desktop = useMediaQuery({ minWidth: 768 })
   const location = useLocation()
   const navigate = useNavigate()
-  const { toggleTheme, isDark } = useTheme()
   const dialog = useDialog()
+  const { toggleTheme, isDark } = useTheme()
+  const [collapsed, setCollapsed] = useState(
+    () => window.localStorage.getItem('karin-sidebar-collapsed') === 'true'
+  )
+  const [expanded, setExpanded] = useState<string | null>('/agent')
+  const [loading, setLoading] = useState(false)
+  const [config, setConfig] = useState<SiteConfigType>({ ...defaultSiteConfig })
 
-  /** 加载插件列表 */
-  const loadPlugins = useCallback(async (isRefresh = false) => {
-    setPluginsLoading(true)
+  const load = useCallback(async (refresh = false) => {
+    setLoading(true)
     try {
-      const updatedConfig = await initSiteConfig(isRefresh)
-      setSiteConfigState(updatedConfig)
-      if (isRefresh) {
-        toast.success('插件列表刷新成功')
-      }
+      setConfig(await initSiteConfig(refresh))
+      if (refresh) toast.success('插件列表已刷新')
     } catch (error) {
-      toast.error('加载插件列表失败')
+      toast.error('插件列表加载失败')
       console.error(error)
     } finally {
-      setPluginsLoading(false)
+      setLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    loadPlugins()
-  }, [loadPlugins])
+    load()
+  }, [load])
 
   useEffect(() => {
-    siteConfigState.navItems.forEach((item) => {
-      // 检查一级菜单
-      if (location.pathname === item.href) {
-        setExpandedMenu(item.href)
-        return
-      }
+    const active = config.navItems.find(item =>
+      location.pathname === item.href ||
+      (item.href !== '/' && location.pathname.startsWith(`${item.href}/`)) ||
+      item.children?.some(child =>
+        location.pathname === child.href ||
+        (!child.href.startsWith('/agent/') && location.pathname.includes(child.id))
+      )
+    )
+    if (active?.children?.length) setExpanded(active.href)
+  }, [config.navItems, location.pathname])
 
-      // 检查二级菜单
-      if (item.children?.some(child => location.pathname === child.href || location.pathname.includes(child.id))) {
-        setExpandedMenu(item.href)
-      }
-    })
-  }, [location.pathname, siteConfigState])
+  const go = (href: string) => {
+    navigate(href)
+    if (!desktop) onToggle()
+  }
 
-  /** 退出登录 */
-  const signOut = async () => {
+  const signOut = () => {
     dialog.confirm({
-      title: '注销',
-      content: '确认注销此次登录吗？注销后需要重新登录',
+      title: '退出登录',
+      content: '退出后需要重新登录 Karin WebUI。',
       onConfirm: async () => {
-        try {
-          localStorage.removeItem('userId')
-          localStorage.removeItem('accessToken')
-          localStorage.removeItem('refreshToken')
-          toast.success('退出登录成功！')
-          navigate('/login')
-        } catch (e) {
-          toast.error('退出登录失败！')
-        }
+        localStorage.removeItem('userId')
+        localStorage.removeItem('accessToken')
+        localStorage.removeItem('refreshToken')
+        navigate('/login')
       },
     })
   }
 
+  if (!isOpen && !desktop) return null
+
   return (
     <>
-      <motion.div
-        className={clsx(
-          'overflow-hidden fixed top-0 left-0 h-full z-50',
-          'md:static',
-          'bg-neutral-200 dark:bg-neutral-800',
-          'rounded-r-md md:rounded-none'
-        )}
-        initial={{ width: 0 }}
-        animate={{ width: isOpen ? (isNotSmallScreen && isCollapsed ? 72 : 240) : 0 }}
-        transition={{
-          type: 'tween',
-          duration: 0.3,
-          ease: [0.00, 0.00, 0.00, 1.00],
-        }}
-        style={{ overflow: 'hidden' }}
-      >
-        <motion.div
-          className={clsx(
-            'h-full bg-neutral-100 dark:bg-neutral-800',
-            'flex flex-col gap-6 overflow-hidden pt-4 touch-none'
-          )}
-          onTouchStart={(e) => e.stopPropagation()} // 阻止事件冒泡
-        >
-          {/* Logo 相关代码 */}
-          {!isCollapsed && (
-            <div style={{ position: 'relative' }}>
-              <TextPressure
-                text='Karin!'
-                alpha={false}
-                stroke={false}
-                weight
-                italic
-                strokeColor='#ff0000'
-              />
-            </div>
-          )}
-
-          {/* 导航菜单 */}
-          <div
-            className={clsx(
-              'flex-1 p-2 pt-[1px] flex flex-col gap-2 overflow-y-auto hide-scrollbar',
-              isCollapsed ? 'px-1' : 'px-4'
-            )}
-          >
-            <ScrollShadow hideScrollBar>
-              <AnimatePresence>
-                {siteConfigState.navItems.map((item, index) => (
-                  <motion.div
-                    key={item.href}
-                    variants={menuItemVariants}
-                    initial='hidden'
-                    animate='visible'
-                    exit='exit'
-                    transition={{ delay: index * 0.05 }}
-                  >
-                    <div
-                      className={clsx(
-                        'mb-2 my-1 block text-default-600 hover:text-primary rounded-xl transition-all cursor-default md:cursor-pointer group',
-                        isCollapsed ? 'mx-auto' : 'mx-1',
-                        {
-                          '!text-primary font-medium': (() => {
-                            // 检查一级菜单直接匹配
-                            if (location.pathname === item.href) return true
-                            if (item.children?.some(child => location.pathname === child.href || location.pathname.includes(child.id))) return true
-                            return false
-                          })(),
-                        }
-                      )}
-                    >
-                      <motion.div
-                        className={clsx(
-                          'flex items-center overflow-hidden relative',
-                          isCollapsed ? 'justify-center py-1.5' : 'justify-between py-2.5' // 改为justify-between
-                        )}
-                        initial={{
-                          paddingLeft: isCollapsed ? 0 : 16,
-                          paddingRight: isCollapsed ? 0 : 16,
-                        }}
-                        animate={{
-                          paddingLeft: isCollapsed ? 0 : 16,
-                          paddingRight: isCollapsed ? 0 : 16,
-                        }}
-                        whileHover={{ x: isCollapsed ? 0 : 4 }}
-                        onClick={() => {
-                          navigate(item.href)
-                        }}
-                      >
-                        {/* 左侧图标和标题区域 */}
-                        <div className='flex items-center gap-4'>
-                          <motion.div
-                            className='relative z-10'
-                            initial={{
-                              fontSize: isCollapsed ? '1.875rem' : '1.625rem',
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                            }}
-                            animate={{
-                              fontSize: isCollapsed ? '1.875rem' : '1.625rem',
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                            }}
-                            transition={{
-                              type: 'spring',
-                              stiffness: 300,
-                              damping: 25,
-                              duration: 0.3,
-                            }}
-                            whileHover={{ scale: 1.1 }}
-                          >
-                            <item.Icon />
-                          </motion.div>
-
-                          {!isCollapsed && (
-                            <motion.div
-                              className='whitespace-nowrap overflow-hidden text-base relative z-10 flex items-center gap-2'
-                            >
-                              <span className='select-none '>{item.label}</span>
-                              {item.href === '/plugins-dashboard' && pluginsLoading && (
-                                <Spinner className='w-10 h-4 text-primary' variant='wave' size='md' />
-                              )}
-                            </motion.div>
-                          )}
-                        </div>
-
-                        {/* 右侧箭头区域 */}
-                        {!isCollapsed && item.children && (
-                          <motion.div
-                            initial={{ rotate: 0 }}
-                            animate={{ rotate: expandedMenu === item.href ? 90 : 0 }}
-                            transition={{ duration: 0.2 }}
-                            onClick={(e) => {
-                              e.stopPropagation() // 阻止冒泡，避免触发父元素的点击
-                              setExpandedMenu(expandedMenu === item.href ? null : item.href)
-                            }}
-                            className='cursor-pointer p-1'
-                          >
-                            <FaChevronRight className='w-2.5 h-2.5' />
-                          </motion.div>
-                        )}
-                      </motion.div>
-
-                      {/* 子菜单 - 只在展开时显示 */}
-                      {item.children && !isCollapsed && (
-                        <AnimatePresence>
-                          {expandedMenu === item.href && (
-                            <motion.div
-                              variants={subMenuVariants}
-                              initial='hidden'
-                              animate='visible'
-                              exit='hidden'
-                              className='overflow-hidden mx-2'
-                            >
-                              {/* 刷新按钮 - 仅在插件管理中显示 */}
-                              {item.href === '/plugins-dashboard' && (
-                                <Button
-                                  variant='light'
-                                  size='sm'
-                                  fullWidth
-                                  className='flex items-center justify-start gap-3 py-2 px-3 mb-2 text-sm text-default-600 hover:text-primary transition-transform hover:-translate-y-[2px]'
-                                  isDisabled={pluginsLoading}
-                                  onPress={() => loadPlugins(true)}
-                                >
-                                  <div className='flex items-center gap-3'>
-                                    <RiRefreshLine
-                                      className={clsx('w-4 h-4 flex-shrink-0',
-                                        pluginsLoading ? 'animate-spin text-primary' : ''
-                                      )}
-                                    />
-                                    <span>刷新插件列表</span>
-                                  </div>
-                                </Button>
-                              )}
-
-                              {pluginsLoading && item.href === '/plugins-dashboard'
-                                ? (
-                                  <div className='flex items-center justify-center py-4'>
-                                    <Spinner className='w-2 h-4 text-primary' variant='dots' size='lg' />
-                                  </div>
-                                )
-                                : (
-                                  (item.href === '/plugins-dashboard'
-                                    ? [...item.children].sort((a, b) =>
-                                      (a.label || a.id).localeCompare(b.label || b.id))
-                                    : item.children)
-                                    .map((child) => (
-                                      <Fragment key={child.id}>
-                                        <Button
-                                          variant='light'
-                                          fullWidth
-                                          className={clsx(
-                                            'flex items-center justify-start gap-3 py-2 px-3 mb-2 text-sm text-default-600 hover:text-primary',
-                                            'transition-transform hover:-translate-y-[2px]',
-                                            {
-                                              '!text-primary glass-effect': location.pathname === child.href || location.pathname.includes(child.id),
-                                            }
-                                          )}
-                                          onPress={() => {
-                                            if (child.kind === 'route') {
-                                              navigate(child.href)
-                                            } else if (child.hasConfig) {
-                                              /** 增加小延迟提供更好的视觉反馈 */
-                                              setTimeout(() => {
-                                                navigate(`/plugins/config?name=${child.id}`)
-                                              }, 150)
-                                            } else {
-                                              toast.error(`插件 "${child.label || child.id}" 暂未提供可配置选项`)
-                                            }
-                                          }}
-                                        >
-                                          <div className='flex items-center gap-3'>
-                                            {child.Icon && <child.Icon className='h-4 w-4 flex-shrink-0' />}
-                                            {child.icon && <Icon name={child.icon.name || ''} size={child.icon.size || 20} color={child.icon.color || 'currentColor'} className='flex-shrink-0' />}
-                                            <span>{child.label || child.id}</span>
-                                          </div>
-                                        </Button>
-                                      </Fragment>
-                                    ))
-                                )}
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
-                      )}
-                    </div>
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-            </ScrollShadow>
-          </div>
-
-          {/* 底部按钮 */}
-          <div className={clsx(
-            'flex-grow-0 flex-shrink-0 py-2 mb-2 flex flex-col gap-4',
-            isCollapsed ? 'px-2 items-center' : 'px-4'
-          )}
-          >
-            {/* PC端折叠按钮 - 添加蓝色主题 */}
-            {isNotSmallScreen && (
-              <Button
-                variant='light'
-                color='primary'
-                radius='full'
-                className='w-full flex items-center justify-center gap-2 glass-effect'
-                isIconOnly={isCollapsed}
-                onPress={() => setIsCollapsed(!isCollapsed)}
-              >
-                {isCollapsed
-                  ? <RiMenuUnfold2Line className='w-5 h-5' />
-                  : (
-                    <>
-                      <IoMenu className='w-5 h-5' />
-                      <span>收起侧边栏</span>
-                    </>
-                  )}
-              </Button>
-            )}
-
-            {/* 主题切换按钮 - 使用自定义Button实现 */}
-            <Button
-              startContent={
-                !isDark
-                  ? <Moon className='w-5 h-5' />
-                  : <Sun className='w-5 h-5' />
-              }
-              radius='full'
-              variant='light'
-              color='primary'
-              className='w-full flex items-center justify-center gap-2 glass-effect'
-              isIconOnly={isCollapsed}
-              onPress={toggleTheme}
-            >
-              {!isCollapsed && (
-                !isDark
-                  ? '深色模式'
-                  : '浅色模式'
-              )}
-            </Button>
-
-            {/* 退出登录按钮 */}
-            <Button
-              startContent={<LuLogIn className='w-5 h-5' />}
-              radius='full'
-              variant='light'
-              color='primary'
-              className='w-full flex items-center justify-center gap-2 glass-effect'
-              isIconOnly={isCollapsed}
-              onPress={signOut}
-            >
-              {!isCollapsed && '退出登录'}
-            </Button>
-          </div>
-        </motion.div>
-      </motion.div>
-
-      {/* 移动端遮罩层 */}
-      {!isNotSmallScreen && isOpen && (
-        <motion.div
-          className='z-[49] fixed inset-0 touch-none'
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={{ duration: 0.2 }}
+      {!desktop && (
+        <button
+          aria-label='关闭导航'
+          className='fixed inset-0 z-40 bg-[#28232d]/25 backdrop-blur-[2px]'
           onClick={onToggle}
         />
       )}
+      <aside
+        className={clsx(
+          'karin-sidebar bloom-sidebar z-50 flex shrink-0 flex-col border border-border bg-card/90 shadow-[0_18px_55px_rgba(66,45,83,0.09)] backdrop-blur-xl',
+          'transition-[width,transform,margin] duration-150 motion-reduce:transition-none',
+          desktop ? 'relative m-3 mr-0 h-[calc(100dvh-1.5rem)] rounded-[24px]' : 'fixed inset-y-0 left-0 h-[100dvh] rounded-r-[24px] shadow-2xl',
+          collapsed && desktop ? 'w-[76px]' : 'w-[252px]',
+          !isOpen && desktop && '-ml-[252px]'
+        )}
+      >
+        <div className='flex h-[76px] shrink-0 items-center gap-3 px-4'>
+          {collapsed && desktop
+            ? (
+              <div className='grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-primary text-lg font-semibold text-primary-foreground'>
+                K
+              </div>
+            )
+            : (
+              <div className='h-11 w-[92px] shrink-0 overflow-hidden'>
+                <img
+                  src='/web/karin.png'
+                  alt='Karin'
+                  className='h-full w-full scale-[1.75] object-contain dark:invert'
+                />
+              </div>
+            )}
+          {(!collapsed || !desktop) && (
+            <div className='min-w-0 flex-1'>
+              <div className='text-[11px] text-default-400'>和你的 Agent 一起完成事情</div>
+            </div>
+          )}
+          {!desktop && (
+            <button
+              type='button'
+              aria-label='关闭导航'
+              className='rounded-lg p-2 text-default-500 hover:bg-default-100'
+              onClick={onToggle}
+            >
+              <X size={18} />
+            </button>
+          )}
+        </div>
+
+        <nav className='karin-scrollbar min-h-0 flex-1 overflow-y-auto px-3 py-2'>
+          <div className='space-y-1.5'>
+            {config.navItems.map(item => {
+              const active = location.pathname === item.href ||
+                (item.href !== '/' && location.pathname.startsWith(`${item.href}/`)) ||
+                item.children?.some(child => location.pathname === child.href)
+              const opened = expanded === item.href
+              return (
+                <div key={item.href}>
+                  <div className='flex items-center gap-1'>
+                    <button
+                      type='button'
+                      data-karin-route={item.href}
+                      title={collapsed && desktop ? item.label : undefined}
+                      onClick={() => {
+                        if (item.groupOnly) {
+                          if (collapsed && desktop) setCollapsed(false)
+                          setExpanded(item.href)
+                          if (item.children?.[0]) go(item.children[0].href)
+                        } else {
+                          go(item.href)
+                        }
+                      }}
+                      className={clsx(
+                        'group relative flex min-w-0 flex-1 items-center gap-3 rounded-2xl px-3 py-2.5 text-sm',
+                        'text-default-600 transition-colors duration-150 hover:bg-primary/8 hover:text-foreground',
+                        active && 'bg-primary text-primary-foreground shadow-[0_8px_22px_rgba(107,93,211,0.2)]',
+                        collapsed && desktop && 'justify-center px-2'
+                      )}
+                    >
+                      <item.Icon className='h-[19px] w-[19px] shrink-0' />
+                      {(!collapsed || !desktop) && (
+                        <span className='truncate font-medium'>{item.label}</span>
+                      )}
+                    </button>
+                    {item.children && (!collapsed || !desktop) && (
+                      <button
+                        type='button'
+                        aria-label={opened ? '收起子菜单' : '展开子菜单'}
+                        onClick={() => setExpanded(opened ? null : item.href)}
+                        className='rounded-xl p-2 text-default-400 hover:bg-primary/8 hover:text-foreground'
+                      >
+                        <ChevronDown
+                          size={14}
+                          className={clsx('transition-transform duration-150', opened && 'rotate-180')}
+                        />
+                      </button>
+                    )}
+                  </div>
+                  {item.children && opened && (!collapsed || !desktop) && (
+                    <div className='ml-[21px] mt-1.5 border-l border-border/80 pl-4'>
+                      {item.href === '/plugins-dashboard' && (
+                        <button
+                          type='button'
+                          disabled={loading}
+                          onClick={() => load(true)}
+                          className='mb-1 flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs text-default-400 hover:bg-primary/8 hover:text-foreground'
+                        >
+                          <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+                          刷新插件
+                        </button>
+                      )}
+                      {item.children.map(child => {
+                        const childActive = location.pathname === child.href
+                        return (
+                          <button
+                            key={child.id}
+                            type='button'
+                            data-karin-route={child.href}
+                            onClick={() => {
+                              if (child.kind === 'route') go(child.href)
+                              else if (child.hasConfig) go(`/plugins/config?name=${child.id}`)
+                              else toast.error(`插件“${child.label || child.id}”没有配置页面`)
+                            }}
+                            className={clsx(
+                              'flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[13px] text-default-500',
+                              'transition-colors duration-150 hover:bg-primary/8 hover:text-foreground',
+                              childActive && 'bg-primary/10 font-medium text-primary'
+                            )}
+                          >
+                            {child.Icon && <child.Icon className='h-4 w-4 shrink-0' />}
+                            {child.icon && (
+                              <Icon
+                                name={child.icon.name || ''}
+                                size={16}
+                                color={child.icon.color || 'currentColor'}
+                              />
+                            )}
+                            <span className='truncate'>{child.label || child.id}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </nav>
+
+        <div className='shrink-0 space-y-1.5 p-3'>
+          {desktop && (
+            <button
+              type='button'
+              onClick={() => {
+                const value = !collapsed
+                setCollapsed(value)
+                window.localStorage.setItem('karin-sidebar-collapsed', String(value))
+              }}
+              className='flex w-full items-center justify-center gap-2 rounded-2xl px-3 py-2.5 text-sm text-default-500 hover:bg-primary/8'
+            >
+              {collapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}
+              {!collapsed && '收起导航'}
+            </button>
+          )}
+          <button
+            type='button'
+            onClick={toggleTheme}
+            className='flex w-full items-center justify-center gap-2 rounded-2xl px-3 py-2.5 text-sm text-default-500 hover:bg-primary/8'
+          >
+            {isDark ? <Sun size={17} /> : <Moon size={17} />}
+            {(!collapsed || !desktop) && (isDark ? '浅色模式' : '深色模式')}
+          </button>
+          <button
+            type='button'
+            onClick={signOut}
+            className='flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-sm text-default-500 hover:bg-danger-50 hover:text-danger'
+          >
+            <LogOut size={17} />
+            {(!collapsed || !desktop) && '退出登录'}
+          </button>
+        </div>
+      </aside>
     </>
   )
+}
+
+export default function Sidebar (props: SidebarProps) {
+  const { activeTheme } = useTheme()
+  return activeTheme.skin === 'classic'
+    ? <ClassicSidebar {...props} />
+    : <BloomSidebar {...props} />
 }

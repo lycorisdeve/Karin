@@ -2,15 +2,17 @@ import { Toaster as HotToaster } from 'react-hot-toast'
 import { useTheme } from '@/hooks/use-theme'
 
 export const Toaster = () => {
-  const { isDark } = useTheme()
+  const { activeTheme, appliedTheme } = useTheme()
+  const palette = activeTheme[appliedTheme]
 
   return (
     <HotToaster
       toastOptions={{
         style: {
           borderRadius: '20px',
-          background: isDark ? '#333' : '#fff',
-          color: isDark ? '#fff' : '#333',
+          background: palette.elevatedSurface,
+          color: palette.foreground,
+          border: `1px solid ${palette.border}`,
           zIndex: 10000,
         },
       }}

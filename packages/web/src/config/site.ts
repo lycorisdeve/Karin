@@ -7,12 +7,15 @@ import {
   RiRobot2Fill,
   RiSettings2Fill,
   RiShieldCheckFill,
+  RiSparkling2Fill,
   RiToolsFill,
 } from 'react-icons/ri'
 import { BsInfoCircleFill } from 'react-icons/bs'
 import {
   MdSpaceDashboard,
+  MdCable,
   MdExtension,
+  MdPalette,
   MdOutlineArticle, // 系统日志
   MdOutlineTerminal, // 仿真终端
 } from 'react-icons/md'
@@ -23,6 +26,7 @@ export interface NavItem {
   Icon: React.ComponentType<React.SVGProps<SVGSVGElement>>
   label: string
   href: string
+  groupOnly?: boolean
   children?: {
     id: string
     href: string
@@ -54,6 +58,30 @@ export const defaultSiteConfig: SiteConfigType = {
       Icon: RiSettings2Fill,
       label: '系统配置',
       href: '/config',
+      groupOnly: true,
+      children: [
+        {
+          id: 'common-config',
+          href: '/config/config',
+          label: '常用配置',
+          Icon: RiSettings2Fill,
+          kind: 'route',
+        },
+        {
+          id: 'adapter-config',
+          href: '/config/adapter',
+          label: '适配器配置',
+          Icon: MdCable,
+          kind: 'route',
+        },
+        {
+          id: 'appearance',
+          href: '/appearance',
+          label: '外观与主题',
+          Icon: MdPalette,
+          kind: 'route',
+        },
+      ],
     },
     {
       Icon: RiRobot2Fill,
@@ -64,7 +92,9 @@ export const defaultSiteConfig: SiteConfigType = {
         { id: 'agent-tasks', href: '/agent/tasks', label: '定时任务', Icon: RiCalendarEventFill, kind: 'route' },
         { id: 'agent-skills', href: '/agent/skills', label: 'Skills 管理', Icon: RiBrainFill, kind: 'route' },
         { id: 'agent-memories', href: '/agent/memories', label: '记忆管理', Icon: RiArchiveFill, kind: 'route' },
+        { id: 'agent-evolution', href: '/agent/evolution', label: '进化中心', Icon: RiSparkling2Fill, kind: 'route' },
         { id: 'agent-tools', href: '/agent/tools', label: 'Tools 管理', Icon: RiToolsFill, kind: 'route' },
+        { id: 'agent-mcp', href: '/agent/mcp', label: 'MCP 服务', Icon: MdCable, kind: 'route' },
         { id: 'agent-approvals', href: '/agent/approvals', label: '审批中心', Icon: RiShieldCheckFill, kind: 'route' },
         { id: 'agent-runs', href: '/agent/runs', label: '运行记录', Icon: RiFileList3Fill, kind: 'route' },
         { id: 'agent-config', href: '/agent/config', label: '配置管理', Icon: RiSettings2Fill, kind: 'route' },

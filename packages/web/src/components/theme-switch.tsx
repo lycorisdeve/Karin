@@ -6,8 +6,9 @@ import { useTheme } from '@/hooks/use-theme'
 import { Moon, Sun } from 'lucide-react'
 import { Button } from '@heroui/button'
 import { Tooltip } from '@heroui/tooltip'
+import toast from 'react-hot-toast'
 
-type Theme = 'system' | 'inverse'
+type Theme = 'system' | 'light' | 'dark'
 
 export interface ThemeSwitchProps {
   className?: string
@@ -34,7 +35,11 @@ export const ThemeSwitch: React.FC<ThemeSwitchProps> = ({ classNames, children, 
 
   const buttonElement = (
     <Button
-      onPress={toggleTheme}
+      onPress={() => {
+        toggleTheme().catch(error => {
+          toast.error(error instanceof Error ? error.message : '保存主题模式失败')
+        })
+      }}
       radius='full'
       variant='light'
       color='primary'

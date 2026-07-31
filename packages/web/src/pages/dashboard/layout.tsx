@@ -1,184 +1,183 @@
-import Sidebar from '@/components/sidebar.tsx'
-import { Outlet, useLocation } from 'react-router-dom'
-import { useState, useEffect, useMemo } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
 import clsx from 'clsx'
-import { IoMenu } from 'react-icons/io5'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Command, Menu, Search, X } from 'lucide-react'
+import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useMediaQuery } from 'react-responsive'
+import Sidebar from '@/components/sidebar'
 import { getPageTitle } from '@/lib/utils'
-import { RiMenuUnfold2Line } from 'react-icons/ri'
+import { siteConfig } from '@/config/site'
+import { useTheme } from '@/hooks/use-theme'
+import ClassicDashboardLayout from './layout-classic'
 
-/** 提取路径的主路径部分（一级路由） */
-function getMainPath (pathname: string): string {
-  const split = pathname.trim().split('/').filter(Boolean)
-  if (split.length === 0) return ''
+function BloomDashboardLayout () {
+  const desktop = useMediaQuery({ minWidth: 768 })
+  const [isOpen, setIsOpen] = useState(false)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const location = useLocation()
+  const navigate = useNavigate()
+  const searchRef = useRef<HTMLInputElement>(null)
+  const title = getPageTitle(location.pathname)
+  const fullHeight = (
+    location.pathname === '/agent/chat' ||
+    location.pathname === '/terminal' ||
+    location.pathname === '/log'
+  )
+  const wide = location.pathname.startsWith('/agent') ||
+    location.pathname.startsWith('/plugins/config')
 
-  const mainPath = split[0]
-  return mainPath === '' ? '' : '/' + mainPath
+  useEffect(() => {
+    setIsOpen(desktop)
+  }, [desktop])
+
+  useEffect(() => {
+    const open = () => setPaletteOpen(true)
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setPaletteOpen(value => !value)
+      }
+      if (event.key === 'Escape') setPaletteOpen(false)
+    }
+    window.addEventListener('karin:command-palette', open)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('karin:command-palette', open)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!paletteOpen) return
+    setQuery('')
+    requestAnimationFrame(() => searchRef.current?.focus())
+  }, [paletteOpen])
+
+  const destinations = useMemo(() => siteConfig.navItems.flatMap(item => [
+    { label: item.label, href: item.href },
+    ...(item.children ?? []).map(child => ({
+      label: `${item.label} / ${child.label ?? child.id}`,
+      href: child.href,
+    })),
+  ]), [])
+  const matches = destinations.filter(item =>
+    `${item.label} ${item.href}`.toLowerCase().includes(query.trim().toLowerCase())
+  ).slice(0, 12)
+
+  const go = (href: string) => {
+    navigate(href)
+    setPaletteOpen(false)
+  }
+
+  return (
+    <div className='flex h-[100dvh] w-full overflow-hidden bg-background text-foreground'>
+      <Sidebar isOpen={isOpen} onToggle={() => setIsOpen(value => !value)} />
+      <main className='flex min-w-0 flex-1 flex-col overflow-hidden'>
+        <header className='flex h-[72px] shrink-0 items-center gap-3 px-4 md:px-7'>
+          {!desktop && (
+            <button
+              type='button'
+              aria-label='打开导航'
+              onClick={() => setIsOpen(true)}
+              className='rounded-2xl p-2.5 text-default-500 hover:bg-primary/8'
+            >
+              <Menu size={19} />
+            </button>
+          )}
+          <div className='min-w-0 flex-1'>
+            <div className='truncate text-lg font-semibold tracking-[-0.025em]'>{title}</div>
+          </div>
+          <button
+            type='button'
+            className='hidden min-w-[240px] items-center gap-2 rounded-2xl bg-card/80 px-4 py-2.5 text-left text-xs text-default-400 shadow-sm ring-1 ring-border/70 lg:flex'
+            onClick={() => window.dispatchEvent(new CustomEvent('karin:command-palette'))}
+          >
+            <Search size={14} />
+            搜索设置、插件和 Agent
+            <kbd className='ml-auto rounded border border-border bg-card px-1.5 font-mono'>⌘K</kbd>
+          </button>
+        </header>
+        <div
+          className={clsx(
+            'min-h-0 flex-1',
+            fullHeight
+              ? 'overflow-hidden px-3 pb-3 md:px-5 md:pb-5'
+              : 'karin-scrollbar overflow-y-auto px-4 pb-6 md:px-7 md:pb-8',
+            !wide && !fullHeight && 'mx-auto w-full max-w-[1480px]'
+          )}
+        >
+          <Outlet />
+        </div>
+      </main>
+      {paletteOpen && (
+        <div
+          className='fixed inset-0 z-[100] flex justify-center bg-[#28232d]/30 px-4 pt-[12vh] backdrop-blur-sm'
+          role='dialog'
+          aria-modal='true'
+          aria-label='全局导航'
+          onMouseDown={event => {
+            if (event.currentTarget === event.target) setPaletteOpen(false)
+          }}
+        >
+          <div className='h-fit w-full max-w-xl overflow-hidden rounded-[24px] border border-border bg-card shadow-2xl'>
+            <div className='flex items-center gap-3 border-b border-border px-4 py-3'>
+              <Search size={17} className='text-primary' />
+              <input
+                ref={searchRef}
+                value={query}
+                onChange={event => setQuery(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter' && matches[0]) go(matches[0].href)
+                }}
+                placeholder='搜索页面、Agent 能力或插件入口'
+                className='min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-default-400'
+              />
+              <button
+                type='button'
+                aria-label='关闭'
+                className='rounded-lg p-1.5 text-default-400 hover:bg-default-100'
+                onClick={() => setPaletteOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className='karin-scrollbar max-h-[420px] overflow-y-auto p-2'>
+              {matches.length
+                ? matches.map(item => (
+                  <button
+                    key={`${item.href}-${item.label}`}
+                    type='button'
+                    onClick={() => go(item.href)}
+                    className='group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-default-100'
+                  >
+                    <span className='grid size-8 place-items-center rounded-lg border border-border bg-default-50 text-default-500 group-hover:text-primary'>
+                      <Command size={14} />
+                    </span>
+                    <span className='min-w-0 flex-1'>
+                      <span className='block truncate text-sm font-medium'>{item.label}</span>
+                      <span className='block truncate font-mono text-[10px] text-default-400'>{item.href}</span>
+                    </span>
+                  </button>
+                ))
+                : (
+                  <div className='px-4 py-10 text-center text-sm text-default-400'>
+                    没有匹配的页面
+                  </div>
+                )}
+            </div>
+            <div className='border-t border-border px-4 py-2 text-[10px] text-default-400'>
+              <kbd className='font-mono'>Enter</kbd> 打开首项 · <kbd className='font-mono'>Esc</kbd> 关闭
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default function DashboardLayout () {
-  // const [touchStartX, setTouchStartX] = useState(0)
-  const [isOpen, setIsOpen] = useState(false)
-  const isNotSmallScreen = useMediaQuery({ minWidth: 768 })
-  const isMediumOrLargeScreen = useMediaQuery({ minWidth: 640 })
-  const location = useLocation()
-  const title = getPageTitle(location.pathname)
-
-  const [currentMainPath, setCurrentMainPath] = useState(getMainPath(location.pathname))
-
-  // 检查当前是否为配置页面
-  const isConfigPage = useMemo(() => {
-    return location.pathname.startsWith('/config') || location.pathname.startsWith('/plugins/config')
-  }, [location.pathname])
-
-  // const [touchStartY, setTouchStartY] = useState(0)
-  // const [touchStartTime, setTouchStartTime] = useState(0)
-
-  // const handleTouchStart = useCallback((e: React.TouchEvent) => {
-  //   if (isNotSmallScreen) return
-  //   const touch = e.touches[0]
-  //   setTouchStartX(touch.clientX)
-  //   setTouchStartY(touch.clientY)
-  //   setTouchStartTime(Date.now())
-  // }, [isNotSmallScreen])
-
-  // const handleTouchMove = useCallback((e: React.TouchEvent) => {
-  //   if (isNotSmallScreen || isOpen) return
-
-  //   const touch = e.touches[0]
-  //   if (!touch) return
-
-  //   // 计算滑动速度和方向
-  //   const deltaX = touch.clientX - touchStartX
-  //   const deltaY = Math.abs(touch.clientY - touchStartY)
-  //   const velocityX = Math.abs(deltaX) / (Date.now() - touchStartTime)
-
-  //   // console.log('滑动参数:', {
-  //   //   deltaX,
-  //   //   deltaY,
-  //   //   velocity: velocityX.toFixed(2),
-  //   //   direction: deltaX > 0 ? 'right' : 'left'
-  //   // })
-
-  //   // 触发条件
-  //   if (
-  //     deltaX > 35 && // 滑动距离
-  //     deltaY < 50 && // 垂直容差
-  //     velocityX > 0.9 && // 滑动速度
-  //     deltaX > Math.abs(deltaY) * 1.5 // 横向主导
-  //   ) {
-  //     // console.log('✅ 全屏滑动触发')
-  //     setIsOpen(true)
-  //   }
-  // }, [isNotSmallScreen, isOpen, touchStartX, touchStartY, touchStartTime])
-
-  useEffect(() => {
-    // 大屏幕默认展开侧边栏
-    if (isNotSmallScreen) {
-      setIsOpen(true)
-    }
-  }, [isNotSmallScreen])
-
-  useEffect(() => {
-    setCurrentMainPath(getMainPath(location.pathname))
-  }, [location])
-
-  return (
-    <div
-      className='relative flex h-screen w-full overflow-hidden bg-white dark:bg-neutral-900 transition-colors duration-300'
-      style={{
-        height: '100dvh',
-      }}
-    >
-      {/* 侧边栏 */}
-      <Sidebar isOpen={isOpen} onToggle={() => setIsOpen(!isOpen)} />
-
-      {/* 主内容区域 */}
-      <motion.main
-        // onTouchStart={handleTouchStart}
-        // onTouchMove={handleTouchMove}
-        // onTouchEnd={() => setTouchStartX(0)}
-        style={{
-          touchAction: 'manipulation',
-          WebkitOverflowScrolling: 'touch',
-        }}
-        className={clsx(
-          'flex flex-col touch-auto bg-neutral-50 dark:bg-neutral-900',
-          // 移动端隐藏滚动条但保持滚动功能
-          isNotSmallScreen ? 'flex-1 overflow-y-auto' : 'w-full overflow-y-auto scrollbar-hide'
-        )}
-        initial={false}
-        animate={{
-          width: isNotSmallScreen ? (isOpen ? 'calc(100% - 240px)' : '100%') : '100%',
-          x: isOpen && !isNotSmallScreen ? 240 : 0,
-        }}
-        transition={{
-          type: 'tween',
-          ease: [0.00, 0.00, 0.00, 1.00],
-          duration: 0.3,
-        }}
-      >
-        {/* 顶部导航栏，仅移动端显示 */}
-        {/**
-         * 顶部导航栏只在移动端显示，桌面端隐藏
-         */}
-        {!isNotSmallScreen && (
-          <motion.div
-            className={clsx(
-              isConfigPage && !isMediumOrLargeScreen ? 'static' : 'sticky top-0',
-              'z-40 w-full bg-opacity-50 backdrop-blur-md',
-              'border-b border-divider shadow-sm flex items-center justify-between',
-              'min-h-10 px-2 py-1'
-            )}
-            initial={{ y: -50 }}
-            animate={{ y: 0 }}
-            transition={{
-              type: 'tween',
-              ease: [0.00, 0.00, 0.00, 1.00],
-              duration: 0.3,
-            }}
-          >
-            <div className='flex min-w-0 items-center'>
-              <motion.button
-                onClick={() => setIsOpen(!isOpen)}
-                className={clsx('min-w-0 rounded-md px-2 py-1.5 text-xs active:bg-default-100 dark:active:bg-default-100/10')}
-              >
-                <div className='flex min-w-0 items-center gap-2'>
-                  {isOpen
-                    ? <RiMenuUnfold2Line className='h-4.5 w-4.5 shrink-0' />
-                    : <IoMenu className='h-4.5 w-4.5 shrink-0' />}
-                  {/* 标题 */}
-                  <motion.h1 className='truncate text-sm font-medium leading-5'>
-                    {title}
-                  </motion.h1>
-                </div>
-              </motion.button>
-            </div>
-          </motion.div>
-        )}
-
-        {/* 内容区域动画 - 根据是否显示导航栏调整类名 */}
-        <motion.div
-          className={clsx(
-            'container mx-auto px-3 flex-1',
-            !location.pathname.startsWith('/plugins/config') && 'py-4'
-          )}
-          key={currentMainPath} // 动态 key，只在主路径变化时触发动画
-          initial={{ opacity: 0, scale: 0.9 }}
-          animate={{ opacity: 1, scale: 1 }}
-          exit={{ opacity: 0, scale: 0.9 }}
-          transition={{
-            type: 'tween',
-            ease: [0.00, 0.00, 0.00, 1.00],
-            duration: 0.3,
-          }}
-        >
-          <AnimatePresence mode='popLayout'>
-            <Outlet key={currentMainPath} />
-          </AnimatePresence>
-        </motion.div>
-      </motion.main>
-    </div>
-  )
+  const { activeTheme } = useTheme()
+  return activeTheme.skin === 'classic'
+    ? <ClassicDashboardLayout />
+    : <BloomDashboardLayout />
 }

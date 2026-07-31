@@ -1,4 +1,3 @@
-import { z } from 'zod'
 import key from '@/consts/key.ts'
 import toast from 'react-hot-toast'
 import { Input } from '@heroui/input'
@@ -6,8 +5,6 @@ import { Button } from '@heroui/button'
 import { Image } from '@heroui/image'
 import { request } from '@/lib/request'
 import { Controller, useForm } from 'react-hook-form'
-import { loginSchema } from '@/schema/user'
-import { zodResolver } from '@hookform/resolvers/zod'
 import { Form } from '@/components/form'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { motion } from 'framer-motion'
@@ -19,6 +16,10 @@ import clsx from 'clsx'
 import { Tooltip } from '@heroui/tooltip'
 import { FaHeart } from 'react-icons/fa'
 // import ConsoleMessage from '@/components/ConsoleMessage.tsx'
+
+interface LoginValues {
+  token: string
+}
 
 /**
  * 加载外部 SHA256 脚本
@@ -72,9 +73,8 @@ export default function LoginPage () {
   const searchParams = new URLSearchParams(location.search)
   const tokenFromUrl = searchParams.get('token')
 
-  const form = useForm<z.infer<typeof loginSchema>>({
+  const form = useForm<LoginValues>({
     defaultValues: { token: tokenFromUrl || '' },
-    resolver: zodResolver(loginSchema),
   })
 
   const [showSplashCursor, setShowSplashCursor] = useState(false)
@@ -84,7 +84,7 @@ export default function LoginPage () {
    * 登录
    * @param data 登录数据
    */
-  const onSubmit = async (data: z.infer<typeof loginSchema>) => {
+  const onSubmit = async (data: LoginValues) => {
     try {
       const authorization = await generateHash(data.token)
       const response = await request.serverPost<{
@@ -286,6 +286,7 @@ export default function LoginPage () {
                   )}
                   name='token'
                   control={form.control}
+                  rules={{ required: '密码不能为空' }}
                 />
               </motion.div>
 

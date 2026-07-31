@@ -1,7 +1,9 @@
 import { Button } from '@heroui/button'
 import { Card } from '@heroui/card'
 import { ExternalLink } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
+import { useTheme } from '@/hooks/use-theme'
+import { systemTheme } from '@/theme/appearance'
 
 import type { GetConfigResponse, WebConfigPage } from 'node-karin'
 
@@ -22,62 +24,41 @@ const getTargetOrigin = (url: string) => {
   }
 }
 
-const getStoredTheme = () => {
-  const theme = localStorage.getItem('theme')
-  return theme === 'inverse' ? 'inverse' : 'system'
-}
-
-const getAppliedTheme = () => {
-  return document.documentElement.classList.contains('dark') ? 'dark' : 'light'
-}
-
-const getThemeSnapshot = () => ({
-  theme: getStoredTheme(),
-  appliedTheme: getAppliedTheme(),
-})
-
 /**
  * 插件自定义配置页面
  * @param props 页面属性
  */
 export const PluginWebConfigPage = ({ page, info }: PluginWebConfigPageProps) => {
   const iframeRef = useRef<HTMLIFrameElement>(null)
-  const [themeSnapshot, setThemeSnapshot] = useState(getThemeSnapshot)
+  const { appearance, activeTheme, appliedTheme } = useTheme()
   const title = page.title || info.name || info.id || '插件配置'
   const description = page.description || info.description || '插件提供的自定义配置页面'
   const external = isExternalUrl(page.url)
-  const { theme, appliedTheme } = themeSnapshot
+  const legacyTheme = appearance.mode === 'system' || appliedTheme === systemTheme()
+    ? 'system'
+    : 'inverse'
+  const palette = activeTheme[appliedTheme]
 
-  useEffect(() => {
+  const postTheme = useCallback(() => {
     const iframeWindow = iframeRef.current?.contentWindow
     if (!iframeWindow) return
 
     iframeWindow.postMessage({
       type: 'karin-theme-change',
-      theme,
+      theme: legacyTheme,
       appliedTheme,
+      mode: appearance.mode,
+      themeId: activeTheme.id,
+      palette,
+      radius: activeTheme.radius,
+      density: activeTheme.density,
+      revision: appearance.revision,
     }, getTargetOrigin(page.url))
-  }, [appliedTheme, page.url, theme])
+  }, [activeTheme, appearance.mode, appearance.revision, appliedTheme, legacyTheme, page.url, palette])
 
   useEffect(() => {
-    const syncThemeSnapshot = () => {
-      setThemeSnapshot(getThemeSnapshot())
-    }
-
-    const observer = new MutationObserver(syncThemeSnapshot)
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['class'],
-    })
-
-    window.addEventListener('storage', syncThemeSnapshot)
-    syncThemeSnapshot()
-
-    return () => {
-      observer.disconnect()
-      window.removeEventListener('storage', syncThemeSnapshot)
-    }
-  }, [])
+    postTheme()
+  }, [postTheme])
 
   return (
     <div className='flex flex-col gap-1.5 sm:gap-3 h-full py-1 sm:py-4'>
@@ -120,11 +101,7 @@ export const PluginWebConfigPage = ({ page, info }: PluginWebConfigPageProps) =>
           className='h-full w-full border-0 bg-background'
           referrerPolicy={external ? 'strict-origin-when-cross-origin' : 'same-origin'}
           onLoad={() => {
-            iframeRef.current?.contentWindow?.postMessage({
-              type: 'karin-theme-change',
-              theme,
-              appliedTheme,
-            }, getTargetOrigin(page.url))
+            postTheme()
           }}
           sandbox='allow-scripts allow-same-origin allow-forms allow-popups'
         />
