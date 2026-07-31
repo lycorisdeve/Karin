@@ -3,6 +3,12 @@ import { adapter } from '@/utils/config/file/adapter'
 import { FeishuChannelDriver } from './feishu'
 import { TelegramChannelDriver } from './telegram'
 import { WeComChannelDriver } from './wecom'
+import { QQBotChannelDriver } from './qqbot'
+import { WeChatChannelDriver } from './wechat'
+import { DingTalkChannelDriver } from './dingtalk'
+import { DiscordChannelDriver } from './discord'
+import { WhatsAppChannelDriver } from './whatsapp'
+import { EmailChannelDriver } from './email'
 import { redactChannelError } from './security'
 
 import type { Adapters } from '@/types/config'
@@ -15,7 +21,13 @@ import type {
 
 type AnyDriver = ChannelDriver<Adapters['wecom'][number]> |
   ChannelDriver<Adapters['feishu'][number]> |
-  ChannelDriver<Adapters['telegram'][number]>
+  ChannelDriver<Adapters['telegram'][number]> |
+  ChannelDriver<Adapters['qqbot'][number]> |
+  ChannelDriver<Adapters['wechat'][number]> |
+  ChannelDriver<Adapters['dingtalk'][number]> |
+  ChannelDriver<Adapters['discord'][number]> |
+  ChannelDriver<Adapters['whatsapp'][number]> |
+  ChannelDriver<Adapters['email'][number]>
 
 const keyFor = (kind: ChannelKind, id: string) => `${kind}:${id}`
 
@@ -23,6 +35,12 @@ const configuredAccounts = (config: Adapters) => [
   ...config.wecom.map(account => ({ kind: 'wecom' as const, account })),
   ...config.feishu.map(account => ({ kind: 'feishu' as const, account })),
   ...config.telegram.map(account => ({ kind: 'telegram' as const, account })),
+  ...config.qqbot.map(account => ({ kind: 'qqbot' as const, account })),
+  ...config.wechat.map(account => ({ kind: 'wechat' as const, account })),
+  ...config.dingtalk.map(account => ({ kind: 'dingtalk' as const, account })),
+  ...config.discord.map(account => ({ kind: 'discord' as const, account })),
+  ...config.whatsapp.map(account => ({ kind: 'whatsapp' as const, account })),
+  ...config.email.map(account => ({ kind: 'email' as const, account })),
 ]
 
 export class ChannelRegistry {
@@ -39,7 +57,25 @@ export class ChannelRegistry {
     if (kind === 'feishu') {
       return new FeishuChannelDriver(account as Adapters['feishu'][number])
     }
-    return new TelegramChannelDriver(account as Adapters['telegram'][number])
+    if (kind === 'telegram') {
+      return new TelegramChannelDriver(account as Adapters['telegram'][number])
+    }
+    if (kind === 'qqbot') {
+      return new QQBotChannelDriver(account as Adapters['qqbot'][number])
+    }
+    if (kind === 'wechat') {
+      return new WeChatChannelDriver(account as Adapters['wechat'][number])
+    }
+    if (kind === 'dingtalk') {
+      return new DingTalkChannelDriver(account as Adapters['dingtalk'][number])
+    }
+    if (kind === 'discord') {
+      return new DiscordChannelDriver(account as Adapters['discord'][number])
+    }
+    if (kind === 'whatsapp') {
+      return new WhatsAppChannelDriver(account as Adapters['whatsapp'][number])
+    }
+    return new EmailChannelDriver(account as Adapters['email'][number])
   }
 
   async start (config = adapter()) {
@@ -135,6 +171,19 @@ export class ChannelRegistry {
       return temporary.deleteWebhook(dropPendingUpdates)
     }
     return driver.deleteWebhook(dropPendingUpdates)
+  }
+
+  async receiveWhatsAppWebhook (id: string, payload: unknown) {
+    const driver = this.drivers.get(keyFor('whatsapp', id))
+    if (!(driver instanceof WhatsAppChannelDriver)) {
+      throw new Error(`WhatsApp 账号未启动: ${id}`)
+    }
+    await driver.receiveWebhook(payload)
+  }
+
+  reportWhatsAppWebhookError (id: string, error: unknown) {
+    const driver = this.drivers.get(keyFor('whatsapp', id))
+    if (driver instanceof WhatsAppChannelDriver) driver.reportWebhookError(error)
   }
 }
 

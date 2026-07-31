@@ -2,7 +2,11 @@ import Ajv, { type ValidateFunction } from 'ajv'
 import { cache } from '@/plugin/system/cache'
 import { createAgentTool } from '@/core/karin/tool'
 
-import type { AgentToolOptions, AgentToolContext } from '@/types/agent'
+import type {
+  AgentToolContext,
+  AgentToolOptions,
+  AgentToolResultEnvelope,
+} from '@/types/agent'
 import type { AgentTool } from '@/types/plugin'
 
 interface CompiledTool {
@@ -97,6 +101,90 @@ export class AgentToolRegistry {
       }))
   }
 
+  discover (
+    query: string,
+    allowedTools?: string[],
+    limit = 24,
+    requiredTools: string[] = []
+  ) {
+    const normalized = query.toLowerCase()
+    const terms = [...new Set(
+      normalized
+        .split(/[\s,，。！？、:：;；()[\]{}"'`]+/)
+        .map(item => item.trim())
+        .filter(item => item.length >= 2)
+    )]
+    const score = (tool: ReturnType<AgentToolRegistry['list']>[number]) => {
+      const name = tool.name.toLowerCase()
+      const description = tool.description.toLowerCase()
+      const tags = tool.tags.join(' ').toLowerCase()
+      let value = normalized.includes(name) ? 20 : 0
+      for (const term of terms) {
+        if (name.includes(term)) value += 8
+        if (tags.includes(term)) value += 5
+        if (description.includes(term)) value += 3
+      }
+      if (tool.name === 'karin.host.inspect' &&
+        /电脑|主机|系统|配置|cpu|内存|磁盘|node|操作系统/i.test(query)) {
+        value += 30
+      }
+      const cronIntent = /定时|提醒|计划任务|cron|schedule/i.test(query)
+      const skillIntent = /技能|skill/i.test(query)
+      const memoryIntent = /记忆|记住|偏好|memory/i.test(query)
+      const browserIntent = /网页|浏览器|网址|链接|url|https?:\/\//i.test(query)
+      const messageIntent = /发送|发消息|通知|推送|告知|联系|提醒|send|message|notify/i.test(query)
+      const imageIntent =
+        /图片|照片|相片|图像|截图|发(?:一|个|张|图|给|送)|传图|image|photo|picture/i.test(query)
+      const relativeTimeIntent =
+        /(?:\d+|一|两|几)(?:秒|分钟|小时|天)后|稍后|待会|过一会/i.test(query)
+      const createIntent = /创建|新增|添加|安排|设置|生成|create|add/i.test(query)
+      const updateIntent = /修改|更新|调整|update|edit/i.test(query)
+      const deleteIntent = /删除|移除|delete|remove/i.test(query)
+      const listIntent = /列出|查看|有哪些|列表|list/i.test(query)
+      const delegateIntent = /并行|分工|委派|子任务|子\s*Agent|多(?:个|项|路)/i.test(query)
+      const diagnosticIntent =
+        /诊断|排查|根因|报错|失败|日志|堆栈|调用轨迹|为什么|修复|diagnos|debug|error/i
+
+      if (cronIntent && name.includes('.cron.')) value += 24
+      if (skillIntent && name.includes('.skill.')) value += 24
+      if (memoryIntent && name.includes('.memory.')) value += 24
+      if (browserIntent && name.includes('.browser.')) value += 24
+      if (messageIntent && name === 'karin.bot.send_message') value += 36
+      if (imageIntent && name === 'karin.bot.send_message') value += 42
+      if (
+        imageIntent &&
+        (
+          name === 'karin.browser.search' ||
+          name === 'karin.browser.open' ||
+          name === 'karin.browser.download'
+        )
+      ) {
+        value += 34
+      }
+      if (diagnosticIntent && name.startsWith('karin.diagnostics.')) value += 38
+      if (relativeTimeIntent && name === 'karin.cron.create') value += 36
+      if (createIntent && name.endsWith('.create')) value += 30
+      if (createIntent && name.endsWith('.install_url')) value += 30
+      if (updateIntent && (name.endsWith('.update') || name.endsWith('.state'))) value += 24
+      if (deleteIntent && name.endsWith('.delete')) value += 24
+      if (listIntent && (name.endsWith('.list') || name.endsWith('.search'))) value += 18
+      if (delegateIntent && name === 'karin.agent.delegate_many') value += 36
+      return value
+    }
+    const tools = this.list(allowedTools)
+    if (tools.length <= limit) return tools
+    const selected = tools
+      .map((tool, index) => ({ tool, index, score: score(tool) }))
+      .sort((left, right) => right.score - left.score || left.index - right.index)
+      .slice(0, Math.max(1, Math.min(limit, 100)))
+      .map(item => item.tool)
+    const pinned = tools.filter(tool => requiredTools.includes(tool.name))
+    return [
+      ...pinned,
+      ...selected.filter(tool => !pinned.some(item => item.name === tool.name)),
+    ].slice(0, 100)
+  }
+
   async execute (
     name: string,
     input: Record<string, unknown>,
@@ -129,5 +217,90 @@ export class AgentToolRegistry {
       .subarray(0, Math.max(0, maxOutputBytes - byteLength(suffix)))
       .toString('utf8')
     return `${truncated}${suffix}`
+  }
+
+  async executeWithReceipt (
+    name: string,
+    input: Record<string, unknown>,
+    context: AgentToolContext,
+    maxOutputBytes: number
+  ): Promise<AgentToolResultEnvelope> {
+    const startedAt = Date.now()
+    const compiled = this.get(name)
+    const idempotent = Boolean(compiled?.tool.idempotent)
+    try {
+      const data = await this.execute(name, input, context, maxOutputBytes)
+      const object = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : {}
+      const delivery = name === 'karin.bot.send_message'
+        ? {
+          completed: object.delivered === true,
+          channel: typeof object.channel === 'string' ? object.channel : undefined,
+          accountId: typeof object.accountId === 'string' ? object.accountId : undefined,
+          contactKey: typeof object.contactKey === 'string' ? object.contactKey : undefined,
+          textSegments: Math.max(0, Number(object.textSegments) || 0),
+          imageSegments: Math.max(0, Number(object.imageSegments) || 0),
+        }
+        : undefined
+      const path = typeof object.path === 'string' ? object.path : undefined
+      const url = typeof object.url === 'string' ? object.url : undefined
+      const media = path || (
+        url && /\.(?:png|jpe?g|gif|webp)(?:$|[?#])/i.test(url)
+      )
+        ? {
+          path,
+          url,
+          mime: typeof object.contentType === 'string'
+            ? object.contentType
+            : typeof object.mime === 'string'
+              ? object.mime
+              : undefined,
+          size: Number(object.bytes || object.size) || undefined,
+        }
+        : undefined
+      return {
+        status: 'completed',
+        data,
+        receipt: {
+          toolName: name,
+          status: 'completed',
+          startedAt,
+          completedAt: Date.now(),
+          idempotent,
+          delivery,
+          media,
+        },
+        evidence: [
+          delivery?.completed ? `delivery:${delivery.channel || 'channel'}:completed` : '',
+          media?.path ? `media:${media.path}` : media?.url ? `media:${media.url}` : '',
+        ].filter(Boolean),
+      }
+    } catch (error) {
+      const message = (error as Error).message
+      return {
+        status: 'failed',
+        errorCode: this.errorCode(message),
+        error: message,
+        receipt: {
+          toolName: name,
+          status: 'failed',
+          startedAt,
+          completedAt: Date.now(),
+          idempotent,
+        },
+        evidence: [],
+      }
+    }
+  }
+
+  private errorCode (message: string) {
+    if (/未知工具/.test(message)) return 'TOOL_NOT_FOUND'
+    if (/参数|Schema|JSON/.test(message)) return 'TOOL_INVALID_INPUT'
+    if (/超时|timeout/i.test(message)) return 'TOOL_TIMEOUT'
+    if (/权限|拒绝|approval/i.test(message)) return 'TOOL_DENIED'
+    if (/投递|发送|delivery/i.test(message)) return 'DELIVERY_FAILED'
+    if (/私网|URL|域名|协议/.test(message)) return 'TOOL_UNSAFE_URL'
+    return 'TOOL_FAILED'
   }
 }

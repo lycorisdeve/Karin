@@ -45,14 +45,27 @@ export class AgentProviderRegistry implements AgentModelProvider {
 
   constructor (private readonly getConfig: () => AgentConfig) {}
 
-  private profiles () {
+  private profiles (request: AgentModelRequest) {
     const config = this.getConfig()
-    return [config.routing.primary, ...config.routing.fallback]
+    const defaults = [config.routing.primary, ...config.routing.fallback]
       .map(id => config.providers.find(profile => profile.id === id))
       .filter(
         (profile): profile is AgentProviderProfile =>
           Boolean(profile?.enabled && profile.apiKey && profile.model)
       )
+      .map(profile => ({ profile, model: profile.model }))
+    const selected = request.providerId
+      ? config.providers.find(profile => profile.id === request.providerId)
+      : null
+    const entries = selected?.enabled && selected.apiKey && request.model
+      ? [{ profile: selected, model: request.model }, ...defaults]
+      : defaults
+    return entries.filter(
+      (entry, index, list) =>
+        list.findIndex(item =>
+          item.profile.id === entry.profile.id && item.model === entry.model
+        ) === index
+    )
   }
 
   private profile (id: string) {
@@ -64,20 +77,23 @@ export class AgentProviderRegistry implements AgentModelProvider {
     onDelta?: (delta: string) => void | Promise<void>
   ): Promise<AgentModelResponse> {
     const started = Date.now()
-    const profiles = this.profiles()
+    const profiles = this.profiles(request)
     if (!profiles.length) throw new Error('[agent][model] 没有可用的 Provider')
     const fallbackFrom: string[] = []
     const retryReasons: string[] = []
     let retries = 0
     let lastError: unknown
 
-    for (const profile of profiles) {
+    for (const entry of profiles) {
+      const { profile, model } = entry
+      const sessionOverride =
+        profile.id === request.providerId && model === request.model
       const provider = clientFor(profile)
       for (let attempt = 0; attempt < 2; attempt++) {
         let emittedDelta = false
         try {
           const response = await provider.complete(
-            { ...request, model: profile.model },
+            { ...request, providerId: undefined, model },
             async delta => {
               emittedDelta = true
               await onDelta?.(delta)
@@ -89,7 +105,7 @@ export class AgentProviderRegistry implements AgentModelProvider {
           return {
             ...response,
             provider: profile.id,
-            model: profile.model,
+            model,
             retries,
             fallbackFrom,
             retryReasons,
@@ -99,10 +115,15 @@ export class AgentProviderRegistry implements AgentModelProvider {
           lastError = error
           // A streamed response cannot be replayed safely without duplicating text
           // already delivered to the caller.
-          if (request.signal?.aborted || emittedDelta || !isTransient(error)) throw error
+          if (request.signal?.aborted || emittedDelta) throw error
           const reason = error instanceof AgentProviderError && error.status
             ? `${profile.id}:HTTP ${error.status}`
             : `${profile.id}:${error instanceof Error ? error.name : 'network'}`
+          if (!isTransient(error)) {
+            if (!sessionOverride) throw error
+            retryReasons.push(`${reason}:session-fallback`)
+            break
+          }
           if (attempt === 0) {
             retries++
             retryReasons.push(`${reason}:retry`)

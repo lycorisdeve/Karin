@@ -20,6 +20,8 @@ import { registerAgentIngress } from './ingress/message'
 import { registerAgentCommands } from './ingress/commands'
 import { AgentMcpClientManager } from './mcp/client'
 import { AgentScheduler } from './automation/scheduler'
+import { AgentRepairManager } from './repair/manager'
+import { restartDirect } from '@/utils/system/restart'
 
 export interface AgentServices {
   database: AgentDatabase
@@ -29,6 +31,7 @@ export interface AgentServices {
   learning: AgentLearning | null
   mcp: AgentMcpClientManager | null
   scheduler: AgentScheduler | null
+  repair: AgentRepairManager | null
 }
 
 let services: AgentServices | null = null
@@ -82,6 +85,7 @@ export const initAgent = async () => {
     learning: null,
     mcp: null,
     scheduler: null,
+    repair: null,
   }
 
   try {
@@ -145,11 +149,17 @@ export const initAgent = async () => {
 
     const scheduler = new AgentScheduler(database, runtime)
     services.scheduler = scheduler
-    registerBuiltinTools(registry, database, runtime, scheduler, learning)
+    const repair = new AgentRepairManager(
+      database,
+      () => restartDirect({ reloadDeps: false, isPm2: false })
+    )
+    services.repair = repair
+    registerBuiltinTools(registry, database, runtime, scheduler, learning, repair)
 
     const mcp = new AgentMcpClientManager(registry, agentConfig)
     services.mcp = mcp
     await mcp.init()
+    await learning.refreshScriptTools()
 
     await scheduler.init()
 

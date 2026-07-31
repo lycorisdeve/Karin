@@ -20,6 +20,11 @@ setTimeout(async () => {
     ffplayPath = ffplay ? `"${ffplay}"` : ffplayPath
   } catch {
     const cfg = await import('@/utils/config')
+    if (
+      typeof cfg.ffmpegPath !== 'function' ||
+      typeof cfg.ffprobePath !== 'function' ||
+      typeof cfg.ffplayPath !== 'function'
+    ) return
     const ffmpeg = cfg.ffmpegPath()
     const ffprobe = cfg.ffprobePath()
     const ffplay = cfg.ffplayPath()

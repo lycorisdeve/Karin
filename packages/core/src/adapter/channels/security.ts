@@ -19,5 +19,11 @@ export const redactChannelError = (value: unknown) => {
     ...config.wecom.map(item => item.secret),
     ...config.feishu.map(item => item.appSecret),
     ...config.telegram.map(item => item.botToken),
+    ...config.qqbot.map(item => item.clientSecret),
+    ...config.wechat.map(item => item.token),
+    ...config.dingtalk.map(item => item.clientSecret),
+    ...config.discord.map(item => item.botToken),
+    ...config.whatsapp.flatMap(item => [item.accessToken, item.appSecret, item.verifyToken]),
+    ...config.email.flatMap(item => [item.imapPassword, item.smtpPassword]),
   ])
 }

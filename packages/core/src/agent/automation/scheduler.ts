@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import schedule, { type Job } from 'node-schedule'
+import { sendMsg } from '@/service/bot'
+import { agentDeliveryTarget } from '../ingress/context'
+import { agentSendMessage } from '../ingress/message-elements'
 
 import type { AgentDatabase, AgentJobRecord } from '../persistence/database'
 import type { AgentRuntime } from '../runtime/runtime'
@@ -40,19 +43,28 @@ export class AgentScheduler {
     const runId = await this.database.startJobRun(record.id)
     await this.database.audit(record.createdBy, 'job.run', record.id, { target: record.target })
     try {
-      await this.runtime.runTurn({
+      const actor = {
+        id: record.createdBy,
+        role: 'admin' as const,
+        selfId: 'automation',
+        scene: 'automation',
+        contactKey: record.target,
+      }
+      const result = await this.runtime.runTurn({
         threadKey: `job:${record.id}:${Date.now()}`,
-        actor: {
-          id: record.createdBy,
-          role: 'admin',
-          selfId: 'automation',
-          scene: 'automation',
-          contactKey: record.target,
-        },
+        actor,
         content: record.prompt,
         automated: true,
         allowedTools: record.toolAllowlist,
       })
+      const delivery = agentDeliveryTarget(actor)
+      if (delivery && result.content) {
+        await sendMsg(
+          delivery.selfId,
+          delivery.contact,
+          await agentSendMessage(result.content)
+        )
+      }
       await this.database.finishJobRun(runId, 'completed')
     } catch (error) {
       await this.database.finishJobRun(runId, 'failed', (error as Error).message)

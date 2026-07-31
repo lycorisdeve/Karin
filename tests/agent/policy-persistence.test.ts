@@ -22,7 +22,7 @@ afterEach(async () => {
 })
 
 const baseConfig = (): AgentConfig => ({
-  version: 3,
+  version: 7,
   enabled: true,
   providers: [{
     id: 'fake',
@@ -61,9 +61,45 @@ const baseConfig = (): AgentConfig => ({
       destructive: 'deny',
     },
   },
-  learning: { memory: false, skills: false },
+  learning: {
+    memory: false,
+    skills: false,
+    reflection: { enabled: true, afterFailure: true, successInterval: 5 },
+    curator: {
+      enabled: true,
+      intervalHours: 168,
+      minIdleMinutes: 120,
+      staleAfterDays: 30,
+      archiveAfterDays: 90,
+    },
+    promotion: {
+      autoMemory: true,
+      autoRouting: true,
+      autoDeclarativeSkills: true,
+      minEvidence: 3,
+      minSuccessRate: 0.8,
+      maxRegressionRate: 0.05,
+      autoRollback: true,
+      rollbackWindow: 20,
+    },
+  },
+  recovery: {
+    enabled: true,
+    maxCycles: 2,
+    maxDiagnosticCalls: 8,
+    maxDurationMs: 120000,
+    researchPolicy: 'evidence-driven',
+    repair: { requireApproval: true, workspaceRoots: [] },
+  },
   tools: { disabled: [], disabledToolsets: [] },
   mcp: { enabled: false, servers: [] },
+  scriptRuntime: {
+    pythonExecutable: '',
+    defaultTimeoutMs: 30000,
+    maxTimeoutMs: 120000,
+    defaultMaxOutputBytes: 65536,
+    maxOutputBytes: 1048576,
+  },
 })
 
 const actor = (role: AgentActor['role'] = 'admin'): AgentActor => ({
@@ -87,6 +123,28 @@ const context = (
 })
 
 describe('Agent policy and tool validation', () => {
+  it('asks for destructive operations by default while still enforcing Tool permissions', () => {
+    const registry = new AgentToolRegistry()
+    const destructive = registry.register({
+      name: 'policy.remove',
+      description: 'remove data',
+      inputSchema: { type: 'object', additionalProperties: false },
+      risk: 'destructive',
+      permission: 'admin',
+      execute: () => ({}),
+    })
+    const config = baseConfig()
+    config.policy.hardDeny = []
+    config.policy.defaults.destructive = 'ask'
+    const policy = new AgentPolicy(() => config)
+
+    expect(policy.decide(destructive, context('admin'))).toBe('ask')
+    expect(policy.decide(destructive, context('all'))).toBe('deny')
+    expect(policy.decide(destructive, context('admin', { automated: true }))).toBe('deny')
+
+    registry.unregister('policy.remove')
+  })
+
   it('applies permission, hard-deny, exact and automated rules in order', () => {
     const registry = new AgentToolRegistry()
     const publicRead = registry.register({

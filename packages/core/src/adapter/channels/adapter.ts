@@ -15,7 +15,9 @@ export interface ChannelInboundMessage {
   peerId: string
   userId: string
   userName?: string
-  text: string
+  contactName?: string
+  text?: string
+  elements?: Elements[]
   mentioned?: boolean
   replyMessageId?: string
   raw: unknown
@@ -33,6 +35,7 @@ const elementsToText = (elements: Elements[]) => elements.map(element => {
   if (element.type === 'image') return `[图片: ${element.file}]`
   if (element.type === 'file') return `[文件: ${element.name || element.file}]`
   if (element.type === 'reply') return `[回复: ${element.messageId}]`
+  if (element.type === 'button') return ''
   return `[${element.type}]`
 }).join('')
 
@@ -85,10 +88,11 @@ export class BuiltinChannelAdapter extends AdapterBase {
     const elements: Elements[] = []
     if (message.replyMessageId) elements.push(segment.reply(message.replyMessageId))
     if (message.mentioned) elements.push(segment.at(this.selfId, this.selfName))
-    if (message.text) elements.push(segment.text(message.text))
+    if (message.elements?.length) elements.push(...message.elements)
+    else if (message.text) elements.push(segment.text(message.text))
     if (!elements.length) elements.push(segment.text('[暂不支持的消息类型]'))
     if (message.scene === 'group') {
-      const contact = contactGroup(message.peerId)
+      const contact = contactGroup(message.peerId, message.contactName || '')
       return createGroupMessage({
         bot: this,
         contact,
@@ -102,7 +106,7 @@ export class BuiltinChannelAdapter extends AdapterBase {
         sender: senderGroup(message.userId, 'member', message.userName || ''),
       })
     }
-    const contact = contactFriend(message.peerId)
+    const contact = contactFriend(message.peerId, message.contactName || message.userName || '')
     return createFriendMessage({
       bot: this,
       contact,

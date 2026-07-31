@@ -98,6 +98,7 @@ export const command: CommandType = <T extends keyof MessageEventMap = keyof Mes
     permission: options.perm || options.permission || 'all',
     priority: isNaN(rank) ? 10000 : rank,
     description: options.description || options.desc,
+    usage: options.usage,
     reg,
     adapter: Array.isArray(options.adapter) ? options.adapter : [],
     dsbAdapter: Array.isArray(dsbAdapter) ? dsbAdapter : [],

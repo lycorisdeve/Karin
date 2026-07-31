@@ -68,7 +68,7 @@ export const friendHandler = async (ctx: FriendMessage) => {
   const filter = privateFilterEvent(ctx, config, friend, privateCD(friend, ctx.userId))
 
   if (filter) {
-    privateDeal(ctx, friend, (plugin: typeof cache.command[number]) => {
+    await privateDeal(ctx, friend, (plugin: typeof cache.command[number]) => {
       if (plugin.event !== 'message' && plugin.event !== 'message.friend') return false
       /** 好友场景只有这三种权限 非这三种一律跳过 */
       if (!['all', 'master', 'admin'].includes(plugin.permission)) return false
@@ -112,7 +112,7 @@ export const directHandler = async (ctx: DirectMessage) => {
   const filter = privateFilterEvent(ctx, config, friend, cd)
 
   if (filter) {
-    privateDeal(ctx, friend, (plugin: typeof cache.command[number]) => {
+    await privateDeal(ctx, friend, (plugin: typeof cache.command[number]) => {
       if (plugin.event !== 'message' && plugin.event !== 'message.direct') return false
       /** 频道私信场景只有这三种权限 非这三种一律跳过 */
       if (!['all', 'master', 'admin'].includes(plugin.permission)) return false
@@ -159,7 +159,7 @@ const privateDeal = async (
   log(ctx.userId, `未找到匹配到相应插件: ${ctx.messageId}`)
 
   /** 触发未找到匹配插件消息钩子 */
-  emptyEmit.message(ctx)
+  await emptyEmit.message(ctx)
 }
 
 /**
@@ -174,7 +174,10 @@ const privateCmd = async (
   config: ReturnType<typeof getFriendCfg>
 ): Promise<boolean> => {
   const reg = plugin.reg
-  if (reg && !reg.test(ctx.msg)) return true
+  if (reg) {
+    reg.lastIndex = 0
+    if (!reg.test(ctx.msg)) return true
+  }
   if (!disableViaAdapter(plugin, ctx.bot.adapter.protocol)) return true
   if (!disableViaPluginWhitelist(plugin, config)) return true
   if (!disableViaPluginBlacklist(plugin, config)) return true

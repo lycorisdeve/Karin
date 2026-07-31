@@ -2,13 +2,21 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import sqlite3, { type Database } from 'sqlite3'
+import { inferAgentOrigin } from '../ingress/origin'
 
 import type {
   AgentActor,
+  AgentEvolutionCandidate,
+  AgentEvolutionMetrics,
+  AgentEvolutionState,
+  AgentEvolutionTarget,
   AgentMessageRole,
   AgentPolicyDecision,
   AgentThreadState,
+  AgentToolRisk,
   AgentToolCall,
+  AgentMessageAttachmentInput,
+  AgentScriptToolDefinition,
 } from '@/types/agent'
 
 export interface AgentThreadRecord {
@@ -23,6 +31,16 @@ export interface AgentThreadRecord {
   archivedAt: number | null
   messageCount: number
   lastMessagePreview: string
+  modelProviderId: string | null
+  modelName: string | null
+  channel: string
+  protocol: string
+  accountId: string
+  accountName: string
+  contactKey: string
+  contactId: string
+  contactSubId: string
+  contactName: string
   createdAt: number
   updatedAt: number
 }
@@ -35,6 +53,7 @@ export interface AgentApprovalRecord {
   actorId: string
   toolName: string
   input: Record<string, unknown>
+  approverContactKey: string | null
   status: 'pending' | 'approved' | 'denied' | 'expired'
   expiresAt: number
   createdAt: number
@@ -77,6 +96,31 @@ export interface AgentJobRecord {
   lastRunAt: number | null
   createdAt: number
   updatedAt: number
+}
+
+export interface AgentExperienceRecord {
+  id: string
+  threadId: string
+  turnId: string
+  actorId: string
+  task: string
+  outcome: 'completed' | 'failed' | 'interrupted'
+  toolNames: string[]
+  skillIds: string[]
+  error?: string
+  correction?: string
+  createdAt: number
+}
+
+export interface AgentThreadGrantRecord {
+  id: string
+  threadId: string
+  actorId: string
+  toolName: string
+  risk: AgentToolRisk
+  mode: 'tool' | 'delegate'
+  createdAt: number
+  revokedAt: number | null
 }
 
 const migrations = [
@@ -285,6 +329,186 @@ const migrations = [
       ON agent_job_runs(job_id, started_at);
     `,
   },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        contact_key TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_sessions_thread
+      ON agent_sessions(thread_id);
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      CREATE TABLE IF NOT EXISTS agent_experiences (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        tool_names_json TEXT NOT NULL DEFAULT '[]',
+        skill_ids_json TEXT NOT NULL DEFAULT '[]',
+        error TEXT,
+        correction TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_feedback (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT,
+        actor_id TEXT NOT NULL,
+        rating INTEGER,
+        correction TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_retrieval_log (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        rank INTEGER NOT NULL,
+        selected INTEGER NOT NULL DEFAULT 1,
+        outcome TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS evolution_candidates (
+        id TEXT PRIMARY KEY,
+        target TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        source_turn_ids_json TEXT NOT NULL,
+        baseline_version TEXT,
+        candidate_version TEXT NOT NULL,
+        state TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        metrics_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS evolution_evaluations (
+        id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL,
+        passed INTEGER NOT NULL,
+        metrics_json TEXT NOT NULL,
+        report TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(candidate_id) REFERENCES evolution_candidates(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS evolution_events (
+        id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        detail_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS skill_usage (
+        skill_id TEXT PRIMARY KEY,
+        use_count INTEGER NOT NULL DEFAULT 0,
+        success_count INTEGER NOT NULL DEFAULT 0,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        correction_count INTEGER NOT NULL DEFAULT 0,
+        last_used_at INTEGER,
+        state TEXT NOT NULL DEFAULT 'active',
+        pinned INTEGER NOT NULL DEFAULT 0,
+        archived_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS thread_tool_grants (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        risk TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_experiences_thread_created
+      ON agent_experiences(thread_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_feedback_thread_created
+      ON agent_feedback(thread_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_retrieval_turn
+      ON agent_retrieval_log(turn_id, kind);
+      CREATE INDEX IF NOT EXISTS idx_evolution_state_created
+      ON evolution_candidates(state, created_at);
+      CREATE INDEX IF NOT EXISTS idx_thread_grants_active
+      ON thread_tool_grants(thread_id, tool_name, revoked_at);
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      ALTER TABLE threads ADD COLUMN model_provider_id TEXT;
+      ALTER TABLE threads ADD COLUMN model_name TEXT;
+      ALTER TABLE skill_versions ADD COLUMN name TEXT NOT NULL DEFAULT '';
+      ALTER TABLE skill_versions ADD COLUMN description TEXT NOT NULL DEFAULT '';
+    `,
+  },
+  {
+    version: 8,
+    sql: `
+      ALTER TABLE skill_versions
+      ADD COLUMN script_tools_json TEXT NOT NULL DEFAULT '[]';
+    `,
+  },
+  {
+    version: 9,
+    sql: `
+      ALTER TABLE threads ADD COLUMN channel_kind TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN protocol TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN account_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN account_name TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN contact_key TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN contact_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN contact_sub_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE threads ADD COLUMN contact_name TEXT NOT NULL DEFAULT '';
+      ALTER TABLE approvals ADD COLUMN approver_contact_key TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_threads_channel_archived_updated
+      ON threads(channel_kind, archived_at, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_approvals_contact_status
+      ON approvals(approver_contact_key, status, expires_at);
+    `,
+  },
+  {
+    version: 10,
+    sql: `
+      CREATE TABLE IF NOT EXISTS message_attachments (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_message_attachments_message
+      ON message_attachments(message_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_message_attachments_thread
+      ON message_attachments(thread_id);
+    `,
+  },
 ]
 
 const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
@@ -294,6 +518,19 @@ const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
   } catch {
     return fallback
   }
+}
+
+const parseSkillFrontmatter = (content: string) => {
+  const header = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || ''
+  const name = header.match(/^name:\s*(.+)$/m)?.[1]?.trim() || ''
+  const rawDescription = header.match(/^description:\s*(.+)$/m)?.[1]?.trim() || ''
+  let description = rawDescription
+  try {
+    description = JSON.parse(rawDescription)
+  } catch {
+    // 兼容旧版本未使用 JSON 字符串的 frontmatter。
+  }
+  return { name, description: String(description || '') }
 }
 
 export class AgentDatabase {
@@ -340,6 +577,105 @@ export class AgentDatabase {
       }
     }
 
+    const legacySkillVersions = await this.all<{
+      id: string
+      content: string
+      name: string
+      description: string
+    }>(
+      `SELECT id, content, name, description FROM skill_versions
+       WHERE name = '' OR description = ''`
+    )
+    for (const version of legacySkillVersions) {
+      const metadata = parseSkillFrontmatter(version.content)
+      await this.run(
+        'UPDATE skill_versions SET name = ?, description = ? WHERE id = ?',
+        [
+          version.name || metadata.name,
+          version.description || metadata.description,
+          version.id,
+        ]
+      )
+    }
+
+    const legacyThreads = await this.all<Record<string, unknown>>(
+      `SELECT id, thread_key, parent_thread_id, actor_id, scene,
+        channel_kind, protocol, account_id, account_name,
+        contact_key, contact_id, contact_sub_id, contact_name
+       FROM threads
+       WHERE channel_kind = '' OR protocol = ''
+         OR (contact_key = '' AND channel_kind NOT IN ('system'))`
+    )
+    if (legacyThreads.length) {
+      const allThreads = await this.all<Record<string, unknown>>(
+        `SELECT id, thread_key, parent_thread_id, actor_id, scene,
+          channel_kind, protocol, account_id, account_name,
+          contact_key, contact_id, contact_sub_id, contact_name
+         FROM threads`
+      )
+      const rowsById = new Map(allThreads.map(row => [String(row.id), row]))
+      const resolved = new Map<string, ReturnType<typeof inferAgentOrigin>>()
+      const resolveOrigin = (
+        row: Record<string, unknown>,
+        visiting = new Set<string>()
+      ): ReturnType<typeof inferAgentOrigin> => {
+        const id = String(row.id)
+        const cached = resolved.get(id)
+        if (cached) return cached
+        if (visiting.has(id)) {
+          return inferAgentOrigin(
+            String(row.thread_key),
+            String(row.scene),
+            String(row.actor_id)
+          )
+        }
+        visiting.add(id)
+        const parent = row.parent_thread_id
+          ? rowsById.get(String(row.parent_thread_id))
+          : undefined
+        const inferred = parent
+          ? resolveOrigin(parent, visiting)
+          : inferAgentOrigin(
+            String(row.thread_key),
+            String(row.scene),
+            String(row.actor_id)
+          )
+        const origin = {
+          channel: String(row.channel_kind || inferred.channel),
+          protocol: String(row.protocol || inferred.protocol),
+          accountId: String(row.account_id || inferred.accountId),
+          accountName: String(row.account_name || inferred.accountName),
+          contactKey: String(row.contact_key || inferred.contactKey),
+          contactId: String(row.contact_id || inferred.contactId),
+          contactSubId: String(row.contact_sub_id || inferred.contactSubId),
+          contactName: String(row.contact_name || inferred.contactName),
+        }
+        resolved.set(id, origin)
+        visiting.delete(id)
+        return origin
+      }
+      for (const row of legacyThreads) {
+        const origin = resolveOrigin(row)
+        await this.run(
+          `UPDATE threads SET
+            channel_kind = ?, protocol = ?, account_id = ?, account_name = ?,
+            contact_key = ?, contact_id = ?, contact_sub_id = ?, contact_name = ?
+           WHERE id = ?`,
+          [
+            origin.channel,
+            origin.protocol,
+            origin.accountId,
+            origin.accountName,
+            origin.contactKey,
+            origin.contactId,
+            origin.contactSubId,
+            origin.contactName,
+            String(row.id),
+          ]
+        )
+      }
+    }
+
     try {
       await this.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
@@ -352,18 +688,20 @@ export class AgentDatabase {
     }
 
     const now = Date.now()
-    await this.run('UPDATE turns SET state = ?, error = ?, updated_at = ? WHERE state IN (?, ?)', [
+    await this.run('UPDATE turns SET state = ?, error = ?, updated_at = ? WHERE state IN (?, ?, ?)', [
       'interrupted',
       'Karin 重启，运行中的回合已中断',
       now,
       'running',
       'waiting_approval',
+      'stopping',
     ])
-    await this.run('UPDATE threads SET state = ?, updated_at = ? WHERE state IN (?, ?)', [
+    await this.run('UPDATE threads SET state = ?, updated_at = ? WHERE state IN (?, ?, ?)', [
       'interrupted',
       now,
       'running',
       'waiting_approval',
+      'stopping',
     ])
     await this.run('UPDATE approvals SET status = ?, resolved_at = ? WHERE status = ?', [
       'expired',
@@ -436,6 +774,16 @@ export class AgentDatabase {
       archivedAt: row.archived_at ? Number(row.archived_at) : null,
       messageCount: Number(row.message_count || 0),
       lastMessagePreview: String(row.last_message_preview || ''),
+      modelProviderId: row.model_provider_id ? String(row.model_provider_id) : null,
+      modelName: row.model_name ? String(row.model_name) : null,
+      channel: String(row.channel_kind || ''),
+      protocol: String(row.protocol || ''),
+      accountId: String(row.account_id || ''),
+      accountName: String(row.account_name || ''),
+      contactKey: String(row.contact_key || ''),
+      contactId: String(row.contact_id || ''),
+      contactSubId: String(row.contact_sub_id || ''),
+      contactName: String(row.contact_name || ''),
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
     }
@@ -455,6 +803,34 @@ export class AgentDatabase {
     `
   }
 
+  private async refreshThreadOrigin (id: string, actor: AgentActor) {
+    const origin = actor.origin
+    if (!origin) return
+    await this.run(
+      `UPDATE threads SET
+        channel_kind = CASE WHEN ? <> '' THEN ? ELSE channel_kind END,
+        protocol = CASE WHEN ? <> '' THEN ? ELSE protocol END,
+        account_id = CASE WHEN ? <> '' THEN ? ELSE account_id END,
+        account_name = CASE WHEN ? <> '' THEN ? ELSE account_name END,
+        contact_key = CASE WHEN ? <> '' THEN ? ELSE contact_key END,
+        contact_id = CASE WHEN ? <> '' THEN ? ELSE contact_id END,
+        contact_sub_id = CASE WHEN ? <> '' THEN ? ELSE contact_sub_id END,
+        contact_name = CASE WHEN ? <> '' THEN ? ELSE contact_name END
+       WHERE id = ?`,
+      [
+        origin.channel, origin.channel,
+        origin.protocol, origin.protocol,
+        origin.accountId, origin.accountId,
+        origin.accountName, origin.accountName,
+        origin.contactKey, origin.contactKey,
+        origin.contactId, origin.contactId,
+        origin.contactSubId, origin.contactSubId,
+        origin.contactName, origin.contactName,
+        id,
+      ]
+    )
+  }
+
   async getOrCreateThread (
     threadKey: string,
     actor: AgentActor,
@@ -464,16 +840,62 @@ export class AgentDatabase {
       `${this.threadSelect()} WHERE thread_key = ?`,
       [threadKey]
     )
-    if (existing) return this.mapThread(existing)
+    if (existing) {
+      await this.refreshThreadOrigin(String(existing.id), actor)
+      return (await this.getThread(String(existing.id)))!
+    }
 
     const id = randomUUID()
     const now = Date.now()
+    const parent = parentThreadId
+      ? await this.get<Record<string, unknown>>(
+        `SELECT model_provider_id, model_name, channel_kind, protocol,
+          account_id, account_name, contact_key, contact_id, contact_sub_id, contact_name
+         FROM threads WHERE id = ?`,
+        [parentThreadId]
+      )
+      : null
+    const inferred = inferAgentOrigin(threadKey, actor.scene, actor.id)
+    const origin = actor.origin || (parent
+      ? {
+        channel: String(parent.channel_kind || ''),
+        protocol: String(parent.protocol || ''),
+        accountId: String(parent.account_id || ''),
+        accountName: String(parent.account_name || ''),
+        contactKey: String(parent.contact_key || ''),
+        contactId: String(parent.contact_id || ''),
+        contactSubId: String(parent.contact_sub_id || ''),
+        contactName: String(parent.contact_name || ''),
+      }
+      : inferred)
     try {
       await this.run(
         `INSERT INTO threads(
-          id, thread_key, parent_thread_id, actor_id, scene, state, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, threadKey, parentThreadId || null, actor.id, actor.scene, 'idle', now, now]
+          id, thread_key, parent_thread_id, actor_id, scene, state,
+          model_provider_id, model_name, channel_kind, protocol,
+          account_id, account_name, contact_key, contact_id, contact_sub_id, contact_name,
+          created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          threadKey,
+          parentThreadId || null,
+          actor.id,
+          actor.scene,
+          'idle',
+          parent?.model_provider_id || null,
+          parent?.model_name || null,
+          origin.channel,
+          origin.protocol,
+          origin.accountId,
+          origin.accountName,
+          origin.contactKey,
+          origin.contactId,
+          origin.contactSubId,
+          origin.contactName,
+          now,
+          now,
+        ]
       )
       if (parentThreadId) {
         await this.run(
@@ -510,6 +932,16 @@ export class AgentDatabase {
       archivedAt: null,
       messageCount: 0,
       lastMessagePreview: '',
+      modelProviderId: parent?.model_provider_id ? String(parent.model_provider_id) : null,
+      modelName: parent?.model_name ? String(parent.model_name) : null,
+      channel: origin.channel,
+      protocol: origin.protocol,
+      accountId: origin.accountId,
+      accountName: origin.accountName,
+      contactKey: origin.contactKey,
+      contactId: origin.contactId,
+      contactSubId: origin.contactSubId,
+      contactName: origin.contactName,
       createdAt: now,
       updatedAt: now,
     }
@@ -523,12 +955,60 @@ export class AgentDatabase {
     return row ? this.mapThread(row) : null
   }
 
+  async getThreadByKey (threadKey: string) {
+    const row = await this.get<Record<string, unknown>>(
+      `${this.threadSelect()} WHERE threads.thread_key = ?`,
+      [threadKey]
+    )
+    return row ? this.mapThread(row) : null
+  }
+
+  async getOrCreateSession (actor: AgentActor) {
+    const session = await this.get<{ thread_id: string }>(
+      'SELECT thread_id FROM agent_sessions WHERE contact_key = ?',
+      [actor.contactKey]
+    )
+    if (session) {
+      const thread = await this.getThread(session.thread_id)
+      if (thread) {
+        await this.refreshThreadOrigin(thread.id, actor)
+        return (await this.getThread(thread.id))!
+      }
+    }
+
+    const thread = await this.getOrCreateThread(actor.contactKey, actor)
+    await this.activateSession(actor.contactKey, thread.id)
+    return thread
+  }
+
+  async createSession (actor: AgentActor) {
+    const thread = await this.getOrCreateThread(
+      `${actor.contactKey}:session:${randomUUID()}`,
+      actor
+    )
+    await this.activateSession(actor.contactKey, thread.id)
+    return thread
+  }
+
+  async activateSession (contactKey: string, threadId: string) {
+    await this.run(
+      `INSERT INTO agent_sessions(contact_key, thread_id, updated_at)
+       VALUES(?, ?, ?)
+       ON CONFLICT(contact_key) DO UPDATE SET
+         thread_id = excluded.thread_id,
+         updated_at = excluded.updated_at`,
+      [contactKey, threadId, Date.now()]
+    )
+  }
+
   async listThreads (
     options: number | {
       limit?: number
       state?: 'active' | 'archived' | 'all'
       query?: string
       cursor?: number
+      channel?: string
+      rootOnly?: boolean
     } = 100
   ) {
     const normalized = typeof options === 'number' ? { limit: options } : options
@@ -536,6 +1016,11 @@ export class AgentDatabase {
     const params: unknown[] = []
     if (normalized.state === 'archived') conditions.push('threads.archived_at IS NOT NULL')
     else if (normalized.state !== 'all') conditions.push('threads.archived_at IS NULL')
+    if (normalized.channel?.trim()) {
+      conditions.push('threads.channel_kind = ?')
+      params.push(normalized.channel.trim())
+    }
+    if (normalized.rootOnly) conditions.push('threads.parent_thread_id IS NULL')
     if (normalized.query?.trim()) {
       conditions.push(`(
         threads.title LIKE ? OR threads.summary LIKE ? OR EXISTS(
@@ -560,6 +1045,52 @@ export class AgentDatabase {
     return rows.map(row => this.mapThread(row))
   }
 
+  async listThreadChannels () {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT channel_kind,
+        SUM(CASE WHEN archived_at IS NULL THEN 1 ELSE 0 END) AS active_count,
+        SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) AS archived_count,
+        MAX(updated_at) AS last_updated_at
+       FROM threads
+       WHERE parent_thread_id IS NULL
+         AND channel_kind NOT IN ('', 'system')
+       GROUP BY channel_kind
+       ORDER BY last_updated_at DESC`
+    )
+    const channels = rows.map(row => ({
+      channel: String(row.channel_kind),
+      activeCount: Number(row.active_count || 0),
+      archivedCount: Number(row.archived_count || 0),
+      lastUpdatedAt: Number(row.last_updated_at || 0),
+    }))
+    if (!channels.some(item => item.channel === 'web')) {
+      channels.push({
+        channel: 'web',
+        activeCount: 0,
+        archivedCount: 0,
+        lastUpdatedAt: 0,
+      })
+    }
+    return channels
+  }
+
+  async getThreadTree (rootId: string) {
+    const nodes = await this.all<{ id: string, depth: number }>(
+      `WITH RECURSIVE tree(id, depth) AS (
+        SELECT id, 0 FROM threads WHERE id = ?
+        UNION ALL
+        SELECT threads.id, tree.depth + 1
+        FROM threads JOIN tree ON threads.parent_thread_id = tree.id
+       )
+       SELECT id, depth FROM tree ORDER BY depth ASC`,
+      [rootId]
+    )
+    return (await Promise.all(nodes.map(async node => {
+      const thread = await this.getThread(node.id)
+      return thread ? { ...thread, depth: node.depth } : null
+    }))).filter((thread): thread is AgentThreadRecord & { depth: number } => Boolean(thread))
+  }
+
   async updateThread (
     id: string,
     input: {
@@ -581,6 +1112,21 @@ export class AgentDatabase {
     assignments.push('updated_at = ?')
     params.push(Date.now(), id)
     await this.run(`UPDATE threads SET ${assignments.join(', ')} WHERE id = ?`, params)
+    return this.getThread(id)
+  }
+
+  async setThreadModel (
+    id: string,
+    providerId: string | null,
+    modelName: string | null
+  ) {
+    const result = await this.run(
+      `UPDATE threads
+       SET model_provider_id = ?, model_name = ?, updated_at = ?
+       WHERE id = ?`,
+      [providerId, modelName, Date.now(), id]
+    )
+    if (!result.changes) throw new Error('会话不存在')
     return this.getThread(id)
   }
 
@@ -614,6 +1160,23 @@ export class AgentDatabase {
     return id
   }
 
+  async listTurns (threadId: string) {
+    const rows = await this.all<Record<string, unknown>>(
+      'SELECT * FROM turns WHERE thread_id = ? ORDER BY created_at ASC',
+      [threadId]
+    )
+    return rows.map(row => ({
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      actorId: String(row.actor_id),
+      state: row.state as AgentThreadState,
+      automated: Boolean(row.automated),
+      error: row.error ? String(row.error) : undefined,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }))
+  }
+
   async updateTurn (turnId: string, threadId: string, state: AgentThreadState, error?: string) {
     const now = Date.now()
     await this.run('UPDATE turns SET state = ?, error = ?, updated_at = ? WHERE id = ?', [
@@ -634,6 +1197,7 @@ export class AgentDatabase {
       name?: string
       toolCallId?: string
       toolCalls?: AgentToolCall[]
+      attachments?: AgentMessageAttachmentInput[]
     } = {}
   ) {
     const id = randomUUID()
@@ -654,6 +1218,24 @@ export class AgentDatabase {
         now,
       ]
     )
+    for (const attachment of options.attachments || []) {
+      await this.run(
+        `INSERT INTO message_attachments(
+          id, message_id, thread_id, type, storage_path, mime, size, name, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          randomUUID(),
+          id,
+          threadId,
+          attachment.type,
+          attachment.storagePath,
+          attachment.mime,
+          attachment.size,
+          attachment.name,
+          now,
+        ]
+      )
+    }
     if (this.ftsAvailable && content) {
       await this.run('INSERT INTO message_fts(message_id, thread_id, content) VALUES(?, ?, ?)', [
         id,
@@ -678,6 +1260,15 @@ export class AgentDatabase {
       ) ORDER BY created_at ASC`,
       params
     )
+    const messageIds = rows.map(row => String(row.id))
+    const attachments = messageIds.length
+      ? await this.all<Record<string, unknown>>(
+        `SELECT * FROM message_attachments
+         WHERE message_id IN (${messageIds.map(() => '?').join(', ')})
+         ORDER BY created_at ASC`,
+        messageIds
+      )
+      : []
     return rows.map(row => ({
       id: String(row.id),
       threadId: String(row.thread_id),
@@ -687,8 +1278,39 @@ export class AgentDatabase {
       name: row.name ? String(row.name) : undefined,
       toolCallId: row.tool_call_id ? String(row.tool_call_id) : undefined,
       toolCalls: parseJson<AgentToolCall[]>(row.tool_calls_json as string, []),
+      attachments: attachments
+        .filter(item => String(item.message_id) === String(row.id))
+        .map(item => ({
+          id: String(item.id),
+          messageId: String(item.message_id),
+          type: 'image' as const,
+          mime: String(item.mime),
+          size: Number(item.size),
+          name: String(item.name),
+          url: `/api/v1/agent/media/${String(item.id)}`,
+          createdAt: Number(item.created_at),
+        })),
       createdAt: Number(row.created_at),
     }))
+  }
+
+  async getMessageAttachment (id: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM message_attachments WHERE id = ?',
+      [id]
+    )
+    if (!row) return null
+    return {
+      id: String(row.id),
+      messageId: String(row.message_id),
+      threadId: String(row.thread_id),
+      type: 'image' as const,
+      storagePath: String(row.storage_path),
+      mime: String(row.mime),
+      size: Number(row.size),
+      name: String(row.name),
+      createdAt: Number(row.created_at),
+    }
   }
 
   async searchMessages (query: string, limit = 100) {
@@ -796,16 +1418,26 @@ export class AgentDatabase {
     const ids = await this.getThreadTreeIds(rootId)
     if (!ids.length) return false
     const placeholders = ids.map(() => '?').join(', ')
+    const attachments = await this.all<{ storage_path: string }>(
+      `SELECT storage_path FROM message_attachments
+       WHERE thread_id IN (${placeholders})`,
+      ids
+    )
     await this.exec('BEGIN IMMEDIATE')
     try {
       if (this.ftsAvailable) {
         await this.run(`DELETE FROM message_fts WHERE thread_id IN (${placeholders})`, ids)
       }
       for (const table of [
+        'message_attachments',
         'thread_skill_snapshots',
+        'thread_tool_grants',
         'approvals',
         'tool_calls',
         'usage',
+        'agent_retrieval_log',
+        'agent_feedback',
+        'agent_experiences',
         'audit_log',
         'messages',
         'turns',
@@ -826,6 +1458,9 @@ export class AgentDatabase {
         ]
       )
       await this.exec('COMMIT')
+      await Promise.allSettled(attachments.map(attachment =>
+        fs.promises.unlink(attachment.storage_path)
+      ))
       return true
     } catch (error) {
       await this.exec('ROLLBACK')
@@ -837,6 +1472,7 @@ export class AgentDatabase {
     threadId: string,
     turnId: string,
     actorId: string,
+    approverContactKey: string | null,
     call: AgentToolCall,
     ttlMs: number
   ) {
@@ -845,8 +1481,8 @@ export class AgentDatabase {
     await this.run(
       `INSERT INTO approvals(
         id, thread_id, turn_id, tool_call_id, actor_id, tool_name, input_json,
-        status, expires_at, created_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        approver_contact_key, status, expires_at, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         threadId,
@@ -855,6 +1491,7 @@ export class AgentDatabase {
         actorId,
         call.name,
         JSON.stringify(call.arguments),
+        approverContactKey,
         'pending',
         now + ttlMs,
         now,
@@ -872,6 +1509,9 @@ export class AgentDatabase {
       actorId: String(row.actor_id),
       toolName: String(row.tool_name),
       input: parseJson<Record<string, unknown>>(row.input_json as string, {}),
+      approverContactKey: row.approver_contact_key
+        ? String(row.approver_contact_key)
+        : null,
       status: row.status as AgentApprovalRecord['status'],
       expiresAt: Number(row.expires_at),
       createdAt: Number(row.created_at),
@@ -895,6 +1535,14 @@ export class AgentDatabase {
       : await this.all<Record<string, unknown>>(
         'SELECT * FROM approvals ORDER BY created_at DESC LIMIT 500'
       )
+    return rows.map(row => this.mapApproval(row))
+  }
+
+  async listApprovalsByThread (threadId: string) {
+    const rows = await this.all<Record<string, unknown>>(
+      'SELECT * FROM approvals WHERE thread_id = ? ORDER BY created_at ASC',
+      [threadId]
+    )
     return rows.map(row => this.mapApproval(row))
   }
 
@@ -983,20 +1631,47 @@ export class AgentDatabase {
     )
   }
 
+  async getActiveScriptSkillVersions () {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT sv.*
+       FROM skills AS s
+       INNER JOIN skill_versions AS sv ON sv.id = s.active_version_id
+       WHERE s.enabled = 1
+       ORDER BY s.updated_at DESC`
+    )
+    return rows.map(row => ({
+      skillId: String(row.skill_id),
+      versionId: String(row.id),
+      version: Number(row.version),
+      scriptTools: parseJson<AgentScriptToolDefinition[]>(
+        row.script_tools_json as string,
+        []
+      ),
+    }))
+  }
+
   async addSkillVersion (input: {
+    skillId?: string
+    newSkillId?: string
     name: string
     description: string
     content: string
     tools: string[]
     sourceTurnId: string
     contentHash: string
+    scriptTools?: AgentScriptToolDefinition[]
   }) {
     const now = Date.now()
-    const existing = await this.get<Record<string, unknown>>(
-      'SELECT * FROM skills WHERE name = ?',
-      [input.name]
+    const existing = input.skillId
+      ? await this.get<Record<string, unknown>>('SELECT * FROM skills WHERE id = ?', [input.skillId])
+      : await this.get<Record<string, unknown>>('SELECT * FROM skills WHERE name = ?', [input.name])
+    if (input.skillId && !existing) throw new Error('Skill 不存在')
+    const duplicate = await this.get<{ id: string }>(
+      'SELECT id FROM skills WHERE name = ? AND id != ?',
+      [input.name, input.skillId || '']
     )
-    const skillId = existing ? String(existing.id) : randomUUID()
+    if (duplicate) throw new Error(`Skill 名称已存在: ${input.name}`)
+    const skillId = existing ? String(existing.id) : input.newSkillId || randomUUID()
     if (!existing) {
       await this.run(
         `INSERT INTO skills(id, name, description, enabled, created_at, updated_at)
@@ -1012,8 +1687,8 @@ export class AgentDatabase {
     await this.run(
       `INSERT INTO skill_versions(
         id, skill_id, version, content, tools_json, source_turn_id,
-        content_hash, validation_status, created_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, 'valid', ?)`,
+        content_hash, validation_status, created_at, name, description, script_tools_json
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?)`,
       [
         versionId,
         skillId,
@@ -1023,27 +1698,149 @@ export class AgentDatabase {
         input.sourceTurnId,
         input.contentHash,
         now,
+        input.name,
+        input.description,
+        JSON.stringify(input.scriptTools || []),
       ]
     )
     await this.run(
-      'UPDATE skills SET description = ?, active_version_id = ?, updated_at = ? WHERE id = ?',
-      [input.description, versionId, now, skillId]
+      `UPDATE skills
+       SET name = ?, description = ?, active_version_id = ?, updated_at = ?
+       WHERE id = ?`,
+      [input.name, input.description, versionId, now, skillId]
     )
     return { skillId, versionId }
   }
 
   async rollbackSkill (skillId: string, versionId: string) {
-    const version = await this.get<{ id: string }>(
-      'SELECT id FROM skill_versions WHERE id = ? AND skill_id = ?',
+    const version = await this.get<{ id: string; name: string; description: string }>(
+      `SELECT id, name, description FROM skill_versions
+       WHERE id = ? AND skill_id = ?`,
       [versionId, skillId]
     )
     if (!version) return false
-    await this.run('UPDATE skills SET active_version_id = ?, updated_at = ? WHERE id = ?', [
-      versionId,
-      Date.now(),
-      skillId,
-    ])
+    const duplicate = await this.get<{ id: string }>(
+      'SELECT id FROM skills WHERE name = ? AND id != ?',
+      [version.name, skillId]
+    )
+    if (duplicate) throw new Error(`无法回滚：Skill 名称已被占用 ${version.name}`)
+    await this.run(
+      `UPDATE skills
+       SET name = ?, description = ?, active_version_id = ?, updated_at = ?
+       WHERE id = ?`,
+      [version.name, version.description, versionId, Date.now(), skillId]
+    )
     return true
+  }
+
+  async getSkill (skillId: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM skills WHERE id = ?',
+      [skillId]
+    )
+    if (!row) return null
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description),
+      enabled: Boolean(row.enabled),
+      activeVersionId: row.active_version_id ? String(row.active_version_id) : null,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    } satisfies AgentSkillRecord
+  }
+
+  async deleteSkillCascade (skillId: string, actorId: string) {
+    const skill = await this.getSkill(skillId)
+    if (!skill) throw new Error('Skill 不存在')
+    const jobs = await this.listJobs()
+    const affectedJobs = jobs.filter(job => job.skillIds.includes(skillId))
+    const candidates = await this.all<{
+      id: string
+      state: string
+      payload_json: string
+    }>(
+      'SELECT id, state, payload_json FROM evolution_candidates WHERE target = \'skill\''
+    )
+    const affectedCandidates = candidates.filter(candidate =>
+      String(parseJson<Record<string, unknown>>(candidate.payload_json, {}).skillId || '') === skillId
+    )
+    const snapshotCount = Number((await this.get<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM thread_skill_snapshots WHERE skill_id = ?',
+      [skillId]
+    ))?.count || 0)
+    const versionCount = Number((await this.get<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM skill_versions WHERE skill_id = ?',
+      [skillId]
+    ))?.count || 0)
+
+    await this.exec('BEGIN IMMEDIATE')
+    try {
+      const now = Date.now()
+      for (const job of affectedJobs) {
+        await this.run(
+          'UPDATE agent_jobs SET skill_ids_json = ?, updated_at = ? WHERE id = ?',
+          [JSON.stringify(job.skillIds.filter(id => id !== skillId)), now, job.id]
+        )
+      }
+      for (const candidate of affectedCandidates) {
+        const payload = parseJson<Record<string, unknown>>(candidate.payload_json, {})
+        delete payload.skillId
+        payload.deletedSkillId = skillId
+        const state = ['rejected', 'rolled_back'].includes(candidate.state)
+          ? candidate.state
+          : 'rolled_back'
+        await this.run(
+          `UPDATE evolution_candidates
+           SET state = ?, payload_json = ?, updated_at = ?
+           WHERE id = ?`,
+          [state, JSON.stringify(payload), now, candidate.id]
+        )
+        await this.run(
+          `INSERT INTO evolution_events(id, candidate_id, action, actor_id, detail_json, created_at)
+           VALUES(?, ?, 'skill.deleted', ?, ?, ?)`,
+          [randomUUID(), candidate.id, actorId, JSON.stringify({ skillId }), now]
+        )
+      }
+      await this.run('DELETE FROM thread_skill_snapshots WHERE skill_id = ?', [skillId])
+      await this.run(
+        'DELETE FROM agent_retrieval_log WHERE kind = \'skill\' AND item_id = ?',
+        [skillId]
+      )
+      await this.run('DELETE FROM skill_usage WHERE skill_id = ?', [skillId])
+      await this.run('DELETE FROM skill_versions WHERE skill_id = ?', [skillId])
+      await this.run('DELETE FROM skills WHERE id = ?', [skillId])
+      await this.run(
+        `INSERT INTO audit_log(
+          id, thread_id, actor_id, action, target, detail_json, created_at
+        ) VALUES(?, NULL, ?, 'skill.delete', ?, ?, ?)`,
+        [
+          randomUUID(),
+          actorId,
+          skillId,
+          JSON.stringify({
+            name: skill.name,
+            versions: versionCount,
+            snapshots: snapshotCount,
+            jobsUpdated: affectedJobs.length,
+            candidatesUpdated: affectedCandidates.length,
+          }),
+          now,
+        ]
+      )
+      await this.exec('COMMIT')
+      return {
+        deleted: true,
+        name: skill.name,
+        versions: versionCount,
+        snapshots: snapshotCount,
+        jobsUpdated: affectedJobs.length,
+        candidatesUpdated: affectedCandidates.length,
+      }
+    } catch (error) {
+      await this.exec('ROLLBACK')
+      throw error
+    }
   }
 
   async setSkillEnabled (skillId: string, enabled: boolean) {
@@ -1056,8 +1853,8 @@ export class AgentDatabase {
   }
 
   async getThreadSkillContents (threadId: string) {
-    const rows = await this.all<{ name: string; content: string }>(
-      `SELECT s.name, sv.content
+    const rows = await this.all<{ id: string; name: string; content: string }>(
+      `SELECT s.id, s.name, sv.content
        FROM thread_skill_snapshots snapshot
        JOIN skills s ON s.id = snapshot.skill_id
        JOIN skill_versions sv ON sv.id = snapshot.skill_version_id
@@ -1065,6 +1862,408 @@ export class AgentDatabase {
       [threadId]
     )
     return rows
+  }
+
+  async recordExperience (
+    input: Omit<AgentExperienceRecord, 'id' | 'createdAt'>
+  ) {
+    const id = randomUUID()
+    await this.run(
+      `INSERT INTO agent_experiences(
+        id, thread_id, turn_id, actor_id, task, outcome, tool_names_json,
+        skill_ids_json, error, correction, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.threadId,
+        input.turnId,
+        input.actorId,
+        input.task.slice(0, 20000),
+        input.outcome,
+        JSON.stringify(input.toolNames),
+        JSON.stringify(input.skillIds),
+        input.error || null,
+        input.correction || null,
+        Date.now(),
+      ]
+    )
+    return id
+  }
+
+  async listExperiences (limit = 200, outcome?: AgentExperienceRecord['outcome']) {
+    const rows = outcome
+      ? await this.all<Record<string, unknown>>(
+        'SELECT * FROM agent_experiences WHERE outcome = ? ORDER BY created_at DESC LIMIT ?',
+        [outcome, Math.max(1, Math.min(limit, 1000))]
+      )
+      : await this.all<Record<string, unknown>>(
+        'SELECT * FROM agent_experiences ORDER BY created_at DESC LIMIT ?',
+        [Math.max(1, Math.min(limit, 1000))]
+      )
+    return rows.map(row => ({
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      turnId: String(row.turn_id),
+      actorId: String(row.actor_id),
+      task: String(row.task),
+      outcome: row.outcome as AgentExperienceRecord['outcome'],
+      toolNames: parseJson<string[]>(row.tool_names_json as string, []),
+      skillIds: parseJson<string[]>(row.skill_ids_json as string, []),
+      error: row.error ? String(row.error) : undefined,
+      correction: row.correction ? String(row.correction) : undefined,
+      createdAt: Number(row.created_at),
+    }))
+  }
+
+  async addFeedback (input: {
+    threadId: string
+    turnId?: string
+    actorId: string
+    rating?: number
+    correction?: string
+  }) {
+    const id = randomUUID()
+    await this.run(
+      `INSERT INTO agent_feedback(
+        id, thread_id, turn_id, actor_id, rating, correction, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.threadId,
+        input.turnId || null,
+        input.actorId,
+        input.rating ?? null,
+        input.correction?.trim().slice(0, 4000) || null,
+        Date.now(),
+      ]
+    )
+    return id
+  }
+
+  async recordRetrieval (input: {
+    threadId: string
+    turnId: string
+    kind: 'memory' | 'skill' | 'tool'
+    itemId: string
+    rank: number
+    selected?: boolean
+    outcome?: string
+  }) {
+    await this.run(
+      `INSERT INTO agent_retrieval_log(
+        id, thread_id, turn_id, kind, item_id, rank, selected, outcome, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        randomUUID(),
+        input.threadId,
+        input.turnId,
+        input.kind,
+        input.itemId,
+        input.rank,
+        input.selected === false ? 0 : 1,
+        input.outcome || null,
+        Date.now(),
+      ]
+    )
+  }
+
+  private mapEvolutionCandidate (row: Record<string, unknown>): AgentEvolutionCandidate {
+    return {
+      id: String(row.id),
+      target: row.target as AgentEvolutionTarget,
+      kind: row.kind === 'executable' ? 'executable' : 'declarative',
+      sourceTurnIds: parseJson<string[]>(row.source_turn_ids_json as string, []),
+      baselineVersion: row.baseline_version ? String(row.baseline_version) : undefined,
+      candidateVersion: String(row.candidate_version),
+      state: row.state as AgentEvolutionState,
+      summary: String(row.summary),
+      payload: parseJson<Record<string, unknown>>(row.payload_json as string, {}),
+      metrics: parseJson<AgentEvolutionMetrics | undefined>(
+        row.metrics_json as string,
+        undefined
+      ),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
+  async createEvolutionCandidate (input: {
+    target: AgentEvolutionTarget
+    kind: 'declarative' | 'executable'
+    sourceTurnIds: string[]
+    baselineVersion?: string
+    candidateVersion: string
+    summary: string
+    payload: Record<string, unknown>
+  }) {
+    const id = randomUUID()
+    const now = Date.now()
+    await this.run(
+      `INSERT INTO evolution_candidates(
+        id, target, kind, source_turn_ids_json, baseline_version,
+        candidate_version, state, summary, payload_json, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
+      [
+        id,
+        input.target,
+        input.kind,
+        JSON.stringify([...new Set(input.sourceTurnIds)]),
+        input.baselineVersion || null,
+        input.candidateVersion,
+        input.summary.slice(0, 500),
+        JSON.stringify(input.payload),
+        now,
+        now,
+      ]
+    )
+    return this.getEvolutionCandidate(id)
+  }
+
+  async getEvolutionCandidate (id: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM evolution_candidates WHERE id = ?',
+      [id]
+    )
+    return row ? this.mapEvolutionCandidate(row) : null
+  }
+
+  async listEvolutionCandidates (
+    state?: AgentEvolutionState,
+    limit = 200
+  ) {
+    const rows = state
+      ? await this.all<Record<string, unknown>>(
+        'SELECT * FROM evolution_candidates WHERE state = ? ORDER BY created_at DESC LIMIT ?',
+        [state, Math.max(1, Math.min(limit, 1000))]
+      )
+      : await this.all<Record<string, unknown>>(
+        'SELECT * FROM evolution_candidates ORDER BY created_at DESC LIMIT ?',
+        [Math.max(1, Math.min(limit, 1000))]
+      )
+    return rows.map(row => this.mapEvolutionCandidate(row))
+  }
+
+  async updateEvolutionCandidate (
+    id: string,
+    state: AgentEvolutionState,
+    metrics?: AgentEvolutionMetrics
+  ) {
+    const result = await this.run(
+      `UPDATE evolution_candidates
+       SET state = ?, metrics_json = COALESCE(?, metrics_json), updated_at = ?
+       WHERE id = ?`,
+      [state, metrics ? JSON.stringify(metrics) : null, Date.now(), id]
+    )
+    return result.changes > 0
+  }
+
+  async updateEvolutionPayload (
+    id: string,
+    payload: Record<string, unknown>,
+    baselineVersion?: string
+  ) {
+    const result = await this.run(
+      `UPDATE evolution_candidates
+       SET payload_json = ?, baseline_version = COALESCE(?, baseline_version), updated_at = ?
+       WHERE id = ?`,
+      [JSON.stringify(payload), baselineVersion || null, Date.now(), id]
+    )
+    return result.changes > 0
+  }
+
+  async addEvolutionEvaluation (
+    candidateId: string,
+    passed: boolean,
+    metrics: AgentEvolutionMetrics,
+    report: string
+  ) {
+    const id = randomUUID()
+    await this.run(
+      `INSERT INTO evolution_evaluations(
+        id, candidate_id, passed, metrics_json, report, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?)`,
+      [id, candidateId, passed ? 1 : 0, JSON.stringify(metrics), report.slice(0, 10000), Date.now()]
+    )
+    return id
+  }
+
+  async addEvolutionEvent (
+    candidateId: string,
+    action: string,
+    actorId: string,
+    detail: unknown
+  ) {
+    await this.run(
+      `INSERT INTO evolution_events(
+        id, candidate_id, action, actor_id, detail_json, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?)`,
+      [randomUUID(), candidateId, action, actorId, JSON.stringify(detail), Date.now()]
+    )
+  }
+
+  async evolutionOverview () {
+    const [candidateCounts, outcomes, feedback, retrieval] = await Promise.all([
+      this.all<{ state: string; count: number }>(
+        'SELECT state, COUNT(*) AS count FROM evolution_candidates GROUP BY state'
+      ),
+      this.all<{ outcome: string; count: number }>(
+        'SELECT outcome, COUNT(*) AS count FROM agent_experiences GROUP BY outcome'
+      ),
+      this.get<{ total: number; corrected: number }>(
+        `SELECT COUNT(*) AS total,
+         SUM(CASE WHEN correction IS NOT NULL AND correction != '' THEN 1 ELSE 0 END) AS corrected
+         FROM agent_feedback`
+      ),
+      this.get<{ total: number; selected: number }>(
+        `SELECT COUNT(*) AS total,
+         SUM(CASE WHEN selected = 1 THEN 1 ELSE 0 END) AS selected
+         FROM agent_retrieval_log`
+      ),
+    ])
+    return {
+      candidates: Object.fromEntries(candidateCounts.map(item => [item.state, Number(item.count)])),
+      outcomes: Object.fromEntries(outcomes.map(item => [item.outcome, Number(item.count)])),
+      feedback: {
+        total: Number(feedback?.total || 0),
+        corrected: Number(feedback?.corrected || 0),
+      },
+      retrieval: {
+        total: Number(retrieval?.total || 0),
+        selected: Number(retrieval?.selected || 0),
+      },
+    }
+  }
+
+  async touchSkillUsage (
+    skillId: string,
+    outcome: 'completed' | 'failed' | 'corrected'
+  ) {
+    await this.run(
+      `INSERT INTO skill_usage(
+        skill_id, use_count, success_count, failure_count, correction_count, last_used_at
+      ) VALUES(?, 1, ?, ?, ?, ?)
+      ON CONFLICT(skill_id) DO UPDATE SET
+        use_count = use_count + 1,
+        success_count = success_count + excluded.success_count,
+        failure_count = failure_count + excluded.failure_count,
+        correction_count = correction_count + excluded.correction_count,
+        last_used_at = excluded.last_used_at`,
+      [
+        skillId,
+        outcome === 'completed' ? 1 : 0,
+        outcome === 'failed' ? 1 : 0,
+        outcome === 'corrected' ? 1 : 0,
+        Date.now(),
+      ]
+    )
+  }
+
+  async getSkillUsage (skillId: string): Promise<Record<string, unknown> | undefined>
+  async getSkillUsage (): Promise<Record<string, unknown>[]>
+  async getSkillUsage (skillId?: string) {
+    if (skillId) {
+      return this.get<Record<string, unknown>>(
+        'SELECT * FROM skill_usage WHERE skill_id = ?',
+        [skillId]
+      )
+    }
+    return this.all<Record<string, unknown>>(
+      'SELECT * FROM skill_usage ORDER BY last_used_at DESC'
+    )
+  }
+
+  async curateSkillUsage (staleBefore: number, archiveBefore: number) {
+    await this.run(
+      `UPDATE skill_usage SET state = 'stale'
+       WHERE pinned = 0 AND state = 'active' AND last_used_at IS NOT NULL AND last_used_at < ?`,
+      [staleBefore]
+    )
+    await this.run(
+      `UPDATE skill_usage SET state = 'archived', archived_at = ?
+       WHERE pinned = 0 AND state IN ('active', 'stale')
+       AND last_used_at IS NOT NULL AND last_used_at < ?`,
+      [Date.now(), archiveBefore]
+    )
+    return this.getSkillUsage()
+  }
+
+  async grantThreadTool (input: {
+    threadId: string
+    actorId: string
+    toolName: string
+    risk: AgentToolRisk
+    mode: 'tool' | 'delegate'
+  }) {
+    const id = randomUUID()
+    await this.run(
+      `INSERT INTO thread_tool_grants(
+        id, thread_id, actor_id, tool_name, risk, mode, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.threadId,
+        input.actorId,
+        input.toolName,
+        input.risk,
+        input.mode,
+        Date.now(),
+      ]
+    )
+    return id
+  }
+
+  async hasThreadToolGrant (
+    threadId: string,
+    toolName: string,
+    risk: AgentToolRisk
+  ) {
+    const row = await this.get<{ id: string }>(
+      `SELECT id FROM thread_tool_grants
+       WHERE thread_id = ? AND revoked_at IS NULL
+       AND (
+         (mode = 'tool' AND tool_name = ?) OR
+         (mode = 'delegate' AND ? IN ('read', 'write'))
+       )
+       ORDER BY created_at DESC LIMIT 1`,
+      [threadId, toolName, risk]
+    )
+    return Boolean(row)
+  }
+
+  async listThreadToolGrants (threadId: string) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT * FROM thread_tool_grants
+       WHERE thread_id = ? AND revoked_at IS NULL ORDER BY created_at DESC`,
+      [threadId]
+    )
+    return rows.map(row => ({
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      actorId: String(row.actor_id),
+      toolName: String(row.tool_name),
+      risk: row.risk as AgentToolRisk,
+      mode: row.mode === 'delegate' ? 'delegate' as const : 'tool' as const,
+      createdAt: Number(row.created_at),
+      revokedAt: row.revoked_at ? Number(row.revoked_at) : null,
+    }))
+  }
+
+  async revokeThreadToolGrant (threadId: string, id: string) {
+    const result = await this.run(
+      `UPDATE thread_tool_grants SET revoked_at = ?
+       WHERE id = ? AND thread_id = ? AND revoked_at IS NULL`,
+      [Date.now(), id, threadId]
+    )
+    return result.changes > 0
+  }
+
+  async revokeAllThreadToolGrants (threadId: string) {
+    const result = await this.run(
+      `UPDATE thread_tool_grants SET revoked_at = ?
+       WHERE thread_id = ? AND revoked_at IS NULL`,
+      [Date.now(), threadId]
+    )
+    return result.changes
   }
 
   async listJobs () {

@@ -16,10 +16,13 @@ vi.mock('@/plugin/system/cache', () => ({
 vi.mock('@/utils/config', () => ({
   config: () => ({}),
   getFriendCfg: () => ({ alias: [], enable: [], disable: [] }),
+  getGroupCfg: () => ({ alias: [], enable: [], disable: [] }),
+  getGuildCfg: () => ({ alias: [], enable: [], disable: [] }),
 }))
 
 vi.mock('@/event/handler/other/cd', () => ({
   privateCD: () => true,
+  groupsCD: () => true,
 }))
 
 vi.mock('@/event/handler/other/context', () => ({
@@ -29,12 +32,17 @@ vi.mock('@/event/handler/other/context', () => ({
 vi.mock('@/event/handler/other/permission', () => ({
   Permission: {
     private: fixtures.permission,
+    groups: fixtures.permission,
   },
 }))
 
 vi.mock('@/hooks/messaeg', () => ({
   hooksMessageEmit: {
     friend: async () => true,
+    direct: async () => true,
+    group: async () => true,
+    groupTemp: async () => true,
+    guild: async () => true,
     message: async () => true,
   },
 }))
@@ -43,6 +51,9 @@ vi.mock('@/hooks/eventCall', () => ({
   eventCallEmit: {
     friend: async () => true,
     direct: async () => true,
+    group: async () => true,
+    groupTemp: async () => true,
+    guild: async () => true,
     message: async () => true,
   },
 }))
@@ -67,6 +78,9 @@ vi.mock('@/event/handler/other/handler', () => ({
   initRole: vi.fn(),
   disableViaAdapter: () => true,
   privateFilterEvent: () => true,
+  groupFilterEvent: () => true,
+  groupPrint: () => false,
+  guildPrint: () => false,
   disableViaPluginWhitelist: () => true,
   disableViaPluginBlacklist: () => true,
 }))
@@ -74,6 +88,18 @@ vi.mock('@/event/handler/other/handler', () => ({
 let friendHandler: typeof import(
   '../../packages/core/src/event/handler/message/private'
 )['friendHandler']
+let directHandler: typeof import(
+  '../../packages/core/src/event/handler/message/private'
+)['directHandler']
+let groupHandler: typeof import(
+  '../../packages/core/src/event/handler/message/groups'
+)['groupHandler']
+let groupTempHandler: typeof import(
+  '../../packages/core/src/event/handler/message/groups'
+)['groupTempHandler']
+let guildHandler: typeof import(
+  '../../packages/core/src/event/handler/message/groups'
+)['guildHandler']
 
 const event = () => ({
   userId: 'user-1',
@@ -88,6 +114,23 @@ const event = () => ({
   isDirect: false,
   logFnc: '',
   logText: '',
+})
+
+const groupEvent = (scene: 'group' | 'groupTemp' | 'guild') => ({
+  ...event(),
+  contact: {
+    scene,
+    peer: scene === 'guild' ? 'guild-1' : 'group-1',
+    subPeer: scene === 'guild' ? 'channel-1' : undefined,
+  },
+  groupId: 'group-1',
+  guildId: 'guild-1',
+  channelId: 'channel-1',
+  isFriend: false,
+  isGroup: scene === 'group',
+  isGuild: scene === 'guild',
+  isGroupTemp: scene === 'groupTemp',
+  isDirect: false,
 })
 
 const plugin = (fnc: () => unknown, permission = 'all') => ({
@@ -112,9 +155,15 @@ beforeAll(async () => {
       green: (value: unknown) => String(value),
     },
   })
-  friendHandler = (
-    await import('../../packages/core/src/event/handler/message/private')
-  ).friendHandler
+  const privateHandlers = await import(
+    '../../packages/core/src/event/handler/message/private'
+  )
+  friendHandler = privateHandlers.friendHandler
+  directHandler = privateHandlers.directHandler
+  const groups = await import('../../packages/core/src/event/handler/message/groups')
+  groupHandler = groups.groupHandler
+  groupTempHandler = groups.groupTempHandler
+  guildHandler = groups.guildHandler
 })
 
 beforeEach(() => {
@@ -164,5 +213,38 @@ describe('fixed command compatibility before Agent ingress', () => {
 
     await friendHandler(event() as never)
     await vi.waitFor(() => expect(fixtures.emptyMessage).toHaveBeenCalledOnce())
+  })
+
+  it('resets global regex state before every fixed command match', async () => {
+    const execute = vi.fn()
+    fixtures.command.push({
+      ...plugin(execute),
+      reg: /^fixed$/g,
+    })
+
+    await friendHandler(event() as never)
+    await friendHandler(event() as never)
+
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(fixtures.emptyMessage).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['direct', () => directHandler({
+      ...event(),
+      isFriend: false,
+      isDirect: true,
+    } as never)],
+    ['group', () => groupHandler(groupEvent('group') as never)],
+    ['groupTemp', () => groupTempHandler(groupEvent('groupTemp') as never)],
+    ['guild', () => guildHandler(groupEvent('guild') as never)],
+  ] as const)('runs fixed commands before Agent in %s conversations', async (_scene, run) => {
+    const execute = vi.fn()
+    fixtures.command.push(plugin(execute))
+
+    await run()
+
+    expect(execute).toHaveBeenCalledOnce()
+    expect(fixtures.emptyMessage).not.toHaveBeenCalled()
   })
 })

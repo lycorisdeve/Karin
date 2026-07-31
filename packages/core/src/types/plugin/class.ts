@@ -8,6 +8,8 @@ export interface PluginRule {
   description?: string
   /** 功能描述简写 */
   desc?: string
+  /** 面向用户展示的命令用法，不应填写正则源码 */
+  usage?: string | string[]
   /** 命令执行方法名称 */
   fnc: string
   /** 监听子事件 */

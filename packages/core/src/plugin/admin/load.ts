@@ -347,6 +347,7 @@ const cacheClassPlugin = (
       Cls: Method as new () => ClassPluginType,
       reg: v.reg instanceof RegExp ? v.reg : new RegExp(v.reg),
       description: v.description || v.desc || command.desc,
+      usage: v.usage,
       permission: v.permission || 'all',
       event: v.event || command.event || 'message',
       priority: v.priority || 10000,

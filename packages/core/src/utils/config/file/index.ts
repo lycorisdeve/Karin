@@ -5,6 +5,8 @@ import initEnv from './env'
 import initGroups from './groups'
 import initPrivates from './privates'
 import initRender from './render'
+import initWebUI from './webui'
+import initHelp from './help'
 
 export * from './adapter'
 export * from './agent'
@@ -13,6 +15,8 @@ export * from './env'
 export * from './groups'
 export * from './privates'
 export * from './render'
+export * from './webui'
+export * from './help'
 export * from './pm2'
 export * from './redis'
 
@@ -30,4 +34,6 @@ export const initConfigCache = (dir: string) => {
   initGroups(dir)
   initPrivates(dir)
   initRender(dir)
+  initWebUI(dir)
+  initHelp(dir)
 }

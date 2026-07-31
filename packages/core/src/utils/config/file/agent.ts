@@ -8,7 +8,16 @@ import { listeners } from '@/core/internal/listeners'
 
 import type { AgentConfig, AgentProviderKind, AgentProviderProfile } from '@/types/agent'
 
-interface LegacyAgentConfig extends Omit<AgentConfig, 'version' | 'providers' | 'routing'> {
+type LegacyLearningConfig = {
+  memory?: boolean
+  skills?: boolean
+}
+
+interface LegacyAgentConfig extends Omit<
+  AgentConfig,
+  'version' | 'providers' | 'routing' | 'learning' | 'recovery'
+> {
+  learning?: LegacyLearningConfig
   provider?: {
     type?: string
     baseUrl?: string
@@ -32,6 +41,122 @@ const providerDefaults: Record<AgentProviderKind, Pick<AgentProviderProfile, 'na
   kimi: { name: 'Kimi', baseUrl: 'https://api.moonshot.ai/v1' },
   mimo: { name: 'MiMo', baseUrl: 'https://api.xiaomimimo.com/v1' },
   custom: { name: 'Custom', baseUrl: 'http://127.0.0.1:8000/v1' },
+}
+
+const legacyDefaultHardDeny = ['*.uninstall', '*.delete', '*.remove', '*.destroy']
+
+const normalizePolicy = (
+  value: AgentConfig['policy'],
+  sourceVersion: number
+): AgentConfig['policy'] => {
+  const hardDeny = [...new Set(value?.hardDeny || [])]
+  const usesLegacyDefault = sourceVersion < 5 &&
+    hardDeny.length === legacyDefaultHardDeny.length &&
+    legacyDefaultHardDeny.every((pattern, index) => hardDeny[index] === pattern)
+
+  return {
+    approvalTtlMs: Math.max(1000, Number(value?.approvalTtlMs) || 300000),
+    hardDeny: usesLegacyDefault ? [] : hardDeny,
+    rules: value?.rules || [],
+    defaults: {
+      read: value?.defaults?.read || 'allow',
+      write: value?.defaults?.write || 'ask',
+      external: value?.defaults?.external || 'ask',
+      destructive: sourceVersion < 5 ? 'ask' : value?.defaults?.destructive || 'ask',
+    },
+  }
+}
+
+const normalizeScriptRuntime = (
+  value?: Partial<AgentConfig['scriptRuntime']>
+): AgentConfig['scriptRuntime'] => {
+  const maxTimeoutMs = Math.max(
+    1000,
+    Math.min(Number(value?.maxTimeoutMs) || 120000, 120000)
+  )
+  const maxOutputBytes = Math.max(
+    1024,
+    Math.min(Number(value?.maxOutputBytes) || 1048576, 1048576)
+  )
+  return {
+    pythonExecutable: String(value?.pythonExecutable || '').trim(),
+    defaultTimeoutMs: Math.max(
+      1000,
+      Math.min(Number(value?.defaultTimeoutMs) || 30000, maxTimeoutMs)
+    ),
+    maxTimeoutMs,
+    defaultMaxOutputBytes: Math.max(
+      1024,
+      Math.min(Number(value?.defaultMaxOutputBytes) || 65536, maxOutputBytes)
+    ),
+    maxOutputBytes,
+  }
+}
+
+const normalizeLearning = (
+  value?: Partial<AgentConfig['learning']> | LegacyLearningConfig
+): AgentConfig['learning'] => {
+  const expanded = value as Partial<AgentConfig['learning']> | undefined
+  const reflection = expanded?.reflection
+  const curator = expanded?.curator
+  const promotion = expanded?.promotion
+  return {
+    memory: value?.memory !== false,
+    skills: value?.skills !== false,
+    reflection: {
+      enabled: reflection?.enabled !== false,
+      afterFailure: reflection?.afterFailure !== false,
+      successInterval: Math.max(1, Math.min(Number(reflection?.successInterval) || 5, 100)),
+    },
+    curator: {
+      enabled: curator?.enabled !== false,
+      intervalHours: Math.max(1, Math.min(Number(curator?.intervalHours) || 168, 8760)),
+      minIdleMinutes: Math.max(1, Math.min(Number(curator?.minIdleMinutes) || 120, 10080)),
+      staleAfterDays: Math.max(1, Math.min(Number(curator?.staleAfterDays) || 30, 3650)),
+      archiveAfterDays: Math.max(1, Math.min(Number(curator?.archiveAfterDays) || 90, 3650)),
+    },
+    promotion: {
+      autoMemory: promotion?.autoMemory !== false,
+      autoRouting: promotion?.autoRouting !== false,
+      autoDeclarativeSkills: promotion?.autoDeclarativeSkills !== false,
+      minEvidence: Math.max(1, Math.min(Number(promotion?.minEvidence) || 3, 100)),
+      minSuccessRate: Math.max(0, Math.min(Number(promotion?.minSuccessRate) || 0.8, 1)),
+      maxRegressionRate: Math.max(0, Math.min(Number(promotion?.maxRegressionRate) || 0.05, 1)),
+      autoRollback: promotion?.autoRollback !== false,
+      rollbackWindow: Math.max(1, Math.min(Number(promotion?.rollbackWindow) || 20, 1000)),
+    },
+  }
+}
+
+const normalizeRecovery = (
+  value?: Partial<AgentConfig['recovery']>
+): AgentConfig['recovery'] => {
+  const policy = value?.researchPolicy
+  return {
+    enabled: value?.enabled !== false,
+    maxCycles: Math.max(0, Math.min(Number(value?.maxCycles) || 2, 5)),
+    maxDiagnosticCalls: Math.max(
+      1,
+      Math.min(Number(value?.maxDiagnosticCalls) || 8, 32)
+    ),
+    maxDurationMs: Math.max(
+      10_000,
+      Math.min(Number(value?.maxDurationMs) || 120_000, 600_000)
+    ),
+    researchPolicy: policy === 'always' || policy === 'explicit'
+      ? policy
+      : 'evidence-driven',
+    repair: {
+      requireApproval: value?.repair?.requireApproval !== false,
+      workspaceRoots: [
+        ...new Set(
+          (value?.repair?.workspaceRoots || [])
+            .map(root => String(root).trim())
+            .filter(root => path.isAbsolute(root))
+        ),
+      ].slice(0, 32),
+    },
+  }
 }
 
 export const agentProviderFingerprint = (profile: AgentProviderProfile) =>
@@ -74,6 +199,23 @@ const normalizeProfile = (
     baseUrl: String(value.baseUrl || defaults.baseUrl).trim().replace(/\/+$/, ''),
     apiKey: String(value.apiKey || ''),
     model: String(value.model || '').trim(),
+    discoveredModels: [
+      ...new Set(
+        (value.discoveredModels || [])
+          .map(model => String(model).trim())
+          .filter(Boolean)
+      ),
+    ].sort((left, right) => left.localeCompare(right)).slice(0, 1000),
+    visionModels: [
+      ...new Set(
+        (value.visionModels || [])
+          .map(model => String(model).trim())
+          .filter(Boolean)
+      ),
+    ].sort((left, right) => left.localeCompare(right)).slice(0, 1000),
+    modelsDiscoveredAt: value.modelsDiscoveredAt
+      ? Math.max(0, Number(value.modelsDiscoveredAt))
+      : undefined,
     timeout: Math.max(1000, Math.min(Number(value.timeout) || 30000, 300000)),
   }
   if (
@@ -90,7 +232,9 @@ export const migrateAgentConfig = (
 ): AgentConfig => {
   const value = structuredClone(data)
   if (Array.isArray((value as AgentConfig).providers)) {
-    const profiles = (value as AgentConfig).providers.map(normalizeProfile)
+    const current = value as AgentConfig
+    const sourceVersion = Number(current.version) || 0
+    const profiles = current.providers.map(normalizeProfile)
     const unique = profiles.filter(
       (profile, index) => profiles.findIndex(item => item.id === profile.id) === index
     )
@@ -100,7 +244,7 @@ export const migrateAgentConfig = (
       : unique[0]?.id || ''
     return {
       ...(value as AgentConfig),
-      version: 3,
+      version: 7,
       providers: unique,
       routing: {
         primary,
@@ -115,6 +259,10 @@ export const migrateAgentConfig = (
           ...new Set((value as AgentConfig).tools?.disabledToolsets || []),
         ],
       },
+      policy: normalizePolicy(current.policy, sourceVersion),
+      scriptRuntime: normalizeScriptRuntime(current.scriptRuntime),
+      learning: normalizeLearning((value as AgentConfig).learning),
+      recovery: normalizeRecovery((value as AgentConfig).recovery),
     }
   }
 
@@ -134,10 +282,14 @@ export const migrateAgentConfig = (
   )
   const { provider: _provider, ...rest } = legacy
   return {
-    ...(rest as Omit<AgentConfig, 'version' | 'providers' | 'routing'>),
-    version: 3,
+    ...(rest as Omit<AgentConfig, 'version' | 'providers' | 'routing' | 'learning'>),
+    version: 7,
     providers: [profile],
     routing: { primary: profile.id, fallback: [] },
+    policy: normalizePolicy(legacy.policy, 0),
+    scriptRuntime: normalizeScriptRuntime(legacy.scriptRuntime),
+    learning: normalizeLearning(legacy.learning),
+    recovery: normalizeRecovery(),
     tools: { disabled: [], disabledToolsets: [] },
   }
 }
@@ -145,9 +297,13 @@ export const migrateAgentConfig = (
 const initAgent = (dir: string) => {
   const name = 'agent.json'
   configFile = path.join(dir, name)
-  cache = migrateAgentConfig(
-    requireFileSync<AgentConfig | LegacyAgentConfig>(configFile, { type: 'json' })
-  )
+  const stored = requireFileSync<AgentConfig | LegacyAgentConfig>(configFile, { type: 'json' })
+  cache = migrateAgentConfig(stored)
+  if (Number((stored as Partial<AgentConfig>).version) !== 7 || !('recovery' in stored)) {
+    const temporary = `${configFile}.migration.tmp`
+    fs.writeFileSync(temporary, JSON.stringify(cache, null, 2), 'utf8')
+    fs.renameSync(temporary, configFile)
+  }
 
   watch<AgentConfig>(
     configFile,
@@ -212,7 +368,7 @@ export const mergeAgentConfig = (
   return migrateAgentConfig({
     ...current,
     ...update,
-    version: 3,
+    version: 7,
     providers,
     routing: update.routing || current.routing,
   } as AgentConfig)
@@ -253,6 +409,18 @@ export const saveAgentProviderVerification = async (
     fingerprint: agentProviderFingerprint(profile),
   }
   await saveAgentConfig(next)
+}
+
+export const saveAgentProviderModels = async (id: string, models: string[]) => {
+  const next = structuredClone(agentConfig())
+  const target = next.providers.find(item => item.id === id)
+  if (!target) throw new Error(`Provider 不存在: ${id}`)
+  target.discoveredModels = [
+    ...new Set(models.map(model => String(model).trim()).filter(Boolean)),
+  ].sort((left, right) => left.localeCompare(right)).slice(0, 1000)
+  target.modelsDiscoveredAt = Date.now()
+  await saveAgentConfig(next)
+  return target.discoveredModels
 }
 
 export const hasAgentApiKey = () => getAgentProviderOrder().some(profile => Boolean(profile.apiKey))

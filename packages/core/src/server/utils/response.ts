@@ -16,6 +16,8 @@ export enum HTTPStatusCode {
   MethodNotAllowed = 405,
   /** 请求体过大 */
   PayloadTooLarge = 413,
+  /** 资源状态冲突 */
+  Conflict = 409,
   /** 服务器错误 */
   InternalServerError = 500,
   /** 访问令牌已过期 */

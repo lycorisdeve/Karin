@@ -1,4 +1,15 @@
-import type { Adapters, AgentConfig, Config, Groups, PM2, Privates, Redis, Renders } from '@/types/config'
+import type {
+  Adapters,
+  AgentConfig,
+  Config,
+  Groups,
+  PM2,
+  Privates,
+  Redis,
+  Renders,
+  WebUIAppearanceConfig,
+  HelpAppearanceConfig,
+} from '@/types/config'
 
 /**
  * @description 默认配置
@@ -12,6 +23,8 @@ export const defaultConfig: {
   redis: Redis
   render: Renders
   privates: Privates
+  webui: WebUIAppearanceConfig
+  help: HelpAppearanceConfig
 } = Object.freeze({
   adapter: {
     console: {
@@ -45,9 +58,15 @@ export const defaultConfig: {
     wecom: [],
     feishu: [],
     telegram: [],
+    qqbot: [],
+    wechat: [],
+    dingtalk: [],
+    discord: [],
+    whatsapp: [],
+    email: [],
   },
   agent: {
-    version: 3,
+    version: 7,
     enabled: false,
     providers: [
       {
@@ -78,18 +97,51 @@ export const defaultConfig: {
     },
     policy: {
       approvalTtlMs: 300000,
-      hardDeny: ['*.uninstall', '*.delete', '*.remove', '*.destroy'],
+      hardDeny: [],
       rules: [],
       defaults: {
         read: 'allow',
         write: 'ask',
         external: 'ask',
-        destructive: 'deny',
+        destructive: 'ask',
       },
     },
     learning: {
       memory: true,
       skills: true,
+      reflection: {
+        enabled: true,
+        afterFailure: true,
+        successInterval: 5,
+      },
+      curator: {
+        enabled: true,
+        intervalHours: 168,
+        minIdleMinutes: 120,
+        staleAfterDays: 30,
+        archiveAfterDays: 90,
+      },
+      promotion: {
+        autoMemory: true,
+        autoRouting: true,
+        autoDeclarativeSkills: true,
+        minEvidence: 3,
+        minSuccessRate: 0.8,
+        maxRegressionRate: 0.05,
+        autoRollback: true,
+        rollbackWindow: 20,
+      },
+    },
+    recovery: {
+      enabled: true,
+      maxCycles: 2,
+      maxDiagnosticCalls: 8,
+      maxDurationMs: 120000,
+      researchPolicy: 'evidence-driven',
+      repair: {
+        requireApproval: true,
+        workspaceRoots: [],
+      },
     },
     tools: {
       disabled: [],
@@ -98,6 +150,13 @@ export const defaultConfig: {
     mcp: {
       enabled: false,
       servers: [],
+    },
+    scriptRuntime: {
+      pythonExecutable: '',
+      defaultTimeoutMs: 30000,
+      maxTimeoutMs: 120000,
+      defaultMaxOutputBytes: 65536,
+      maxOutputBytes: 1048576,
     },
   },
   config: {
@@ -301,5 +360,21 @@ export const defaultConfig: {
         isSnapka: false,
       },
     ],
+  },
+  webui: {
+    version: 1,
+    revision: 1,
+    activeThemeId: 'karin-bloom',
+    mode: 'system',
+    themes: [],
+  },
+  help: {
+    version: 1,
+    revision: 1,
+    title: 'Karin 帮助',
+    subtitle: 'Karin Bot & Plugins',
+    backgroundAsset: '',
+    backgroundPosition: 'center',
+    overlay: 0.16,
   },
 })

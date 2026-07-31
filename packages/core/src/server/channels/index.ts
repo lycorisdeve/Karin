@@ -18,7 +18,21 @@ channelsRouter.get('/status', (_req, res) => {
 channelsRouter.post('/probe', async (req, res) => {
   try {
     const { kind, id } = req.body as { kind?: ChannelKind, id?: string }
-    if (!kind || !['wecom', 'feishu', 'telegram'].includes(kind) || !id) {
+    if (
+      !kind ||
+      ![
+        'wecom',
+        'feishu',
+        'telegram',
+        'qqbot',
+        'wechat',
+        'dingtalk',
+        'discord',
+        'whatsapp',
+        'email',
+      ].includes(kind) ||
+      !id
+    ) {
       return createBadRequestResponse(res, 'kind/id 无效')
     }
     createSuccessResponse(res, await channelRegistry.probe(kind, id))

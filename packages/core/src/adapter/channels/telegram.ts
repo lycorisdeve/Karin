@@ -1,6 +1,8 @@
 import { BuiltinChannelAdapter } from './adapter'
 import { channelStateStore } from './state'
 import { redactSecrets } from './security'
+import { resolveChannelImage, saveInboundChannelImage } from './media'
+import { segment } from '@/utils/message'
 
 import type { Adapters, Contact, Elements } from '@/types'
 import type { ChannelDriver, ChannelProbeResult, ChannelStatus } from './types'
@@ -89,6 +91,23 @@ export class TelegramChannelDriver implements ChannelDriver<TelegramConfig> {
     return data.result
   }
 
+  private async callForm<T>(
+    config: TelegramConfig,
+    method: string,
+    body: FormData,
+    signal?: AbortSignal
+  ) {
+    const response = await this.fetcher(
+      `${config.apiBase}/bot${config.botToken}/${method}`,
+      { method: 'POST', body, signal }
+    )
+    const data = await response.json() as TelegramResponse<T>
+    if (!response.ok || !data.ok) {
+      throw new Error(data.description || `Telegram ${method} 失败: HTTP ${response.status}`)
+    }
+    return data.result
+  }
+
   async start (config: TelegramConfig) {
     this.config = config
     this.current.enabled = config.enable
@@ -113,11 +132,34 @@ export class TelegramChannelDriver implements ChannelDriver<TelegramConfig> {
       config.name || me.username || String(me.id),
       config.apiBase,
       async (contact: Contact, elements: Elements[]) => {
-        const result = await this.call<TelegramMessage>(config, 'sendMessage', {
-          chat_id: contact.peer,
-          text: BuiltinChannelAdapter.text(elements),
-        })
-        return { messageId: String(result.message_id), rawData: result }
+        const results: TelegramMessage[] = []
+        for (const element of elements) {
+          if (element.type === 'image') {
+            const image = await resolveChannelImage(element.file, this.fetcher)
+            const form = new FormData()
+            form.set('chat_id', contact.peer)
+            form.set(
+              'photo',
+              new Blob([Uint8Array.from(image.buffer)], { type: image.mime }),
+              image.filename
+            )
+            results.push(await this.callForm<TelegramMessage>(config, 'sendPhoto', form))
+            continue
+          }
+          const text = BuiltinChannelAdapter.text([element]).trim()
+          if (text) {
+            results.push(await this.call<TelegramMessage>(config, 'sendMessage', {
+              chat_id: contact.peer,
+              text,
+            }))
+          }
+        }
+        const result = results.at(-1)
+        if (!result) throw new Error('Telegram 消息没有可发送的内容')
+        return {
+          messageId: String(result.message_id),
+          rawData: { messages: results },
+        }
       }
     )
     this.bot.account.subId.channel = config.id
@@ -148,6 +190,34 @@ export class TelegramChannelDriver implements ChannelDriver<TelegramConfig> {
     return '[暂不支持的 Telegram 消息类型]'
   }
 
+  private async messageElements (message: TelegramMessage): Promise<Elements[]> {
+    const elements: Elements[] = []
+    const text = message.text || message.caption || ''
+    if (text) elements.push(segment.text(text))
+    const photo = message.photo?.at(-1)
+    if (photo?.file_id) {
+      const file = await this.call<{ file_path?: string }>(
+        this.config,
+        'getFile',
+        { file_id: photo.file_id }
+      )
+      if (!file.file_path) throw new Error('Telegram 图片缺少 file_path')
+      const response = await this.fetcher(
+        `${this.config.apiBase}/file/bot${this.config.botToken}/${file.file_path}`,
+        { signal: AbortSignal.timeout(30_000) }
+      )
+      if (!response.ok) throw new Error(`Telegram 图片下载失败: HTTP ${response.status}`)
+      const filename = await saveInboundChannelImage(
+        'telegram',
+        this.config.id,
+        Buffer.from(await response.arrayBuffer())
+      )
+      elements.push(segment.image(filename))
+    }
+    if (!elements.length) elements.push(segment.text(this.messageText(message)))
+    return elements
+  }
+
   private async receive (update: TelegramUpdate) {
     const message = update.message
     if (!message || !this.bot) return
@@ -164,7 +234,8 @@ export class TelegramChannelDriver implements ChannelDriver<TelegramConfig> {
       peerId: String(message.chat.id),
       userId: String(user?.id || message.chat.id),
       userName: user?.username || user?.first_name || '',
-      text: this.messageText(message),
+      contactName: message.chat.title || user?.username || user?.first_name || '',
+      elements: await this.messageElements(message),
       mentioned: this.mentioned(message),
       replyMessageId: message.reply_to_message
         ? String(message.reply_to_message.message_id)

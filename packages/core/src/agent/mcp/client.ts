@@ -40,6 +40,11 @@ const safeSegment = (value: string) => {
   return /^[a-z]/.test(result) ? result : `tool_${result || 'unnamed'}`
 }
 
+export const mcpToolRisk = (annotations?: { readOnlyHint?: boolean }) => ({
+  risk: annotations?.readOnlyHint === true ? 'read' as const : 'external' as const,
+  idempotent: annotations?.readOnlyHint === true,
+})
+
 export class AgentMcpClientManager {
   private readonly connections = new Map<string, Connection>()
   private readonly errors = new Map<string, string>()
@@ -112,16 +117,17 @@ export class AgentMcpClientManager {
     const registered: string[] = []
     for (const remote of listed.tools) {
       const name = `mcp.${safeSegment(config.name)}.${safeSegment(remote.name)}`
+      const risk = mcpToolRisk(remote.annotations)
       this.registry.register(
         {
           name,
           description: `[MCP:${config.name}] ${remote.description || remote.name}`,
           inputSchema: remote.inputSchema as Record<string, unknown>,
           outputSchema: remote.outputSchema as Record<string, unknown> | undefined,
-          risk: 'external',
+          risk: risk.risk,
           permission: 'all',
           timeout: 30_000,
-          idempotent: remote.annotations?.readOnlyHint === true,
+          idempotent: risk.idempotent,
           execute: async input => {
             return client.callTool({
               name: remote.name,

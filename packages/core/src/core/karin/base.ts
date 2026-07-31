@@ -10,6 +10,8 @@ export interface Options {
   description?: string
   /** 功能描述简写 */
   desc?: string
+  /** 面向用户展示的命令用法，不应填写正则源码 */
+  usage?: string | string[]
   /** 是否启用日志 */
   log?: boolean
   /** 权限 默认`all` */

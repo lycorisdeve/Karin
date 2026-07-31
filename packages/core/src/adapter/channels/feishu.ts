@@ -2,6 +2,12 @@ import { Client, Domain, EventDispatcher, WSClient } from '@larksuiteoapi/node-s
 import { BuiltinChannelAdapter } from './adapter'
 import { channelStateStore } from './state'
 import { redactSecrets } from './security'
+import {
+  readableToBuffer,
+  resolveChannelImage,
+  saveInboundChannelImage,
+} from './media'
+import { segment } from '@/utils/message'
 
 import type { Adapters, Contact, Elements } from '@/types'
 import type { ChannelDriver, ChannelProbeResult, ChannelStatus } from './types'
@@ -23,6 +29,7 @@ interface FeishuMessageEvent {
     content?: string
     mentions?: Array<{ id?: { open_id?: string }, name?: string }>
     parent_id?: string
+    message_type?: string
   }
 }
 
@@ -59,6 +66,7 @@ export const feishuContentText = (content = '') => {
 export class FeishuChannelDriver implements ChannelDriver<FeishuConfig> {
   readonly kind = 'feishu' as const
   private socket: WSClient | null = null
+  private api: Client | null = null
   private bot: BuiltinChannelAdapter | null = null
   private botOpenId = ''
   private config: FeishuConfig
@@ -100,6 +108,7 @@ export class FeishuChannelDriver implements ChannelDriver<FeishuConfig> {
       appSecret: config.appSecret,
       domain,
     })
+    this.api = api
     const identity = await api.request<FeishuBotInfo>({
       method: 'GET',
       url: '/open-apis/bot/v3/info',
@@ -112,17 +121,43 @@ export class FeishuChannelDriver implements ChannelDriver<FeishuConfig> {
       config.name || identity.bot?.app_name || config.appId,
       config.domain,
       async (contact: Contact, elements: Elements[]) => {
-        const result = await api.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: contact.peer,
-            content: JSON.stringify({ text: BuiltinChannelAdapter.text(elements) }),
-            msg_type: 'text',
-          },
-        })
+        const results: unknown[] = []
+        for (const element of elements) {
+          if (element.type === 'image') {
+            const image = await resolveChannelImage(element.file)
+            const uploaded = await api.im.image.create({
+              data: { image_type: 'message', image: image.buffer },
+            })
+            if (!uploaded?.image_key) throw new Error('飞书图片上传未返回 image_key')
+            results.push(await api.im.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: contact.peer,
+                content: JSON.stringify({ image_key: uploaded.image_key }),
+                msg_type: 'image',
+              },
+            }))
+            continue
+          }
+          const text = BuiltinChannelAdapter.text([element]).trim()
+          if (text) {
+            results.push(await api.im.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: contact.peer,
+                content: JSON.stringify({ text }),
+                msg_type: 'text',
+              },
+            }))
+          }
+        }
+        const result = results.at(-1) as {
+          data?: { message_id?: string }
+        } | undefined
+        if (!result) throw new Error('飞书消息没有可发送的内容')
         return {
           messageId: result.data?.message_id || '',
-          rawData: result,
+          rawData: { messages: results },
         }
       }
     )
@@ -171,6 +206,25 @@ export class FeishuChannelDriver implements ChannelDriver<FeishuConfig> {
     })
   }
 
+  private async messageElements (message: NonNullable<FeishuMessageEvent['message']>) {
+    if (message.message_type !== 'image') {
+      return [segment.text(feishuContentText(message.content))]
+    }
+    const content = JSON.parse(message.content || '{}') as { image_key?: string }
+    if (!content.image_key || !message.message_id || !this.api) {
+      return [segment.text('[飞书图片无法获取]')]
+    }
+    const resource = await this.api.im.messageResource.get({
+      params: { type: 'image' },
+      path: {
+        message_id: message.message_id,
+        file_key: content.image_key,
+      },
+    })
+    const buffer = await readableToBuffer(resource.getReadableStream())
+    return [segment.image(await saveInboundChannelImage('feishu', this.config.id, buffer))]
+  }
+
   private async receive (event: FeishuMessageEvent) {
     const message = event.message
     const messageId = message?.message_id
@@ -186,7 +240,7 @@ export class FeishuChannelDriver implements ChannelDriver<FeishuConfig> {
       scene: group ? 'group' : 'friend',
       peerId: message.chat_id || userId,
       userId,
-      text: feishuContentText(message.content),
+      elements: await this.messageElements(message),
       mentioned: group && Boolean(
         message.mentions?.some(mention => mention.id?.open_id === this.botOpenId)
       ),
@@ -199,6 +253,7 @@ export class FeishuChannelDriver implements ChannelDriver<FeishuConfig> {
     this.socket?.close({ force: true })
     this.bot?.unregister()
     this.socket = null
+    this.api = null
     this.bot = null
     this.current.state = 'stopped'
   }

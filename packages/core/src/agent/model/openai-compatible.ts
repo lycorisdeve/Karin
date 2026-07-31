@@ -82,7 +82,17 @@ const toMessage = (message: AgentModelMessage, encodeToolName: (name: string) =>
 
   return {
     role: message.role,
-    content: message.content,
+    content: Array.isArray(message.content)
+      ? message.content.map(part => part.type === 'image'
+        ? {
+          type: 'image_url',
+          image_url: { url: part.imageUrl },
+        }
+        : {
+          type: 'text',
+          text: part.text,
+        })
+      : message.content,
   }
 }
 
@@ -169,6 +179,16 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
           }))
           : undefined,
         tool_choice: request.tools.length ? request.toolChoice || 'auto' : undefined,
+        response_format: request.responseSchema
+          ? {
+            type: 'json_schema',
+            json_schema: {
+              name: request.responseSchema.name,
+              strict: request.responseSchema.strict !== false,
+              schema: request.responseSchema.schema,
+            },
+          }
+          : undefined,
         stream: Boolean(onDelta),
         stream_options: onDelta ? { include_usage: true } : undefined,
       }),

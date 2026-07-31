@@ -5,6 +5,7 @@ export type AgentToolRisk = 'read' | 'write' | 'external' | 'destructive'
 export type AgentPolicyDecision = 'allow' | 'ask' | 'deny'
 export type AgentThreadState =
   | 'idle'
+  | 'stopping'
   | 'running'
   | 'waiting_approval'
   | 'completed'
@@ -19,9 +20,40 @@ export interface AgentToolCall {
   arguments: Record<string, unknown>
 }
 
+export interface AgentModelTextPart {
+  type: 'text'
+  text: string
+}
+
+export interface AgentModelImagePart {
+  type: 'image'
+  imageUrl: string
+}
+
+export interface AgentMessageAttachment {
+  id: string
+  messageId: string
+  type: 'image'
+  mime: string
+  size: number
+  name: string
+  url: string
+  createdAt: number
+}
+
+export interface AgentMessageAttachmentInput {
+  type: 'image'
+  storagePath: string
+  mime: string
+  size: number
+  name: string
+}
+
+export type AgentModelContent = string | Array<AgentModelTextPart | AgentModelImagePart>
+
 export interface AgentModelMessage {
   role: AgentMessageRole
-  content: string
+  content: AgentModelContent
   name?: string
   toolCallId?: string
   toolCalls?: AgentToolCall[]
@@ -34,10 +66,16 @@ export interface AgentModelTool {
 }
 
 export interface AgentModelRequest {
+  providerId?: string
   model: string
   messages: AgentModelMessage[]
   tools: AgentModelTool[]
   toolChoice?: 'auto' | 'required'
+  responseSchema?: {
+    name: string
+    schema: Record<string, unknown>
+    strict?: boolean
+  }
   signal?: AbortSignal
 }
 
@@ -70,6 +108,18 @@ export interface AgentActor {
   selfId: string
   scene: string
   contactKey: string
+  origin?: AgentConversationOrigin
+}
+
+export interface AgentConversationOrigin {
+  channel: string
+  protocol: string
+  accountId: string
+  accountName: string
+  contactKey: string
+  contactId: string
+  contactSubId: string
+  contactName: string
 }
 
 export interface AgentToolContext {
@@ -117,6 +167,10 @@ export interface AgentProviderProfile {
   enabled: boolean
   baseUrl: string
   apiKey: string
+  discoveredModels?: string[]
+  modelsDiscoveredAt?: number
+  /** 留空表示按 OpenAI 兼容协议尝试；非空时只向列出的模型发送视觉输入 */
+  visionModels?: string[]
   model: string
   timeout: number
   verification?: {
@@ -141,8 +195,234 @@ export interface AgentMcpServerConfig {
   env?: Record<string, string>
 }
 
+export type AgentEvolutionTarget =
+  | 'memory'
+  | 'profile'
+  | 'routing'
+  | 'skill'
+  | 'tool'
+  | 'repair'
+export type AgentEvolutionState =
+  | 'draft'
+  | 'evaluating'
+  | 'ready'
+  | 'active'
+  | 'rejected'
+  | 'rolled_back'
+
+export interface AgentEvolutionMetrics {
+  evidence: number
+  successRate: number
+  regressionRate: number
+  toolHitRate: number
+  correctionRate: number
+}
+
+export interface AgentEvolutionCandidate {
+  id: string
+  target: AgentEvolutionTarget
+  kind: 'declarative' | 'executable'
+  sourceTurnIds: string[]
+  baselineVersion?: string
+  candidateVersion: string
+  state: AgentEvolutionState
+  summary: string
+  payload: Record<string, unknown>
+  metrics?: AgentEvolutionMetrics
+  createdAt: number
+  updatedAt: number
+}
+
+export type AgentTurnPhase =
+  | 'observe'
+  | 'plan'
+  | 'act'
+  | 'verify'
+  | 'recover'
+  | 'finish'
+  | 'waiting_approval'
+
+export interface AgentPostcondition {
+  id: string
+  kind: 'delivery' | 'media' | 'tool' | 'information'
+  description: string
+  toolNames: string[]
+  required: boolean
+  minimumCount?: number
+}
+
+export interface AgentTaskGoal {
+  id: string
+  description: string
+  capabilities: string[]
+  postconditions: AgentPostcondition[]
+}
+
+export interface AgentTaskPlan {
+  version: 1
+  summary: string
+  goals: AgentTaskGoal[]
+  research: 'local-first' | 'web-required' | 'none'
+  allowedSideEffects: AgentToolRisk[]
+  stopCondition: string
+  createdBy: 'model' | 'fallback'
+}
+
+export type AgentFailureClassification =
+  | 'missing_tool'
+  | 'tool_failed'
+  | 'postcondition_failed'
+  | 'delivery_failed'
+  | 'provider_failed'
+  | 'approval_required'
+  | 'interrupted'
+
+export interface AgentToolReceipt {
+  toolName: string
+  status: 'completed' | 'failed'
+  startedAt: number
+  completedAt: number
+  idempotent: boolean
+  delivery?: {
+    completed: boolean
+    channel?: string
+    accountId?: string
+    contactKey?: string
+    textSegments: number
+    imageSegments: number
+  }
+  media?: {
+    path?: string
+    url?: string
+    mime?: string
+    size?: number
+  }
+}
+
+export interface AgentToolResultEnvelope<T = unknown> {
+  status: 'completed' | 'failed'
+  errorCode?: string
+  data?: T
+  error?: string
+  receipt: AgentToolReceipt
+  evidence: string[]
+}
+
+export interface AgentRecoveryEvent {
+  phase: AgentTurnPhase
+  cycle: number
+  classification?: AgentFailureClassification
+  message: string
+  completed?: boolean
+  missingPostconditions?: string[]
+  query?: string
+  createdAt: number
+}
+
+export interface AgentRepairCandidatePayload {
+  fingerprint: string
+  problem: string
+  reproduction: string
+  evidence: string[]
+  rootCause: string
+  confidence: number
+  workspaceRoot?: string
+  affectedFiles: string[]
+  patchHash?: string
+  patchFile?: string
+  semantics: {
+    objective: string
+    inputs: string
+    outputs: string
+    sideEffects: string[]
+    idempotent: boolean
+  }
+  stopCondition: string
+  failureStrategy: string
+  verification: Array<{
+    command: string
+    status: 'pending' | 'passed' | 'failed'
+    output?: string
+  }>
+  rollback: string
+}
+
+export interface AgentLearningConfig {
+  memory: boolean
+  skills: boolean
+  reflection: {
+    enabled: boolean
+    afterFailure: boolean
+    successInterval: number
+  }
+  curator: {
+    enabled: boolean
+    intervalHours: number
+    minIdleMinutes: number
+    staleAfterDays: number
+    archiveAfterDays: number
+  }
+  promotion: {
+    autoMemory: boolean
+    autoRouting: boolean
+    autoDeclarativeSkills: boolean
+    minEvidence: number
+    minSuccessRate: number
+    maxRegressionRate: number
+    autoRollback: boolean
+    rollbackWindow: number
+  }
+}
+
+export interface AgentRecoveryConfig {
+  enabled: boolean
+  maxCycles: number
+  maxDiagnosticCalls: number
+  maxDurationMs: number
+  researchPolicy: 'evidence-driven' | 'always' | 'explicit'
+  repair: {
+    requireApproval: boolean
+    workspaceRoots: string[]
+  }
+}
+
+export interface AgentScriptSemantics {
+  objective: string
+  inputs: string
+  outputs: string
+  sideEffects: string[]
+  idempotent: boolean
+}
+
+export interface AgentScriptStopPolicy {
+  completionCondition: string
+  timeoutMs: number
+  maxOutputBytes: number
+}
+
+export interface AgentScriptFailurePolicy {
+  strategy: 'fail' | 'retry'
+  maxAttempts: number
+  retryDelayMs: number
+  userMessage: string
+}
+
+export interface AgentScriptToolDefinition {
+  id: string
+  name: string
+  description: string
+  runtime: 'python'
+  source: string
+  sourceHash: string
+  inputSchema: Record<string, unknown>
+  outputSchema?: Record<string, unknown>
+  semantics: AgentScriptSemantics
+  stop: AgentScriptStopPolicy
+  failure: AgentScriptFailurePolicy
+}
+
 export interface AgentConfig {
-  version: 3
+  version: 7
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: {
@@ -166,10 +446,8 @@ export interface AgentConfig {
     rules: AgentPolicyRule[]
     defaults: Record<AgentToolRisk, AgentPolicyDecision>
   }
-  learning: {
-    memory: boolean
-    skills: boolean
-  }
+  learning: AgentLearningConfig
+  recovery: AgentRecoveryConfig
   tools: {
     disabled: string[]
     disabledToolsets: string[]
@@ -177,6 +455,13 @@ export interface AgentConfig {
   mcp: {
     enabled: boolean
     servers: AgentMcpServerConfig[]
+  }
+  scriptRuntime: {
+    pythonExecutable: string
+    defaultTimeoutMs: number
+    maxTimeoutMs: number
+    defaultMaxOutputBytes: number
+    maxOutputBytes: number
   }
 }
 
@@ -189,8 +474,38 @@ export interface AgentTurnInput {
   depth?: number
   automated?: boolean
   allowedTools?: string[]
+  strictToolAllowlist?: boolean
+  readOnlyTools?: boolean
+  signal?: AbortSignal
   onDelta?: (delta: string) => void | Promise<void>
   onEvent?: (event: AgentStreamEvent) => void | Promise<void>
+  onResult?: (result: AgentTurnResult) => void | Promise<void>
+}
+
+export interface AgentActivityView {
+  id: string
+  threadId: string
+  turnId: string
+  kind: 'turn' | 'tool' | 'approval' | 'subagent'
+  status:
+    | 'running'
+    | 'waiting_approval'
+    | 'completed'
+    | 'failed'
+    | 'denied'
+    | 'expired'
+    | 'interrupted'
+  label: string
+  source?: string
+  risk?: AgentToolRisk
+  decision?: AgentPolicyDecision
+  parentId?: string
+  input?: unknown
+  output?: unknown
+  error?: string
+  startedAt: number
+  completedAt?: number
+  durationMs?: number
 }
 
 export interface AgentTurnResult {
@@ -201,12 +516,32 @@ export interface AgentTurnResult {
   approvalId?: string
 }
 
+export interface AgentDelegateBatchTask {
+  id: string
+  label: string
+  prompt: string
+}
+
+export interface AgentDelegateBatchResult {
+  id: string
+  label: string
+  childThreadId?: string
+  state: AgentThreadState
+  content: string
+  error?: string
+}
+
 export interface AgentStreamEvent {
   id: number
   threadId: string
   turnId?: string
   type:
     | 'turn.started'
+    | 'plan.created'
+    | 'verification.completed'
+    | 'recovery.started'
+    | 'recovery.completed'
+    | 'repair.candidate'
     | 'text.delta'
     | 'tool.started'
     | 'tool.completed'
@@ -216,6 +551,8 @@ export interface AgentStreamEvent {
     | 'subagent.completed'
     | 'turn.completed'
     | 'turn.failed'
+    | 'delivery.completed'
+    | 'delivery.failed'
   data: unknown
   createdAt: number
 }

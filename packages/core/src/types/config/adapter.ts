@@ -42,6 +42,54 @@ export interface TelegramAccountConfig extends ChannelAccountBase {
   allowedUpdates: string[]
 }
 
+export interface QQBotAccountConfig extends ChannelAccountBase {
+  appId: string
+  clientSecret: string
+  apiBase: string
+  gatewayUrl: string
+}
+
+export interface WeChatAccountConfig extends ChannelAccountBase {
+  serverUrl: string
+  token: string
+  pollInterval: number
+}
+
+export interface DingTalkAccountConfig extends ChannelAccountBase {
+  clientId: string
+  clientSecret: string
+  robotCode: string
+}
+
+export interface DiscordAccountConfig extends ChannelAccountBase {
+  applicationId: string
+  botToken: string
+  intents: string[]
+}
+
+export interface WhatsAppAccountConfig extends ChannelAccountBase {
+  phoneNumberId: string
+  accessToken: string
+  appSecret: string
+  verifyToken: string
+  graphVersion: string
+}
+
+export interface EmailAccountConfig extends ChannelAccountBase {
+  address: string
+  imapHost: string
+  imapPort: number
+  imapSecure: boolean
+  imapUser: string
+  imapPassword: string
+  mailbox: string
+  smtpHost: string
+  smtpPort: number
+  smtpSecure: boolean
+  smtpUser: string
+  smtpPassword: string
+}
+
 export interface Adapters {
   /** `console`适配器配置 */
   console: {
@@ -92,4 +140,16 @@ export interface Adapters {
   feishu: FeishuAccountConfig[]
   /** Telegram Bot API long polling 账号 */
   telegram: TelegramAccountConfig[]
+  /** 腾讯 QQ 开放平台机器人 */
+  qqbot: QQBotAccountConfig[]
+  /** WeChatPadPro 个人微信 */
+  wechat: WeChatAccountConfig[]
+  /** 钉钉 Stream 机器人 */
+  dingtalk: DingTalkAccountConfig[]
+  /** Discord Bot */
+  discord: DiscordAccountConfig[]
+  /** WhatsApp Cloud API */
+  whatsapp: WhatsAppAccountConfig[]
+  /** IMAP/SMTP Email */
+  email: EmailAccountConfig[]
 }

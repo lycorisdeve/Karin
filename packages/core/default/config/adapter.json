@@ -27,5 +27,11 @@
   },
   "wecom": [],
   "feishu": [],
-  "telegram": []
+  "telegram": [],
+  "qqbot": [],
+  "wechat": [],
+  "dingtalk": [],
+  "discord": [],
+  "whatsapp": [],
+  "email": []
 }

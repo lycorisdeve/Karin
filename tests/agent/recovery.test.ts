@@ -1,0 +1,298 @@
+import { describe, expect, it, vi } from 'vitest'
+import { AgentTurnRecovery } from '../../packages/core/src/agent/runtime/recovery'
+
+import type {
+  AgentConfig,
+  AgentModelProvider,
+  AgentTaskPlan,
+  AgentToolResultEnvelope,
+  AgentTurnInput,
+} from '../../packages/core/src/types/agent'
+
+const config = (verified = false): AgentConfig => ({
+  version: 7,
+  enabled: true,
+  providers: [{
+    id: 'fake',
+    name: 'Fake',
+    kind: 'custom',
+    enabled: true,
+    baseUrl: 'https://example.test/v1',
+    apiKey: 'test-only',
+    model: 'fake',
+    timeout: 30000,
+    verification: verified
+      ? {
+        testedAt: Date.now(),
+        chat: true,
+        stream: true,
+        tools: true,
+        latency: 1,
+        fingerprint: 'test',
+      }
+      : undefined,
+  }],
+  routing: { primary: 'fake', fallback: [] },
+  trigger: { private: true, groupMention: true, wakeWords: [] },
+  limits: {
+    maxToolRounds: 8,
+    maxToolOutputBytes: 65536,
+    maxRecentMessages: 40,
+    maxSubagents: 3,
+  },
+  policy: {
+    approvalTtlMs: 300000,
+    hardDeny: [],
+    rules: [],
+    defaults: {
+      read: 'allow',
+      write: 'ask',
+      external: 'ask',
+      destructive: 'ask',
+    },
+  },
+  learning: {
+    memory: true,
+    skills: true,
+    reflection: { enabled: true, afterFailure: true, successInterval: 5 },
+    curator: {
+      enabled: true,
+      intervalHours: 168,
+      minIdleMinutes: 120,
+      staleAfterDays: 30,
+      archiveAfterDays: 90,
+    },
+    promotion: {
+      autoMemory: true,
+      autoRouting: true,
+      autoDeclarativeSkills: true,
+      minEvidence: 3,
+      minSuccessRate: 0.8,
+      maxRegressionRate: 0.05,
+      autoRollback: true,
+      rollbackWindow: 20,
+    },
+  },
+  recovery: {
+    enabled: true,
+    maxCycles: 2,
+    maxDiagnosticCalls: 8,
+    maxDurationMs: 120000,
+    researchPolicy: 'evidence-driven',
+    repair: { requireApproval: true, workspaceRoots: [] },
+  },
+  tools: { disabled: [], disabledToolsets: [] },
+  mcp: { enabled: false, servers: [] },
+  scriptRuntime: {
+    pythonExecutable: '',
+    defaultTimeoutMs: 30000,
+    maxTimeoutMs: 120000,
+    defaultMaxOutputBytes: 65536,
+    maxOutputBytes: 1048576,
+  },
+})
+
+const input: AgentTurnInput = {
+  threadKey: 'test',
+  actor: {
+    id: 'user',
+    role: 'admin',
+    selfId: 'bot',
+    scene: 'friend',
+    contactKey: 'onebot:bot:friend:user',
+    origin: {
+      channel: 'onebot',
+      protocol: 'onebot11',
+      accountId: 'bot',
+      accountName: 'Bot',
+      contactKey: 'onebot:bot:friend:user',
+      contactId: 'user',
+      contactSubId: '',
+      contactName: 'User',
+    },
+  },
+  content: '发一张猫的照片给我',
+}
+
+const tools = [
+  {
+    name: 'karin.browser.search',
+    description: 'search',
+    risk: 'read',
+    tags: ['图片'],
+  },
+  {
+    name: 'karin.browser.download',
+    description: 'download',
+    risk: 'read',
+    tags: ['图片'],
+  },
+  {
+    name: 'karin.bot.send_message',
+    description: 'send',
+    risk: 'external',
+    tags: ['发送图片'],
+  },
+]
+
+const provider = (content: string): AgentModelProvider => ({
+  name: 'fake',
+  complete: vi.fn(async () => ({ content, toolCalls: [] })),
+})
+
+describe('Agent verifiable recovery', () => {
+  it('uses a conservative actionable plan until provider planning is verified', async () => {
+    const model = provider('unused')
+    const recovery = new AgentTurnRecovery(model, () => config(false))
+    const result = await recovery.createPlan(
+      input,
+      tools,
+      'fake',
+      'fake',
+      new AbortController().signal
+    )
+
+    expect(model.complete).not.toHaveBeenCalled()
+    expect(result.plan.createdBy).toBe('fallback')
+    expect(result.plan.goals[0].postconditions.map(item => item.kind)).toEqual([
+      'media',
+      'delivery',
+    ])
+  })
+
+  it('presents downloaded images in a Web thread without requiring channel delivery', async () => {
+    const model = provider('unused')
+    const recovery = new AgentTurnRecovery(model, () => config(false))
+    const result = await recovery.createPlan(
+      {
+        ...input,
+        actor: {
+          ...input.actor,
+          scene: 'web',
+          contactKey: 'web:admin',
+          origin: {
+            channel: 'web',
+            protocol: 'web',
+            accountId: 'web',
+            accountName: 'WebUI',
+            contactKey: 'web:admin',
+            contactId: 'admin',
+            contactSubId: '',
+            contactName: 'Admin',
+          },
+        },
+      },
+      tools,
+      'fake',
+      'fake',
+      new AbortController().signal
+    )
+
+    expect(result.plan.goals[0].postconditions.map(item => item.kind)).toEqual(['media'])
+    expect(result.plan.goals[0].capabilities).not.toContain('karin.bot.send_message')
+    const media: AgentToolResultEnvelope[] = [{
+      status: 'completed',
+      data: { path: 'controlled/dog.png' },
+      receipt: {
+        toolName: 'karin.browser.download',
+        status: 'completed',
+        startedAt: 1,
+        completedAt: 2,
+        idempotent: true,
+        media: { path: 'controlled/dog.png', mime: 'image/png', size: 1024 },
+      },
+      evidence: ['media:controlled/dog.png'],
+    }]
+    expect(recovery.finalContent(result.plan, media, '我没有发送图片的工具'))
+      .toContain('附件展示')
+  })
+
+  it('requires a real image delivery receipt and replaces contradictory capability denial', () => {
+    const recovery = new AgentTurnRecovery(provider(''), () => config())
+    const plan: AgentTaskPlan = {
+      version: 1,
+      summary: 'send image',
+      research: 'local-first',
+      allowedSideEffects: ['read', 'external'],
+      stopCondition: 'delivered',
+      createdBy: 'fallback',
+      goals: [{
+        id: 'send',
+        description: 'send image',
+        capabilities: ['karin.bot.send_message'],
+        postconditions: [
+          {
+            id: 'media',
+            kind: 'media',
+            description: 'image ready',
+            toolNames: ['karin.browser.download'],
+            required: true,
+          },
+          {
+            id: 'delivery',
+            kind: 'delivery',
+            description: 'image delivered',
+            toolNames: ['karin.bot.send_message'],
+            required: true,
+            minimumCount: 1,
+          },
+        ],
+      }],
+    }
+    expect(recovery.verify(plan, [], '我没有发送图片的工具').completed).toBe(false)
+
+    const results: AgentToolResultEnvelope[] = [
+      {
+        status: 'completed',
+        data: { path: 'controlled/cat.png' },
+        receipt: {
+          toolName: 'karin.browser.download',
+          status: 'completed',
+          startedAt: 1,
+          completedAt: 2,
+          idempotent: true,
+          media: { path: 'controlled/cat.png', mime: 'image/png', size: 1024 },
+        },
+        evidence: ['media:controlled/cat.png'],
+      },
+      {
+        status: 'completed',
+        data: { delivered: true },
+        receipt: {
+          toolName: 'karin.bot.send_message',
+          status: 'completed',
+          startedAt: 2,
+          completedAt: 3,
+          idempotent: false,
+          delivery: {
+            completed: true,
+            channel: 'onebot',
+            textSegments: 0,
+            imageSegments: 1,
+          },
+        },
+        evidence: ['delivery:onebot:completed'],
+      },
+    ]
+
+    expect(recovery.verify(plan, results, '我没有发送图片的工具').completed).toBe(true)
+    expect(recovery.finalContent(plan, results, '我没有发送图片的工具'))
+      .toContain('投递回执验证')
+  })
+
+  it('retries invalid structured plans once and falls back without failing the turn', async () => {
+    const model = provider('not json')
+    const recovery = new AgentTurnRecovery(model, () => config(true))
+    const result = await recovery.createPlan(
+      input,
+      tools,
+      'fake',
+      'fake',
+      new AbortController().signal
+    )
+
+    expect(model.complete).toHaveBeenCalledTimes(2)
+    expect(result.plan.createdBy).toBe('fallback')
+    expect(result.errors).toHaveLength(2)
+  })
+})

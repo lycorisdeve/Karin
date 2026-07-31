@@ -2,6 +2,8 @@ import express, { Router } from 'express'
 import {
   LOGIN_ROUTER,
   REFRESH_ROUTER,
+  WEBUI_APPEARANCE_ROUTER,
+  HELP_APPEARANCE_ROUTER,
   GET_CONFIG_ROUTER,
   SAVE_CONFIG_ROUTER,
   GET_LOG_ROUTER,
@@ -56,6 +58,18 @@ import { logMiddleware } from '../log'
 import { authMiddleware } from '../auth/middleware'
 import { loginRouter } from '../auth/login'
 import { refreshRouter } from '../auth/refresh'
+import {
+  getWebUIAppearance,
+  patchWebUIAppearance,
+  updateWebUIAppearance,
+} from '../webui/appearance'
+import {
+  getHelpAppearance,
+  getHelpBackground,
+  removeHelpBackground,
+  updateHelpAppearance,
+  uploadHelpBackground,
+} from '../help/appearance'
 import { getConfig, saveConfig } from '../config'
 import { pingRouter } from '../system/ping'
 import { pluginGetLocalList } from '../plugins/local'
@@ -108,6 +122,7 @@ import { getFrontendInstalledPluginList, getLoadedCommandPluginCacheList, getPlu
 import { getPluginMarketList } from '../plugins/market'
 import { agentRouter } from '../agent'
 import { channelsRouter } from '../channels'
+import { whatsappWebhookRouter } from '../channels/whatsapp'
 
 /**
  * karin内部路由
@@ -116,6 +131,8 @@ export const router: Router = Router()
 
 /** 日志 */
 router.use(logMiddleware)
+/** WhatsApp Cloud API 公共 Webhook；写入请求由平台 HMAC 签名保护。 */
+router.use('/channels/whatsapp', whatsappWebhookRouter)
 /** 鉴权 */
 router.use(authMiddleware)
 /** 解析json */
@@ -124,6 +141,22 @@ router.use(express.json())
 router.post(LOGIN_ROUTER, loginRouter)
 /** 刷新令牌 */
 router.post(REFRESH_ROUTER, refreshRouter)
+/** WebUI 外观：读取公开，写入仍由全局鉴权中间件保护 */
+router.get(WEBUI_APPEARANCE_ROUTER, getWebUIAppearance)
+router.put(WEBUI_APPEARANCE_ROUTER, updateWebUIAppearance)
+router.patch(WEBUI_APPEARANCE_ROUTER, patchWebUIAppearance)
+router.get(HELP_APPEARANCE_ROUTER, getHelpAppearance)
+router.put(HELP_APPEARANCE_ROUTER, updateHelpAppearance)
+router.get(`${HELP_APPEARANCE_ROUTER}/background`, getHelpBackground)
+router.post(
+  `${HELP_APPEARANCE_ROUTER}/background`,
+  express.raw({
+    type: ['image/png', 'image/jpeg', 'image/webp', 'application/octet-stream'],
+    limit: '10mb',
+  }),
+  uploadHelpBackground
+)
+router.delete(`${HELP_APPEARANCE_ROUTER}/background`, removeHelpBackground)
 
 /** Karin Agent */
 router.use('/agent', agentRouter)

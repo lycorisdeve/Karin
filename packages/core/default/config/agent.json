@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 7,
   "enabled": false,
   "providers": [
     {
@@ -30,23 +30,51 @@
   },
   "policy": {
     "approvalTtlMs": 300000,
-    "hardDeny": [
-      "*.uninstall",
-      "*.delete",
-      "*.remove",
-      "*.destroy"
-    ],
+    "hardDeny": [],
     "rules": [],
     "defaults": {
       "read": "allow",
       "write": "ask",
       "external": "ask",
-      "destructive": "deny"
+      "destructive": "ask"
     }
   },
   "learning": {
     "memory": true,
-    "skills": true
+    "skills": true,
+    "reflection": {
+      "enabled": true,
+      "afterFailure": true,
+      "successInterval": 5
+    },
+    "curator": {
+      "enabled": true,
+      "intervalHours": 168,
+      "minIdleMinutes": 120,
+      "staleAfterDays": 30,
+      "archiveAfterDays": 90
+    },
+    "promotion": {
+      "autoMemory": true,
+      "autoRouting": true,
+      "autoDeclarativeSkills": true,
+      "minEvidence": 3,
+      "minSuccessRate": 0.8,
+      "maxRegressionRate": 0.05,
+      "autoRollback": true,
+      "rollbackWindow": 20
+    }
+  },
+  "recovery": {
+    "enabled": true,
+    "maxCycles": 2,
+    "maxDiagnosticCalls": 8,
+    "maxDurationMs": 120000,
+    "researchPolicy": "evidence-driven",
+    "repair": {
+      "requireApproval": true,
+      "workspaceRoots": []
+    }
   },
   "tools": {
     "disabled": [],
@@ -55,5 +83,12 @@
   "mcp": {
     "enabled": false,
     "servers": []
+  },
+  "scriptRuntime": {
+    "pythonExecutable": "",
+    "defaultTimeoutMs": 30000,
+    "maxTimeoutMs": 120000,
+    "defaultMaxOutputBytes": 65536,
+    "maxOutputBytes": 1048576
   }
 }

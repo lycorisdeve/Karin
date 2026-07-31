@@ -1,14 +1,18 @@
 import { hooks } from '@/hooks'
-import { segment } from '@/utils/message'
 import { adapter } from '@/utils/config/file/adapter'
+import { replyAgentResult } from './reply'
 
 import type { Message } from '@/types/event'
-import type { AgentConfig, AgentTurnResult } from '@/types/agent'
+import type { AgentConfig } from '@/types/agent'
 import type { AgentRuntime } from '../runtime/runtime'
-import { agentActor, agentThreadKey } from './context'
+import { agentActor } from './context'
 
 export const getAgentTriggerContent = (event: Message, config: AgentConfig) => {
-  const content = event.msg.trim()
+  const content = event.msg.trim() || (
+    event.image.length
+      ? `[用户发送了 ${event.image.length} 张图片]`
+      : ''
+  )
   if (!content) return null
   if (event.isPrivate) return config.trigger.private ? content : null
 
@@ -25,6 +29,21 @@ export const getAgentTriggerContent = (event: Message, config: AgentConfig) => {
         item => item.id === event.bot.account?.subId?.channel
       )?.trigger.wakeWords
     }
+    const channel = event.bot.adapter.platform
+    if ([
+      'qqbot',
+      'wechat',
+      'dingtalk',
+      'discord',
+      'whatsapp',
+      'email',
+    ].includes(channel)) {
+      const accounts = adapter()[channel as
+        'qqbot' | 'wechat' | 'dingtalk' | 'discord' | 'whatsapp' | 'email']
+      return accounts.find(
+        item => item.id === event.bot.account?.subId?.channel
+      )?.trigger.wakeWords
+    }
     return []
   })() || []
   const wakeWord = [...channelWakeWords, ...config.trigger.wakeWords].find(
@@ -33,42 +52,6 @@ export const getAgentTriggerContent = (event: Message, config: AgentConfig) => {
   if (wakeWord) return content.slice(wakeWord.length).trim() || content
   if (config.trigger.groupMention && event.atBot) return content
   return null
-}
-
-const replyResult = async (event: Message, result: AgentTurnResult) => {
-  if (!result.content) return
-  if (result.state !== 'waiting_approval' || !result.approvalId) {
-    await event.reply(result.content)
-    return
-  }
-
-  const approve = `/agent approve ${result.approvalId}`
-  const deny = `/agent deny ${result.approvalId}`
-  try {
-    await event.reply([
-      segment.text(`${result.content}\n不支持按钮时可发送：\n${approve}\n${deny}`),
-      segment.button([
-        {
-          text: '允许一次',
-          data: approve,
-          enter: true,
-          reply: true,
-          style: 1,
-          list: [event.userId],
-        },
-        {
-          text: '拒绝',
-          data: deny,
-          enter: true,
-          reply: true,
-          style: 3,
-          list: [event.userId],
-        },
-      ]),
-    ])
-  } catch {
-    await event.reply(`${result.content}\n${approve}\n${deny}`)
-  }
 }
 
 export const registerAgentIngress = (runtime: AgentRuntime, getConfig: () => AgentConfig) =>
@@ -81,13 +64,15 @@ export const registerAgentIngress = (runtime: AgentRuntime, getConfig: () => Age
       }
 
       try {
+        const actor = agentActor(event)
+        const session = await runtime.currentSession(actor)
         const result = await runtime.runTurn({
-          threadKey: agentThreadKey(event),
-          actor: agentActor(event),
+          threadKey: session.threadKey,
+          actor,
           content,
           event,
         })
-        await replyResult(event, result)
+        await replyAgentResult(event, result)
       } catch (error) {
         logger.error(new Error('[agent][ingress] 未匹配消息处理失败', { cause: error }))
         try {

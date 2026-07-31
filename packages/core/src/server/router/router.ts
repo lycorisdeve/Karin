@@ -4,6 +4,10 @@ export const BASE_ROUTER = '/api/v1'
 export const LOGIN_ROUTER = '/login'
 /** 刷新令牌路由 */
 export const REFRESH_ROUTER = '/refresh'
+/** WebUI 外观配置 */
+export const WEBUI_APPEARANCE_ROUTER = '/webui/appearance'
+/** #帮助 图片外观配置 */
+export const HELP_APPEARANCE_ROUTER = '/help/appearance'
 /** 获取系统配置路由 */
 export const GET_CONFIG_ROUTER = '/config/new/get'
 /** 保存系统配置路由 */

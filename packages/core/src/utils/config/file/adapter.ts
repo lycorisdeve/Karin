@@ -12,6 +12,12 @@ import type {
   FeishuAccountConfig,
   TelegramAccountConfig,
   WeComAccountConfig,
+  QQBotAccountConfig,
+  WeChatAccountConfig,
+  DingTalkAccountConfig,
+  DiscordAccountConfig,
+  WhatsAppAccountConfig,
+  EmailAccountConfig,
 } from '@/types/config'
 
 /** adapter.json 缓存 */
@@ -32,6 +38,11 @@ const formatBase = <T extends ChannelAccountBase>(value: T, prefix: string, inde
       : [],
   },
 })
+
+const uniqueAccounts = <T extends { id: string }>(accounts: T[]) =>
+  accounts.filter((account, index, list) =>
+    list.findIndex(item => item.id === account.id) === index
+  )
 
 export const formatAdapterConfig = (data: Adapters): Adapters => {
   return {
@@ -93,6 +104,54 @@ export const formatAdapterConfig = (data: Adapters): Adapters => {
       .filter((account, index, list) =>
         list.findIndex(item => item.id === account.id) === index
       ),
+    qqbot: uniqueAccounts((Array.isArray(data.qqbot) ? data.qqbot : []).map((value, index) => ({
+      ...formatBase(value, 'qqbot', index),
+      appId: String(value.appId || ''),
+      clientSecret: String(value.clientSecret || ''),
+      apiBase: String(value.apiBase || 'https://api.sgroup.qq.com').replace(/\/+$/, ''),
+      gatewayUrl: String(value.gatewayUrl || ''),
+    }))),
+    wechat: uniqueAccounts((Array.isArray(data.wechat) ? data.wechat : []).map((value, index) => ({
+      ...formatBase(value, 'wechat', index),
+      serverUrl: String(value.serverUrl || '').replace(/\/+$/, ''),
+      token: String(value.token || ''),
+      pollInterval: Math.max(500, Number(value.pollInterval) || 1500),
+    }))),
+    dingtalk: uniqueAccounts((Array.isArray(data.dingtalk) ? data.dingtalk : []).map((value, index) => ({
+      ...formatBase(value, 'dingtalk', index),
+      clientId: String(value.clientId || ''),
+      clientSecret: String(value.clientSecret || ''),
+      robotCode: String(value.robotCode || ''),
+    }))),
+    discord: uniqueAccounts((Array.isArray(data.discord) ? data.discord : []).map((value, index) => ({
+      ...formatBase(value, 'discord', index),
+      applicationId: String(value.applicationId || ''),
+      botToken: String(value.botToken || ''),
+      intents: Array.isArray(value.intents) ? value.intents.map(String) : ['Guilds', 'GuildMessages', 'DirectMessages', 'MessageContent'],
+    }))),
+    whatsapp: uniqueAccounts((Array.isArray(data.whatsapp) ? data.whatsapp : []).map((value, index) => ({
+      ...formatBase(value, 'whatsapp', index),
+      phoneNumberId: String(value.phoneNumberId || ''),
+      accessToken: String(value.accessToken || ''),
+      appSecret: String(value.appSecret || ''),
+      verifyToken: String(value.verifyToken || ''),
+      graphVersion: String(value.graphVersion || 'v23.0'),
+    }))),
+    email: uniqueAccounts((Array.isArray(data.email) ? data.email : []).map((value, index) => ({
+      ...formatBase(value, 'email', index),
+      address: String(value.address || ''),
+      imapHost: String(value.imapHost || ''),
+      imapPort: Math.max(1, Number(value.imapPort) || 993),
+      imapSecure: value.imapSecure !== false,
+      imapUser: String(value.imapUser || ''),
+      imapPassword: String(value.imapPassword || ''),
+      mailbox: String(value.mailbox || 'INBOX'),
+      smtpHost: String(value.smtpHost || ''),
+      smtpPort: Math.max(1, Number(value.smtpPort) || 465),
+      smtpSecure: value.smtpSecure !== false,
+      smtpUser: String(value.smtpUser || ''),
+      smtpPassword: String(value.smtpPassword || ''),
+    }))),
   }
 }
 
@@ -179,6 +238,16 @@ export const redactAdapterConfig = (config: Adapters) => ({
   wecom: config.wecom.map(account => maskAccount(account, 'secret')),
   feishu: config.feishu.map(account => maskAccount(account, 'appSecret')),
   telegram: config.telegram.map(account => maskAccount(account, 'botToken')),
+  qqbot: config.qqbot.map(account => maskAccount(account, 'clientSecret')),
+  wechat: config.wechat.map(account => maskAccount(account, 'token')),
+  dingtalk: config.dingtalk.map(account => maskAccount(account, 'clientSecret')),
+  discord: config.discord.map(account => maskAccount(account, 'botToken')),
+  whatsapp: config.whatsapp.map(account => ({
+    ...maskAccount(maskAccount(maskAccount(account, 'accessToken'), 'appSecret'), 'verifyToken'),
+  })),
+  email: config.email.map(account => ({
+    ...maskAccount(maskAccount(account, 'imapPassword'), 'smtpPassword'),
+  })),
 })
 
 export const publicAdapterConfig = () => redactAdapterConfig(cache)
@@ -203,6 +272,27 @@ const mergeAccounts = <T extends ChannelAccountBase>(
     return { ...existing, ...update, [secretKey]: secret } as T
   })
 
+const mergeAccountsWithSecrets = <T extends ChannelAccountBase>(
+  current: T[],
+  incoming: Array<Partial<T> & Pick<T, 'id'>>,
+  secretKeys: Array<keyof T>
+) => incoming.map(account => {
+    const existing = current.find(item => item.id === account.id)
+    const update = account as Partial<T> & Pick<T, 'id'> & SecretUpdate
+    const merged = { ...existing, ...update } as T
+    for (const secretKey of secretKeys) {
+      const submitted = update[secretKey]
+      merged[secretKey] = (
+        update.clearSecret
+          ? ''
+          : typeof submitted === 'string' && submitted
+            ? submitted
+            : existing?.[secretKey] || ''
+      ) as T[keyof T]
+    }
+    return merged
+  })
+
 /**
  * 合并 WebUI 写入。Secret 省略或空字符串时保留，clearSecret 才清除。
  */
@@ -223,6 +313,32 @@ export const mergeAdapterConfig = (
   telegram: update.telegram
     ? mergeAccounts<TelegramAccountConfig>(current.telegram, update.telegram, 'botToken')
     : current.telegram,
+  qqbot: update.qqbot
+    ? mergeAccounts<QQBotAccountConfig>(current.qqbot, update.qqbot, 'clientSecret')
+    : current.qqbot,
+  wechat: update.wechat
+    ? mergeAccounts<WeChatAccountConfig>(current.wechat, update.wechat, 'token')
+    : current.wechat,
+  dingtalk: update.dingtalk
+    ? mergeAccounts<DingTalkAccountConfig>(current.dingtalk, update.dingtalk, 'clientSecret')
+    : current.dingtalk,
+  discord: update.discord
+    ? mergeAccounts<DiscordAccountConfig>(current.discord, update.discord, 'botToken')
+    : current.discord,
+  whatsapp: update.whatsapp
+    ? mergeAccountsWithSecrets<WhatsAppAccountConfig>(
+      current.whatsapp,
+      update.whatsapp,
+      ['accessToken', 'appSecret', 'verifyToken']
+    )
+    : current.whatsapp,
+  email: update.email
+    ? mergeAccountsWithSecrets<EmailAccountConfig>(
+      current.email,
+      update.email,
+      ['imapPassword', 'smtpPassword']
+    )
+    : current.email,
 })
 
 export const mergeAdapterConfigUpdate = (update: Partial<Adapters>): Adapters =>

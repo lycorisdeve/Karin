@@ -24,6 +24,8 @@ export interface Command<
   reg: RegExp
   /** 功能描述 */
   description?: string
+  /** 面向用户展示的命令用法 */
+  usage?: string | string[]
   /** 监听事件 */
   event: T
   /** 优先级 */
@@ -57,6 +59,8 @@ export interface CommandClass<
   reg: RegExp
   /** 功能描述 */
   description?: string
+  /** 面向用户展示的命令用法 */
+  usage?: string | string[]
   /** 监听事件 */
   event: T
   /** 优先级 */

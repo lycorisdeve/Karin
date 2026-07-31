@@ -62,7 +62,7 @@ export const groupHandler = async (ctx: GroupMessage) => {
   const filter = groupFilterEvent(ctx, config, group, cd)
 
   if (filter) {
-    groupsDeal(ctx, group, isPrint, (plugin: typeof cache.command[number]) => {
+    await groupsDeal(ctx, group, isPrint, (plugin: typeof cache.command[number]) => {
       if (plugin.event !== 'message' && plugin.event !== 'message.group') return false
       if (![
         'all',
@@ -113,7 +113,7 @@ export const groupTempHandler = async (ctx: GroupTempMessage) => {
   const filter = groupFilterEvent(ctx, config, group, cd)
 
   if (filter) {
-    groupsDeal(ctx, group, isPrint, (plugin: typeof cache.command[number]) => {
+    await groupsDeal(ctx, group, isPrint, (plugin: typeof cache.command[number]) => {
       if (plugin.event !== 'message' && plugin.event !== 'message.groupTemp') return false
       if (!['all', 'master', 'admin'].includes(plugin.permission)) return false
       return true
@@ -143,14 +143,22 @@ export const guildHandler = async (ctx: GuildMessage) => {
   if (context) return ctx
 
   /** 消息钩子 */
-  hooksMessageEmit.guild(ctx)
-  hooksMessageEmit.message(ctx)
+  const hook = await hooksMessageEmit.guild(ctx)
+  if (!hook) {
+    logger.debug(`[${ctx.logFnc}] 频道消息钩子返回false 跳过当前事件: ${ctx.eventId}`)
+    return
+  }
+  const hook2 = await hooksMessageEmit.message(ctx)
+  if (!hook2) {
+    logger.debug(`[${ctx.logFnc}] 消息钩子返回false 跳过当前事件: ${ctx.eventId}`)
+    return
+  }
 
   const cd = groupsCD(group, `${ctx.guildId}:${ctx.channelId}`, ctx.userId)
   const filter = groupFilterEvent(ctx, config, group, cd)
 
   if (filter) {
-    groupsDeal(ctx, group, isPrint, (plugin: typeof cache.command[number]) => {
+    await groupsDeal(ctx, group, isPrint, (plugin: typeof cache.command[number]) => {
       if (plugin.event !== 'message' && plugin.event !== 'message.guild') return false
       if (![
         'all',
@@ -220,7 +228,7 @@ const groupsDeal = async (
   log(ctx.userId, `未找到匹配到相应插件: ${ctx.messageId}`)
 
   /** 触发未找到匹配插件消息钩子 */
-  emptyEmit.message(ctx)
+  await emptyEmit.message(ctx)
 }
 
 /**
@@ -237,7 +245,10 @@ const groupsCmd = async (
   isPrint: boolean
 ): Promise<boolean> => {
   const reg = plugin.reg
-  if (reg && !reg.test(ctx.msg)) return true
+  if (reg) {
+    reg.lastIndex = 0
+    if (!reg.test(ctx.msg)) return true
+  }
   if (!disableViaAdapter(plugin, ctx.bot.adapter.protocol)) return true
   if (!disableViaPluginWhitelist(plugin, config)) return true
   if (!disableViaPluginBlacklist(plugin, config)) return true

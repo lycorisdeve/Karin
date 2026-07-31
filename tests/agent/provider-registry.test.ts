@@ -8,7 +8,7 @@ afterEach(() => {
 })
 
 const config = (): AgentConfig => ({
-  version: 3,
+  version: 7,
   enabled: true,
   providers: [
     {
@@ -51,9 +51,45 @@ const config = (): AgentConfig => ({
       destructive: 'deny',
     },
   },
-  learning: { memory: false, skills: false },
+  learning: {
+    memory: false,
+    skills: false,
+    reflection: { enabled: true, afterFailure: true, successInterval: 5 },
+    curator: {
+      enabled: true,
+      intervalHours: 168,
+      minIdleMinutes: 120,
+      staleAfterDays: 30,
+      archiveAfterDays: 90,
+    },
+    promotion: {
+      autoMemory: true,
+      autoRouting: true,
+      autoDeclarativeSkills: true,
+      minEvidence: 3,
+      minSuccessRate: 0.8,
+      maxRegressionRate: 0.05,
+      autoRollback: true,
+      rollbackWindow: 20,
+    },
+  },
+  recovery: {
+    enabled: true,
+    maxCycles: 2,
+    maxDiagnosticCalls: 8,
+    maxDurationMs: 120000,
+    researchPolicy: 'evidence-driven',
+    repair: { requireApproval: true, workspaceRoots: [] },
+  },
   tools: { disabled: [], disabledToolsets: [] },
   mcp: { enabled: false, servers: [] },
+  scriptRuntime: {
+    pythonExecutable: '',
+    defaultTimeoutMs: 30000,
+    maxTimeoutMs: 120000,
+    defaultMaxOutputBytes: 65536,
+    maxOutputBytes: 1048576,
+  },
 })
 
 const request = {
@@ -103,6 +139,47 @@ describe('Provider Registry', () => {
 
     await expect(registry.complete(request)).rejects.toThrow('401')
     expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('tries the thread model first and falls back to global routing when it is invalid', async () => {
+    const calls: Array<{ url: string; model: string }> = []
+    vi.stubGlobal('fetch', vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit
+    ) => {
+      const body = JSON.parse(String(init?.body)) as { model: string }
+      calls.push({ url: String(input), model: body.model })
+      if (body.model === 'thread-model') {
+        return new Response('model not found', { status: 404 })
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'global ok', tool_calls: [] } }],
+      }), { headers: { 'content-type': 'application/json' } })
+    }))
+
+    const result = await new AgentProviderRegistry(config).complete({
+      ...request,
+      providerId: 'fallback',
+      model: 'thread-model',
+    })
+
+    expect(calls).toEqual([
+      {
+        url: 'https://fallback.example/v1/chat/completions',
+        model: 'thread-model',
+      },
+      {
+        url: 'https://primary.example/v1/chat/completions',
+        model: 'primary-model',
+      },
+    ])
+    expect(result).toMatchObject({
+      provider: 'primary',
+      model: 'primary-model',
+      content: 'global ok',
+      fallbackFrom: ['fallback'],
+      retryReasons: ['fallback:HTTP 404:session-fallback'],
+    })
   })
 
   it('discovers models without replacing the configured model', async () => {

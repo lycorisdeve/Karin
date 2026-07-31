@@ -13,7 +13,7 @@ import type { AgentConfig } from '../../packages/core/src/types/agent'
 import type { Adapters } from '../../packages/core/src/types/config'
 
 const agentConfig = (): AgentConfig => ({
-  version: 3,
+  version: 7,
   enabled: false,
   providers: [{
     id: 'openai',
@@ -44,9 +44,45 @@ const agentConfig = (): AgentConfig => ({
       destructive: 'deny',
     },
   },
-  learning: { memory: false, skills: false },
+  learning: {
+    memory: false,
+    skills: false,
+    reflection: { enabled: true, afterFailure: true, successInterval: 5 },
+    curator: {
+      enabled: true,
+      intervalHours: 168,
+      minIdleMinutes: 120,
+      staleAfterDays: 30,
+      archiveAfterDays: 90,
+    },
+    promotion: {
+      autoMemory: true,
+      autoRouting: true,
+      autoDeclarativeSkills: true,
+      minEvidence: 3,
+      minSuccessRate: 0.8,
+      maxRegressionRate: 0.05,
+      autoRollback: true,
+      rollbackWindow: 20,
+    },
+  },
+  recovery: {
+    enabled: true,
+    maxCycles: 2,
+    maxDiagnosticCalls: 8,
+    maxDurationMs: 120000,
+    researchPolicy: 'evidence-driven',
+    repair: { requireApproval: true, workspaceRoots: [] },
+  },
   tools: { disabled: [], disabledToolsets: [] },
   mcp: { enabled: false, servers: [] },
+  scriptRuntime: {
+    pythonExecutable: '',
+    defaultTimeoutMs: 30000,
+    maxTimeoutMs: 120000,
+    defaultMaxOutputBytes: 65536,
+    maxOutputBytes: 1048576,
+  },
 })
 
 const adapters = (): Adapters => ({
@@ -88,6 +124,48 @@ const adapters = (): Adapters => ({
     allowedUpdates: ['message'],
     trigger: { wakeWords: [] },
   }],
+  qqbot: [{
+    id: 'qqbot-1',
+    name: 'QQBot',
+    enable: true,
+    appId: 'qq-app',
+    clientSecret: 'test-qq-secret',
+    apiBase: 'https://api.sgroup.qq.com',
+    gatewayUrl: '',
+    trigger: { wakeWords: [] },
+  }],
+  wechat: [],
+  dingtalk: [],
+  discord: [],
+  whatsapp: [{
+    id: 'whatsapp-1',
+    name: 'WhatsApp',
+    enable: true,
+    phoneNumberId: 'phone-1',
+    accessToken: 'test-whatsapp-access',
+    appSecret: 'test-whatsapp-secret',
+    verifyToken: 'test-whatsapp-verify',
+    graphVersion: 'v23.0',
+    trigger: { wakeWords: [] },
+  }],
+  email: [{
+    id: 'email-1',
+    name: 'Email',
+    enable: true,
+    address: 'bot@example.test',
+    imapHost: 'imap.example.test',
+    imapPort: 993,
+    imapSecure: true,
+    imapUser: 'bot@example.test',
+    imapPassword: 'test-imap-password',
+    mailbox: 'INBOX',
+    smtpHost: 'smtp.example.test',
+    smtpPort: 465,
+    smtpSecure: true,
+    smtpUser: 'bot@example.test',
+    smtpPassword: 'test-smtp-password',
+    trigger: { wakeWords: [] },
+  }],
 })
 
 describe('versioned configuration and write-only secrets', () => {
@@ -105,13 +183,50 @@ describe('versioned configuration and write-only secrets', () => {
       },
     } as never)
 
-    expect(migrated.version).toBe(3)
+    expect(migrated.version).toBe(7)
+    expect(migrated.scriptRuntime).toMatchObject({
+      pythonExecutable: '',
+      defaultTimeoutMs: 30000,
+      maxTimeoutMs: 120000,
+      defaultMaxOutputBytes: 65536,
+      maxOutputBytes: 1048576,
+    })
     expect(migrated.providers[0]).toMatchObject({
       baseUrl: 'https://legacy.example/v1',
       model: 'legacy-model',
       apiKey: 'legacy-test-key',
       timeout: 12000,
     })
+  })
+
+  it('migrates only the v4 default deny list to the v5 approval defaults', () => {
+    const legacy = {
+      ...agentConfig(),
+      version: 4,
+      policy: {
+        ...agentConfig().policy,
+        hardDeny: ['*.uninstall', '*.delete', '*.remove', '*.destroy'],
+        defaults: {
+          ...agentConfig().policy.defaults,
+          destructive: 'deny',
+        },
+      },
+    }
+    const migrated = migrateAgentConfig(legacy as never)
+    expect(migrated.version).toBe(7)
+    expect(migrated.policy.hardDeny).toEqual([])
+    expect(migrated.policy.defaults.destructive).toBe('ask')
+
+    const custom = migrateAgentConfig({
+      ...legacy,
+      policy: {
+        ...legacy.policy,
+        hardDeny: ['custom.delete'],
+        rules: [{ pattern: 'custom.destroy', decision: 'deny' }],
+      },
+    } as never)
+    expect(custom.policy.hardDeny).toEqual(['custom.delete'])
+    expect(custom.policy.rules).toEqual([{ pattern: 'custom.destroy', decision: 'deny' }])
   })
 
   it('preserves, replaces and explicitly clears Provider API keys', () => {
@@ -133,6 +248,24 @@ describe('versioned configuration and write-only secrets', () => {
     expect(cleared.providers[0].apiKey).toBe('')
   })
 
+  it('normalizes and exposes the persisted Provider model discovery cache', () => {
+    const migrated = migrateAgentConfig({
+      ...agentConfig(),
+      providers: [{
+        ...agentConfig().providers[0],
+        discoveredModels: ['model-z', 'model-a', 'model-z', ''],
+        modelsDiscoveredAt: 123456,
+      }],
+    })
+
+    expect(migrated.providers[0].discoveredModels).toEqual(['model-a', 'model-z'])
+    expect(migrated.providers[0].modelsDiscoveredAt).toBe(123456)
+    expect(redactAgentConfig(migrated).providers[0]).toMatchObject({
+      discoveredModels: ['model-a', 'model-z'],
+      modelsDiscoveredAt: 123456,
+    })
+  })
+
   it('never exposes Provider or channel secrets and preserves OneBot data', () => {
     const agentPublic = redactAgentConfig(agentConfig())
     expect(JSON.stringify(agentPublic)).not.toContain('test-api-key-original')
@@ -144,10 +277,32 @@ describe('versioned configuration and write-only secrets', () => {
       wecom: [{ ...current.wecom[0], secret: '' }],
       feishu: [{ ...current.feishu[0], appSecret: '' }],
       telegram: [{ ...current.telegram[0], botToken: '' }],
+      qqbot: [{ ...current.qqbot[0], clientSecret: '' }],
+      whatsapp: [{
+        ...current.whatsapp[0],
+        accessToken: '',
+        appSecret: '',
+        verifyToken: '',
+      }],
+      email: [{
+        ...current.email[0],
+        imapPassword: '',
+        smtpPassword: '',
+      }],
     })
     expect(merged.wecom[0].secret).toBe('test-wecom-secret')
     expect(merged.feishu[0].appSecret).toBe('test-feishu-secret')
     expect(merged.telegram[0].botToken).toBe('test-telegram-token')
+    expect(merged.qqbot[0].clientSecret).toBe('test-qq-secret')
+    expect(merged.whatsapp[0]).toMatchObject({
+      accessToken: 'test-whatsapp-access',
+      appSecret: 'test-whatsapp-secret',
+      verifyToken: 'test-whatsapp-verify',
+    })
+    expect(merged.email[0]).toMatchObject({
+      imapPassword: 'test-imap-password',
+      smtpPassword: 'test-smtp-password',
+    })
     expect(merged.onebot).toEqual(current.onebot)
 
     const cleared = mergeAdapterConfig(current, {
@@ -161,5 +316,9 @@ describe('versioned configuration and write-only secrets', () => {
     expect(serialized).not.toContain('test-wecom-secret')
     expect(serialized).not.toContain('test-feishu-secret')
     expect(serialized).not.toContain('test-telegram-token')
+    expect(serialized).not.toContain('test-qq-secret')
+    expect(serialized).not.toContain('test-whatsapp')
+    expect(serialized).not.toContain('test-imap-password')
+    expect(serialized).not.toContain('test-smtp-password')
   })
 })

@@ -1,10 +1,12 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { WSClient } from '@wecom/aibot-node-sdk'
 import { BuiltinChannelAdapter } from './adapter'
 import { channelStateStore } from './state'
 import { redactSecrets } from './security'
+import { resolveChannelImage, saveInboundChannelImage } from './media'
+import { segment } from '@/utils/message'
 
-import type { BaseMessage, WsFrame } from '@wecom/aibot-node-sdk'
+import type { BaseMessage, ReplyMsgItem, WsFrame } from '@wecom/aibot-node-sdk'
 import type { Adapters, Contact, Elements } from '@/types'
 import type { ChannelDriver, ChannelProbeResult, ChannelStatus } from './types'
 
@@ -95,11 +97,31 @@ export class WeComChannelDriver implements ChannelDriver<WeComConfig> {
       config.name,
       config.wsUrl || 'wss://openws.work.weixin.qq.com',
       async (contact: Contact, elements: Elements[]) => {
-        const frame = await client.sendMessage(contact.peer, {
-          msgtype: 'markdown',
-          markdown: { content: BuiltinChannelAdapter.text(elements) },
-        })
-        return { messageId: frame.headers?.req_id || randomUUID(), rawData: frame }
+        const frames: WsFrame[] = []
+        for (const element of elements) {
+          if (element.type === 'image') {
+            const image = await resolveChannelImage(element.file)
+            const uploaded = await client.uploadMedia(image.buffer, {
+              type: 'image',
+              filename: image.filename,
+            })
+            frames.push(await client.sendMediaMessage(contact.peer, 'image', uploaded.media_id))
+            continue
+          }
+          const text = BuiltinChannelAdapter.text([element]).trim()
+          if (text) {
+            frames.push(await client.sendMessage(contact.peer, {
+              msgtype: 'markdown',
+              markdown: { content: text },
+            }))
+          }
+        }
+        const frame = frames.at(-1)
+        if (!frame) throw new Error('企业微信消息没有可发送的内容')
+        return {
+          messageId: frame.headers?.req_id || randomUUID(),
+          rawData: { frames },
+        }
       }
     )
     this.bot.account.subId.channel = config.id
@@ -135,6 +157,38 @@ export class WeComChannelDriver implements ChannelDriver<WeComConfig> {
     client.connect()
   }
 
+  private async messageElements (body: BaseMessage): Promise<Elements[]> {
+    if (!this.client) return [segment.text(weComMessageText(body))]
+    const elements: Elements[] = []
+    const addImage = async (image?: { url?: string, aeskey?: string }) => {
+      if (!image?.url) {
+        elements.push(segment.text('[企业微信图片无法获取]'))
+        return
+      }
+      const downloaded = await this.client!.downloadFile(image.url, image.aeskey)
+      elements.push(segment.image(await saveInboundChannelImage(
+        'wecom',
+        this.config.id,
+        downloaded.buffer
+      )))
+    }
+    if (body.msgtype === 'text') elements.push(segment.text(body.text?.content || ''))
+    else if (body.msgtype === 'voice') elements.push(segment.text(body.voice?.content || '[语音]'))
+    else if (body.msgtype === 'image') await addImage(body.image)
+    else if (body.msgtype === 'mixed') {
+      for (const item of body.mixed?.msg_item || []) {
+        if (item.msgtype === 'text' && item.text?.content) {
+          elements.push(segment.text(item.text.content))
+        } else if (item.msgtype === 'image') {
+          await addImage(item.image)
+        }
+      }
+    } else {
+      elements.push(segment.text(weComMessageText(body)))
+    }
+    return elements.filter(item => item.type !== 'text' || item.text)
+  }
+
   private async receive (frame: WsFrame<BaseMessage>) {
     if (!this.bot) return
     const body = frame.body
@@ -148,15 +202,31 @@ export class WeComChannelDriver implements ChannelDriver<WeComConfig> {
       scene: body.chattype === 'group' ? 'group' : 'friend',
       peerId: body.chattype === 'group' ? body.chatid || body.from.userid : body.from.userid,
       userId: body.from.userid,
-      text: weComMessageText(body),
+      elements: await this.messageElements(body),
       mentioned: body.chattype === 'group',
       raw: frame,
       reply: async elements => {
+        const text = BuiltinChannelAdapter.text(
+          elements.filter(element => element.type !== 'image')
+        )
+        const images: ReplyMsgItem[] = []
+        for (const element of elements) {
+          if (element.type !== 'image') continue
+          const image = await resolveChannelImage(element.file)
+          images.push({
+            msgtype: 'image',
+            image: {
+              base64: image.buffer.toString('base64'),
+              md5: createHash('md5').update(image.buffer).digest('hex'),
+            },
+          })
+        }
         const result = await this.client!.replyStream(
           frame,
           streamId,
-          BuiltinChannelAdapter.text(elements),
-          true
+          text,
+          true,
+          images
         )
         const time = Date.now()
         return {

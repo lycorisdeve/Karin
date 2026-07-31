@@ -15,6 +15,7 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
     req.path === '/ping' ||
     req.path === '/login' ||
     req.path === '/refresh' ||
+    (req.method === 'GET' && req.path === '/webui/appearance') ||
     req.path.startsWith('/console')
   ) {
     next()
