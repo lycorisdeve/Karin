@@ -1,6 +1,6 @@
 {
   "name": "create-karin",
-  "version": "1.3.2",
+  "version": "2.0.0-beta.0",
   "description": "CLI tool for creating Karin projects, supports -y flag for silent installation",
   "keywords": [
     "karin",
@@ -43,7 +43,7 @@
     "typescript": "^5.3.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "publishConfig": {
     "access": "public",

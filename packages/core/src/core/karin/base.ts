@@ -6,6 +6,10 @@ import type { Command } from '@/types/plugin'
 export interface Options {
   /** 插件名称 */
   name?: string
+  /** 功能描述，用于帮助菜单等命令发现能力 */
+  description?: string
+  /** 功能描述简写 */
+  desc?: string
   /** 是否启用日志 */
   log?: boolean
   /** 权限 默认`all` */

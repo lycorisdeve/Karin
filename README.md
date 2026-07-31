@@ -30,6 +30,91 @@
 
 > 当前文档可能存在滞后性，欢迎加入交流群（850541480）一起玩耍、提建议！
 
+### 基本运行方式
+
+运行环境要求：
+
+- Node.js 20 或更高版本
+- pnpm 9
+
+首次安装依赖：
+
+```bash
+pnpm install --frozen-lockfile
+```
+
+开发运行 Core：
+
+```bash
+pnpm dev
+```
+
+WebUI 开发模式需要另开一个终端：
+
+```bash
+pnpm dev:web
+```
+
+生产构建与启动：
+
+```bash
+pnpm build
+pnpm app
+```
+
+默认 WebUI 地址由 `.env` 中的 `HTTP_HOST`、`HTTP_PORT` 决定。默认端口为
+`7777`，本机访问地址通常为 `http://127.0.0.1:7777/web`。
+
+常用验证命令：
+
+```bash
+pnpm test
+pnpm exec eslint "packages/**/*.ts"
+pnpm build
+```
+
+### Git 插件免构建运行
+
+Git 插件可以直接克隆到项目的 `plugins` 目录。Karin 会优先运行插件声明的
+TypeScript 源码，不要求先执行插件的 build：
+
+```bash
+git clone <插件仓库地址> plugins/karin-plugin-example
+pnpm install
+pnpm app
+```
+
+插件存在额外依赖时仍需执行依赖安装，但无需生成 `lib` 或 `dist`。运行期间修改
+本地 Git 插件的 `.ts`、`.tsx`、`.js`、`.mjs`、`.cjs`、`.mts` 或 `.cts`
+应用文件会触发热重载。
+
+TypeScript 插件建议在 `package.json` 中声明源码入口：
+
+```json
+{
+  "karin": {
+    "main": "src/index.ts",
+    "ts-apps": ["src/apps"]
+  }
+}
+```
+
+没有 `ts-apps` 的旧插件会继续读取原有 `karin.apps`，NPM 插件仍使用其发布的构建产物。
+
+### 命令帮助
+
+向机器人发送 `#帮助`，Karin 会扫描当前已经加载的全部正则命令，按来源插件分类，
+显示命令正则、功能描述和特殊权限。插件热更新后，帮助内容会实时反映新的命令列表。
+
+插件作者可以为命令填写简短描述：
+
+```ts
+export const status = karin.command(/^#状态$/, showStatus, {
+  name: '运行状态',
+  description: '查看机器人和运行环境状态',
+})
+```
+
 ## 温馨提示
 
 > Karin 现已稳定，放心食用！遇到问题欢迎提 Issue 或加群讨论，我们会持续优化。

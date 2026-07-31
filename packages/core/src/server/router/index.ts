@@ -106,6 +106,8 @@ import { taskListRouter, taskRunRouter, taskLogsRouter, taskDeleteRouter } from 
 import { getNpmBaseConfigRouter, getNpmrcContentRouter, getNpmrcListRouter, saveNpmrcRouter } from '../dependencies/config'
 import { getFrontendInstalledPluginList, getLoadedCommandPluginCacheList, getPluginListPluginAdmin } from '../plugins/detail'
 import { getPluginMarketList } from '../plugins/market'
+import { agentRouter } from '../agent'
+import { channelsRouter } from '../channels'
 
 /**
  * karin内部路由
@@ -122,6 +124,11 @@ router.use(express.json())
 router.post(LOGIN_ROUTER, loginRouter)
 /** 刷新令牌 */
 router.post(REFRESH_ROUTER, refreshRouter)
+
+/** Karin Agent */
+router.use('/agent', agentRouter)
+/** Core 内置多渠道状态和运维 */
+router.use('/channels', channelsRouter)
 
 /** 获取系统配置 */
 router.post(GET_CONFIG_ROUTER, getConfig)

@@ -1,0 +1,59 @@
+{
+  "version": 3,
+  "enabled": false,
+  "providers": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "kind": "openai",
+      "enabled": true,
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "",
+      "model": "",
+      "timeout": 30000
+    }
+  ],
+  "routing": {
+    "primary": "openai",
+    "fallback": []
+  },
+  "trigger": {
+    "private": true,
+    "groupMention": true,
+    "wakeWords": []
+  },
+  "limits": {
+    "maxToolRounds": 8,
+    "maxToolOutputBytes": 65536,
+    "maxRecentMessages": 40,
+    "maxSubagents": 3
+  },
+  "policy": {
+    "approvalTtlMs": 300000,
+    "hardDeny": [
+      "*.uninstall",
+      "*.delete",
+      "*.remove",
+      "*.destroy"
+    ],
+    "rules": [],
+    "defaults": {
+      "read": "allow",
+      "write": "ask",
+      "external": "ask",
+      "destructive": "deny"
+    }
+  },
+  "learning": {
+    "memory": true,
+    "skills": true
+  },
+  "tools": {
+    "disabled": [],
+    "disabledToolsets": []
+  },
+  "mcp": {
+    "enabled": false,
+    "servers": []
+  }
+}

@@ -1,4 +1,4 @@
-import App from './App.tsx'
+import App from './App'
 import '@/styles/globals.scss'
 import { scan } from 'react-scan'
 import ReactDOM from 'react-dom/client'

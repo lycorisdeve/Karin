@@ -36,6 +36,10 @@ export const karinPathResource = Object.freeze(path.join(karinPathBase, 'resourc
 export const karinPathDb = Object.freeze(path.join(karinPathData, 'db'))
 /** 任务数据库目录 `@karinjs/data/db/task` */
 export const karinPathTaskDb = Object.freeze(path.join(karinPathDb, 'task'))
+/** Agent 数据库目录 `@karinjs/data/db/agent` */
+export const karinPathAgentDb = Object.freeze(path.join(karinPathDb, 'agent'))
+/** Agent 声明式技能目录 `@karinjs/data/agent/skills` */
+export const karinPathAgentSkills = Object.freeze(path.join(karinPathData, 'agent', 'skills'))
 /** 伪redis sqlite3目录 `@karinjs/data/db/redis-sqlite3` */
 export const karinPathRedisSqlite3 = Object.freeze(path.join(karinPathDb, 'redis-sqlite3'))
 /** kv数据库目录 `@karinjs/data/db/kv` */
@@ -121,6 +125,8 @@ export default {
   karinPathSandboxData,
   karinPathSandboxTemp,
   karinPathTaskDb,
+  karinPathAgentDb,
+  karinPathAgentSkills,
 
   // 旧常量，保持兼容性
   karinDir,

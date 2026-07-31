@@ -4,6 +4,10 @@ import type { MessageEventMap, Permission } from '../event'
 export interface PluginRule {
   /** 命令正则 */
   reg: string | RegExp
+  /** 功能描述；未填写时使用插件描述或功能名称 */
+  description?: string
+  /** 功能描述简写 */
+  desc?: string
   /** 命令执行方法名称 */
   fnc: string
   /** 监听子事件 */

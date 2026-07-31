@@ -148,7 +148,7 @@ export const loginRouter: RequestHandler = async (req, res) => {
   try {
     const clientIP = req.ip || req.socket.remoteAddress || 'unknown'
 
-    logger.info(`${logger.green('login')}: ${clientIP} ${JSON.stringify(req.body)}`)
+    logger.info(`${logger.green('login')}: ${clientIP} 发起登录请求`)
 
     /** 检查IP限制 */
     const { isBlocked, ipRecord } = checkIPBlocked(clientIP, res)

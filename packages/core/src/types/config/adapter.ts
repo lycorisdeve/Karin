@@ -1,6 +1,47 @@
 /**
  * adapter.json 类型
  */
+export interface ChannelTriggerConfig {
+  /** 群聊额外唤醒词 */
+  wakeWords: string[]
+}
+
+export interface ChannelAccountBase {
+  /** WebUI 和热重载使用的稳定标识 */
+  id: string
+  /** 显示名称 */
+  name: string
+  /** 是否启用 */
+  enable: boolean
+  /** Agent 触发设置 */
+  trigger: ChannelTriggerConfig
+  /** WebUI 写入语义：显式清除本账号凭证，不持久化此字段 */
+  clearSecret?: boolean
+}
+
+export interface WeComAccountConfig extends ChannelAccountBase {
+  botId: string
+  secret: string
+  wsUrl: string
+  reconnectInterval: number
+  maxReconnectAttempts: number
+}
+
+export interface FeishuAccountConfig extends ChannelAccountBase {
+  appId: string
+  appSecret: string
+  domain: 'feishu' | 'lark'
+  reconnectInterval: number
+  maxReconnectAttempts: number
+}
+
+export interface TelegramAccountConfig extends ChannelAccountBase {
+  botToken: string
+  apiBase: string
+  pollTimeout: number
+  allowedUpdates: string[]
+}
+
 export interface Adapters {
   /** `console`适配器配置 */
   console: {
@@ -45,4 +86,10 @@ export interface Adapters {
       post_token: string
     }[]
   }
+  /** 企业微信智能机器人长连接账号 */
+  wecom: WeComAccountConfig[]
+  /** 飞书/Lark 长连接账号 */
+  feishu: FeishuAccountConfig[]
+  /** Telegram Bot API long polling 账号 */
+  telegram: TelegramAccountConfig[]
 }

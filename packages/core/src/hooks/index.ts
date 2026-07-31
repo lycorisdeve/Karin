@@ -2,6 +2,7 @@ import { empty } from './empty'
 import { message } from './messaeg'
 import { sendMsg } from './sendMsg'
 import { eventCall } from './eventCall'
+import { agent } from './agent'
 
 /**
  * 消息钩子系统类型
@@ -15,6 +16,8 @@ export type HooksType = {
   empty: typeof empty
   /** 事件调用插件钩子 */
   eventCall: typeof eventCall
+  /** Agent 生命周期 hook */
+  agent: typeof agent
 }
 
 /**
@@ -25,4 +28,7 @@ export const hooks: HooksType = {
   sendMsg,
   empty,
   eventCall,
+  agent,
 }
+
+export * from './agent'

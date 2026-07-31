@@ -1,5 +1,6 @@
 export * from './load'
 export * from './uninstall'
 export * from './init'
+export * from './help'
 export * from './upgrade'
 export { watcher } from './hmr'

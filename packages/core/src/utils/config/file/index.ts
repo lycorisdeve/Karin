@@ -1,4 +1,5 @@
 import initAdapter from './adapter'
+import initAgent from './agent'
 import initConfig from './config'
 import initEnv from './env'
 import initGroups from './groups'
@@ -6,6 +7,7 @@ import initPrivates from './privates'
 import initRender from './render'
 
 export * from './adapter'
+export * from './agent'
 export * from './config'
 export * from './env'
 export * from './groups'
@@ -22,6 +24,7 @@ export * from './redis'
  */
 export const initConfigCache = (dir: string) => {
   initEnv()
+  initAgent(dir)
   initAdapter(dir)
   initConfig(dir)
   initGroups(dir)

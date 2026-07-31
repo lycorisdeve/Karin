@@ -11,7 +11,7 @@ const writePm2Entry = () => {
 export default defineConfig({
   entry: ['src/index.ts'],
   format: ['esm', 'cjs'],
-  target: 'node18',
+  target: 'node20',
   platform: 'node',
   dts: {
     build: false,

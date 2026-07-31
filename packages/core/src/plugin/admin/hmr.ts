@@ -2,7 +2,7 @@ import path from 'node:path'
 import chokidar from 'chokidar'
 import { cache } from '../system/cache'
 import { pkgRemoveModule } from './uninstall'
-import { getModuleType, isDev } from '@/env'
+import { getModuleType } from '@/env'
 import { formatPath } from '@/utils/fs/path'
 import { pkgCache, findPkgByFile, pkgLoadModule, pkgSort } from './load'
 
@@ -25,7 +25,8 @@ export const initPluginHmr = async (
   const watchDirs = new Set<string>()
 
   Object.values(cache.index).forEach((pkg) => {
-    if (!isDev() && pkg.type !== 'app') return
+    /** npm 插件继续视为不可变构建产物；本地 App 和 Git 插件始终热重载。 */
+    if (pkg.type === 'npm') return
     pkg.allApps.forEach(dir => watchDirs.add(dir))
   })
 
@@ -58,7 +59,13 @@ export const initPluginHmr = async (
 const handleFileChange = async (file: string, action: 'add' | 'change' | 'unlink') => {
   /** 文件后缀 */
   const ext = path.extname(file)
-  const exts = getModuleType()
+  const exts = [
+    ...getModuleType(),
+    '.ts',
+    '.tsx',
+    '.cts',
+    '.mts',
+  ]
   if (!exts.includes(ext)) return
 
   const absPath = formatPath(file)

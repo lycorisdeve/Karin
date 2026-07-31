@@ -22,6 +22,8 @@ export interface Command<
   type: 'fnc'
   /** 插件正则 */
   reg: RegExp
+  /** 功能描述 */
+  description?: string
   /** 监听事件 */
   event: T
   /** 优先级 */
@@ -53,6 +55,8 @@ export interface CommandClass<
   type: 'class'
   /** 插件正则 */
   reg: RegExp
+  /** 功能描述 */
+  description?: string
   /** 监听事件 */
   event: T
   /** 优先级 */

@@ -4,7 +4,6 @@ import path from 'node:path'
 import util from 'node:util'
 import schedule from 'node-schedule'
 
-import { isTs } from '@/env'
 import { cache } from '../system/cache'
 import { formatPath } from '@/utils'
 import { createLogger } from '../tools'
@@ -21,6 +20,7 @@ import type {
   Accept,
   Button,
   Command,
+  AgentTool,
   Handler,
   PkgInfo,
   PluginFile,
@@ -31,9 +31,11 @@ import type {
 } from '@/types/plugin'
 import type { Plugin as ClassPluginType } from '../class'
 import { createPluginMismatchReporter } from '../system/versionCheck'
+import { AgentToolRegistry } from '@/agent/tools/registry'
 
 /** 插件ID */
 let seq = 0
+const agentToolValidator = new AgentToolRegistry()
 
 /**
  * 加载插件包
@@ -95,9 +97,12 @@ export const pkgLoads = async (
 
   /** 收集入口文件加载的Promise：仅非app类型插件执行入口 */
   if (pkg.type !== 'app' && shouldLoad) {
-    const main = pkg.type === 'npm' || !isTs()
-      ? await loadMainFile(pkg, pkg.pkgData?.main)
-      : await loadMainFile(pkg, pkg.pkgData?.karin?.main)
+    const sourceMain = pkg.type === 'git' ? pkg.pkgData?.karin?.main : undefined
+    const sourceMainExists = sourceMain && fs.existsSync(path.join(pkg.dir, sourceMain))
+    const main = await loadMainFile(
+      pkg,
+      sourceMainExists ? sourceMain : pkg.pkgData?.main
+    )
 
     if (main && main.KARIN_PLUGIN_INIT) {
       try {
@@ -211,6 +216,26 @@ export const pkgCache = (result: LoadPluginResult, pkg: PkgInfo, app: string) =>
       return
     }
 
+    if (isType<AgentTool>(val, 'tool')) {
+      if (val.name.startsWith('karin.')) {
+        logger.error(`[agent][tool] 插件不得注册 karin.* 保留工具: ${val.name}`)
+        return
+      }
+      if (cache.tool.some(tool => tool.name === val.name)) {
+        logger.error(`[agent][tool] 工具名称重复，已跳过: ${val.name}`)
+        return
+      }
+      try {
+        agentToolValidator.validateDefinition(val)
+      } catch (error) {
+        logger.error(error)
+        return
+      }
+      cache.count.tool++
+      cache.tool.push(val)
+      return
+    }
+
     if (isType<Task>(val, 'task')) {
       val.schedule = schedule.scheduleJob(val.cron, async () => {
         try {
@@ -321,6 +346,7 @@ const cacheClassPlugin = (
       dsbAdapter: v.dsbAdapter || [],
       Cls: Method as new () => ClassPluginType,
       reg: v.reg instanceof RegExp ? v.reg : new RegExp(v.reg),
+      description: v.description || v.desc || command.desc,
       permission: v.permission || 'all',
       event: v.event || command.event || 'message',
       priority: v.priority || 10000,
@@ -355,6 +381,7 @@ export const pkgSort = () => {
   cache.accept = lodash.sortBy(cache.accept, ['rank'], ['asc'])
   cache.command = lodash.sortBy(cache.command, ['rank'], ['asc'])
   cache.task = lodash.sortBy(cache.task, ['rank'], ['asc'])
+  cache.tool = lodash.sortBy(cache.tool, ['name'], ['asc'])
   cache.button = lodash.sortBy(cache.button, ['rank'], ['asc'])
   for (const key of Object.keys(cache.handler)) {
     cache.handler[key] = lodash.sortBy(cache.handler[key], ['rank'], ['asc'])

@@ -5,7 +5,6 @@ import {
   createServerErrorResponse,
 } from '@/server/utils/response'
 import {
-  adapter,
   getRenderCfg,
   pm2,
   redis,
@@ -16,6 +15,10 @@ import {
   getGroupsFileData,
   getPrivatesFileData,
 } from '@/utils/config'
+import {
+  mergeAdapterConfigUpdate,
+  publicAdapterConfig,
+} from '@/utils/config/file/adapter'
 
 import type { RequestHandler } from 'express'
 
@@ -33,7 +36,7 @@ export const getConfig: RequestHandler = async (req, res) => {
   }
 
   if (type === 'adapter') {
-    const cfg = adapter()
+    const cfg = publicAdapterConfig()
     return createSuccessResponse(res, cfg)
   }
 
@@ -88,6 +91,10 @@ export const saveConfig: RequestHandler = async (req, res) => {
       }))
       writeEnv(result, undefined, true)
       return true
+    }
+
+    if (type === 'adapter') {
+      return setConfig(type, mergeAdapterConfigUpdate(data))
     }
 
     if (list.includes(type)) {

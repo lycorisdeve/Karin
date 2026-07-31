@@ -1,10 +1,11 @@
-import type { Adapters, Config, Groups, PM2, Privates, Redis, Renders } from '@/types/config'
+import type { Adapters, AgentConfig, Config, Groups, PM2, Privates, Redis, Renders } from '@/types/config'
 
 /**
  * @description 默认配置
  */
 export const defaultConfig: {
   adapter: Adapters
+  agent: AgentConfig
   config: Config
   groups: Groups
   pm2: PM2
@@ -40,6 +41,63 @@ export const defaultConfig: {
           post_token: '',
         },
       ],
+    },
+    wecom: [],
+    feishu: [],
+    telegram: [],
+  },
+  agent: {
+    version: 3,
+    enabled: false,
+    providers: [
+      {
+        id: 'openai',
+        name: 'OpenAI',
+        kind: 'openai',
+        enabled: true,
+        baseUrl: 'https://api.openai.com/v1',
+        apiKey: '',
+        model: '',
+        timeout: 30000,
+      },
+    ],
+    routing: {
+      primary: 'openai',
+      fallback: [],
+    },
+    trigger: {
+      private: true,
+      groupMention: true,
+      wakeWords: [],
+    },
+    limits: {
+      maxToolRounds: 8,
+      maxToolOutputBytes: 65536,
+      maxRecentMessages: 40,
+      maxSubagents: 3,
+    },
+    policy: {
+      approvalTtlMs: 300000,
+      hardDeny: ['*.uninstall', '*.delete', '*.remove', '*.destroy'],
+      rules: [],
+      defaults: {
+        read: 'allow',
+        write: 'ask',
+        external: 'ask',
+        destructive: 'deny',
+      },
+    },
+    learning: {
+      memory: true,
+      skills: true,
+    },
+    tools: {
+      disabled: [],
+      disabledToolsets: [],
+    },
+    mcp: {
+      enabled: false,
+      servers: [],
     },
   },
   config: {

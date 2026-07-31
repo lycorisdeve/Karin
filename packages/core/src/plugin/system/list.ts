@@ -1,7 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import lodash from 'lodash'
-import { isTs } from '@/env'
 import { createAddEnv } from './env'
 import { satisfies } from '@/utils/system'
 import { karinPathPlugins } from '@/root'
@@ -21,6 +20,7 @@ import type {
 import { createPluginMismatchReporter } from './versionCheck'
 
 let isInit = true
+const LOCAL_PLUGIN_EXTENSIONS = ['.ts', '.tsx', '.cts', '.mts', '.js', '.cjs', '.mjs']
 
 /**
  * ===================================================================
@@ -195,34 +195,33 @@ const getGitInfo = async (
 
   /** 收集应用文件 */
   const apps: string[] = []
-  const files: string[] = []
   const allApps: string[] = []
 
-  /** 添加应用路径的辅助函数 */
-  const pushApps = (app: string | string[]): void => {
-    if (typeof app === 'string') {
-      files.push(app)
-    } else if (Array.isArray(app)) {
-      files.push(...app)
-    }
-  }
+  /**
+   * Git 插件优先运行源码。旧插件没有 ts-apps 时继续使用 apps，
+   * 已发布的 npm 插件仍只加载构建产物。
+   */
+  const sourceApps = pkg.karin['ts-apps']
+  const appGroups = [sourceApps, pkg.karin.apps]
+    .filter((group): group is string | string[] => typeof group === 'string' || Array.isArray(group))
 
-  /** 根据环境决定使用哪些应用路径 */
-  if (isTs()) {
-    pkg.karin['ts-apps'] && pushApps(pkg.karin['ts-apps'])
-  } else {
-    pkg.karin.apps && pushApps(pkg.karin.apps)
-  }
-
-  /** 处理所有应用路径 */
-  await Promise.allSettled(
-    files.map(async (app) => {
+  for (const group of appGroups) {
+    const files = typeof group === 'string' ? [group] : group
+    const groupApps: string[] = []
+    const groupDirs: string[] = []
+    await Promise.allSettled(files.map(async (app) => {
       const appPath = path.join(dir, app)
       if (!fs.existsSync(appPath)) return
-      apps.push(...filesByExt(appPath, ext, 'abs'))
-      allApps.push(appPath)
-    })
-  )
+      groupApps.push(...filesByExt(appPath, ext, 'abs'))
+      groupDirs.push(appPath)
+    }))
+
+    if (groupApps.length > 0) {
+      apps.push(...groupApps)
+      allApps.push(...groupDirs)
+      break
+    }
+  }
 
   info.push(createPkg('git', name, dir, apps, allApps, isForce))
 }
@@ -295,7 +294,6 @@ export const getPluginsInfo = async (
   isFirst: boolean
 ): Promise<PkgInfo[]> => {
   const info: PkgInfo[] = []
-  const ext = isTs() ? ['.ts', '.js'] : ['.js']
   const env: PkgEnv[] | null = isFirst ? [] : null
 
   /** 处理每个插件 */
@@ -305,13 +303,13 @@ export const getPluginsInfo = async (
 
       if (type === 'app') {
         const file = path.join(karinPathPlugins, name)
-        await getAppInfo(info, file, name, ext, isForce)
+        await getAppInfo(info, file, name, LOCAL_PLUGIN_EXTENSIONS, isForce)
         return
       }
 
       if (type === 'git' || type === 'root') {
         const file = type === 'root' ? process.cwd() : path.join(karinPathPlugins, name)
-        await getGitInfo(info, file, name, ext, isForce, env)
+        await getGitInfo(info, file, name, LOCAL_PLUGIN_EXTENSIONS, isForce, env)
         return
       }
 

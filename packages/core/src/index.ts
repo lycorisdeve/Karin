@@ -10,6 +10,7 @@ import { printStartLog } from './service/start'
 import { createDB, createRedis } from '@/core/db'
 import { initRender } from '@/adapter/render'
 import { initOneBotAdapter } from '@/adapter/onebot'
+import { initBuiltinChannels } from '@/adapter/channels'
 import { initTaskSystem } from '@/service/task'
 import { listeners } from './core/internal/listeners'
 import type { LoggerLevel } from '@/service/logger/types'
@@ -21,11 +22,13 @@ export * from '@/core/karin'
 export * from '@/utils'
 export * from '@/server'
 export * from '@/adapter/onebot'
+export * from '@/adapter/channels'
 export * from '@/event'
 export * from '@/adapter/render/admin/cache'
 export * from '@/adapter/render/admin/types'
 export * from '@/components'
 export * from '@/hooks'
+export * from '@/agent'
 export { renderTpl } from '@/adapter/render/admin/template'
 export { AdapterBase } from '@/adapter/base/index'
 export { getPlugins } from '@/plugin/system/list'
@@ -117,10 +120,19 @@ export const start = async () => {
   await initPlugin()
 
   /**
-   * 9. 加载适配器
+   * 9. 初始化 Karin Agent
+   * - 仅在配置有效且显式启用时注册未匹配消息入口
+   * - 初始化失败不会影响固定命令和适配器
+   */
+  const { initAgent } = await import('@/agent')
+  await initAgent()
+
+  /**
+   * 10. 加载适配器
    */
   await import('@/adapter')
   await initOneBotAdapter()
+  await initBuiltinChannels()
   await initRender()
 
   /**

@@ -6,6 +6,7 @@ export const cache: Cache = {
   accept: [],
   command: [],
   task: [],
+  tool: [],
   button: [],
   handler: {},
   missing: new Map(),
@@ -14,6 +15,7 @@ export const cache: Cache = {
     accept: 0,
     command: 0,
     task: 0,
+    tool: 0,
     button: 0,
     handler: {
       key: 0,

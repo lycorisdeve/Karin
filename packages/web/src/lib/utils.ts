@@ -20,6 +20,7 @@ export const getPageTitle = (pathname: string) => {
     '/sandbox/chat': '沙箱 | [聊天]',
     '/sandbox/contact': '沙箱 | [联系人]',
     '/about': '关于我们',
+    '/agent': 'Karin Agent',
     '/login': '登录',
     '/log': '实时日志',
     '/terminal': '仿真终端',
@@ -34,6 +35,20 @@ export const getPageTitle = (pathname: string) => {
   // 然后检查通用路径前缀
   if (pathname.startsWith('/config/')) {
     return '配置信息'
+  }
+
+  if (pathname.startsWith('/agent/')) {
+    const titles: Record<string, string> = {
+      '/agent/chat': 'Karin Agent 对话',
+      '/agent/tasks': 'Karin Agent 定时任务',
+      '/agent/skills': 'Karin Agent Skills',
+      '/agent/memories': 'Karin Agent 记忆',
+      '/agent/tools': 'Karin Agent Tools',
+      '/agent/approvals': 'Karin Agent 审批',
+      '/agent/runs': 'Karin Agent 运行记录',
+      '/agent/config': 'Karin Agent 配置',
+    }
+    return titles[pathname] || 'Karin Agent'
   }
 
   if (pathname.startsWith('/plugins/')) {

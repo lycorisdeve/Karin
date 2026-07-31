@@ -2,6 +2,7 @@ import { cache } from '../system/cache'
 import { getPlugins } from '../system/list'
 import { initPluginHmr } from './hmr'
 import { pkgLoads, pkgSort } from './load'
+import { registerHelpCommand } from './help'
 import { errorHandler } from '@/core/internal'
 
 /**
@@ -23,6 +24,8 @@ export const initPlugins = async () => {
 
   /** 排序 */
   pkgSort()
+  /** 固定帮助命令始终优先于 Agent，并动态读取命令缓存。 */
+  registerHelpCommand()
   /** 打印加载错误的插件 */
   errorHandler.printMissing()
   logger.info('插件加载完成')

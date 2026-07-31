@@ -3,6 +3,7 @@ import type { Button } from './button'
 import type { Accept } from './accept'
 import type { Handler } from './handler'
 import type { Command, CommandClass } from './command'
+import type { AgentTool } from './tool'
 
 /**
  * 全部插件方法联合类型
@@ -11,5 +12,6 @@ export type AllPluginMethods = Accept
   | Button
   | Handler
   | Task
+  | AgentTool
   | Command
   | CommandClass

@@ -97,6 +97,7 @@ export const command: CommandType = <T extends keyof MessageEventMap = keyof Mes
     log: createLogger(options.log, true),
     permission: options.perm || options.permission || 'all',
     priority: isNaN(rank) ? 10000 : rank,
+    description: options.description || options.desc,
     reg,
     adapter: Array.isArray(options.adapter) ? options.adapter : [],
     dsbAdapter: Array.isArray(dsbAdapter) ? dsbAdapter : [],

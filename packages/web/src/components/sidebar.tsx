@@ -259,7 +259,7 @@ export default function Sidebar ({ isOpen, onToggle }: SidebarProps) {
                         </div>
 
                         {/* 右侧箭头区域 */}
-                        {!isCollapsed && item.href === '/plugins-dashboard' && item.children && (
+                        {!isCollapsed && item.children && (
                           <motion.div
                             initial={{ rotate: 0 }}
                             animate={{ rotate: expandedMenu === item.href ? 90 : 0 }}
@@ -314,8 +314,10 @@ export default function Sidebar ({ isOpen, onToggle }: SidebarProps) {
                                   </div>
                                 )
                                 : (
-                                  item.children
-                                    .sort((a, b) => (a.label || a.id).localeCompare(b.label || b.id))
+                                  (item.href === '/plugins-dashboard'
+                                    ? [...item.children].sort((a, b) =>
+                                      (a.label || a.id).localeCompare(b.label || b.id))
+                                    : item.children)
                                     .map((child) => (
                                       <Fragment key={child.id}>
                                         <Button
@@ -329,7 +331,9 @@ export default function Sidebar ({ isOpen, onToggle }: SidebarProps) {
                                             }
                                           )}
                                           onPress={() => {
-                                            if (child.hasConfig) {
+                                            if (child.kind === 'route') {
+                                              navigate(child.href)
+                                            } else if (child.hasConfig) {
                                               /** 增加小延迟提供更好的视觉反馈 */
                                               setTimeout(() => {
                                                 navigate(`/plugins/config?name=${child.id}`)
@@ -340,6 +344,7 @@ export default function Sidebar ({ isOpen, onToggle }: SidebarProps) {
                                           }}
                                         >
                                           <div className='flex items-center gap-3'>
+                                            {child.Icon && <child.Icon className='h-4 w-4 flex-shrink-0' />}
                                             {child.icon && <Icon name={child.icon.name || ''} size={child.icon.size || 20} color={child.icon.color || 'currentColor'} className='flex-shrink-0' />}
                                             <span>{child.label || child.id}</span>
                                           </div>

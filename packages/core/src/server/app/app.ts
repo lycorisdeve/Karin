@@ -33,8 +33,8 @@ const listen = (port: number, host: string) => {
 
   listeners.once(ONLINE, () => {
     logger.info('\n--------------------^_^--------------------')
-    logger.info(`[server] ${logger.yellow('WebUI 访问地址:')} ${logger.green(`http://127.0.0.1:${port}/web/login?token=${process.env.HTTP_AUTH_KEY}`)}`)
-    logger.info(`[server] HTTP  鉴权秘钥: ${logger.green(process.env.HTTP_AUTH_KEY)}`)
+    logger.info(`[server] ${logger.yellow('WebUI 访问地址:')} ${logger.green(`http://127.0.0.1:${port}/web/login`)}`)
+    logger.info('[server] HTTP 鉴权密钥已配置，不在日志中显示')
     logger.info(`[server] WS    鉴权秘钥: ${logger.green(process.env.WS_SERVER_AUTH_KEY) || logger.yellow('没有设置鉴权秘钥')}`)
     logger.info('-------------------------------------------')
     logger.info(`[OneBot] ${logger.yellow('协议端连接地址:')} ${logger.green(`ws://127.0.0.1:${process.env.HTTP_PORT}`)}`)

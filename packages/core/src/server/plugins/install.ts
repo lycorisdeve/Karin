@@ -170,40 +170,43 @@ const installPluginTask = async (task: InstallTask, url?: string) => {
   }
 }
 
+export const startPluginInstall = (
+  input: { name: string, type: 'npm' | 'git' | 'app', url?: string }
+) => {
+  const { name, type, url } = input
+  if (!name || !['npm', 'git', 'app'].includes(type)) {
+    throw new Error('插件名称或类型无效')
+  }
+  const existingTask = Array.from(taskQueue.values()).find(
+    task => task.name === name && task.status === 'running'
+  )
+  if (existingTask) throw new Error('该插件正在安装中')
+
+  const taskId = `${type}-${name}-${Date.now()}`
+  const task: InstallTask = {
+    id: taskId,
+    name,
+    type,
+    status: 'pending',
+    logs: [],
+    minimized: false,
+  }
+  taskQueue.set(taskId, task)
+  installPluginTask(task, url).catch(error => {
+    task.status = 'failed'
+    task.error = error.message
+    task.logs.push(`安装失败: ${error.message}`)
+  })
+  return taskId
+}
+
 /**
  * 安装插件
  */
 export const pluginInstall: RequestHandler = async (req, res) => {
   try {
     const { name, type, url } = req.body
-    const taskId = `${type}-${name}-${Date.now()}`
-
-    /** 检查是否已在安装队列中 */
-    const existingTask = Array.from(taskQueue.values()).find(
-      task => task.name === name && task.status === 'running'
-    )
-    if (existingTask) {
-      return createServerErrorResponse(res, '该插件正在安装中')
-    }
-
-    /** 创建新任务 */
-    const task: InstallTask = {
-      id: taskId,
-      name,
-      type,
-      status: 'pending',
-      logs: [],
-      minimized: false,
-    }
-    taskQueue.set(taskId, task)
-
-    /** 异步执行安装 */
-    installPluginTask(task, url).catch(error => {
-      task.status = 'failed'
-      task.error = error.message
-      task.logs.push(`安装失败: ${error.message}`)
-    })
-
+    const taskId = startPluginInstall({ name, type, url })
     createSuccessResponse(res, { taskId })
   } catch (error) {
     createServerErrorResponse(res, (error as Error).message)
@@ -274,40 +277,43 @@ const uninstallPluginTask = async (task: InstallTask) => {
   }
 }
 
+export const startPluginUninstall = (
+  input: { name: string, type: 'npm' | 'git' }
+) => {
+  const { name, type } = input
+  if (!name || !['npm', 'git'].includes(type)) {
+    throw new Error('插件名称或类型无效')
+  }
+  const existingTask = Array.from(taskQueue.values()).find(
+    task => task.name === name && task.status === 'running'
+  )
+  if (existingTask) throw new Error('该插件正在操作中')
+
+  const taskId = `uninstall-${type}-${name}-${Date.now()}`
+  const task: InstallTask = {
+    id: taskId,
+    name,
+    type,
+    status: 'pending',
+    logs: [],
+    minimized: false,
+  }
+  taskQueue.set(taskId, task)
+  uninstallPluginTask(task).catch(error => {
+    task.status = 'failed'
+    task.error = error.message
+    task.logs.push(`卸载失败: ${error.message}`)
+  })
+  return taskId
+}
+
 /**
  * 卸载插件
  */
 export const pluginUninstall: RequestHandler = async (req, res) => {
   try {
     const { name, type } = req.body
-    const taskId = `uninstall-${type}-${name}-${Date.now()}`
-
-    /** 检查是否已在卸载队列中 */
-    const existingTask = Array.from(taskQueue.values()).find(
-      task => task.name === name && task.status === 'running'
-    )
-    if (existingTask) {
-      return createServerErrorResponse(res, '该插件正在卸载中')
-    }
-
-    /** 创建新任务 */
-    const task: InstallTask = {
-      id: taskId,
-      name,
-      type,
-      status: 'pending',
-      logs: [],
-      minimized: false,
-    }
-    taskQueue.set(taskId, task)
-
-    /** 异步执行卸载 */
-    uninstallPluginTask(task).catch(error => {
-      task.status = 'failed'
-      task.error = error.message
-      task.logs.push(`卸载失败: ${error.message}`)
-    })
-
+    const taskId = startPluginUninstall({ name, type })
     createSuccessResponse(res, { taskId })
   } catch (error) {
     createServerErrorResponse(res, (error as Error).message)

@@ -1,4 +1,14 @@
-import { RiSettings2Fill } from 'react-icons/ri'
+import {
+  RiArchiveFill,
+  RiBrainFill,
+  RiCalendarEventFill,
+  RiChat3Fill,
+  RiFileList3Fill,
+  RiRobot2Fill,
+  RiSettings2Fill,
+  RiShieldCheckFill,
+  RiToolsFill,
+} from 'react-icons/ri'
 import { BsInfoCircleFill } from 'react-icons/bs'
 import {
   MdSpaceDashboard,
@@ -17,7 +27,9 @@ export interface NavItem {
     id: string
     href: string
     label?: string
-    icon: FrontendInstalledPluginListResponse['icon']
+    icon?: FrontendInstalledPluginListResponse['icon']
+    Icon?: React.ComponentType<React.SVGProps<SVGSVGElement>>
+    kind?: 'route' | 'plugin'
     type?: 'git' | 'npm' | 'app'
     hasConfig?: boolean
   }[]
@@ -42,6 +54,21 @@ export const defaultSiteConfig: SiteConfigType = {
       Icon: RiSettings2Fill,
       label: '系统配置',
       href: '/config',
+    },
+    {
+      Icon: RiRobot2Fill,
+      label: 'Karin Agent',
+      href: '/agent',
+      children: [
+        { id: 'agent-chat', href: '/agent/chat', label: '对话', Icon: RiChat3Fill, kind: 'route' },
+        { id: 'agent-tasks', href: '/agent/tasks', label: '定时任务', Icon: RiCalendarEventFill, kind: 'route' },
+        { id: 'agent-skills', href: '/agent/skills', label: 'Skills 管理', Icon: RiBrainFill, kind: 'route' },
+        { id: 'agent-memories', href: '/agent/memories', label: '记忆管理', Icon: RiArchiveFill, kind: 'route' },
+        { id: 'agent-tools', href: '/agent/tools', label: 'Tools 管理', Icon: RiToolsFill, kind: 'route' },
+        { id: 'agent-approvals', href: '/agent/approvals', label: '审批中心', Icon: RiShieldCheckFill, kind: 'route' },
+        { id: 'agent-runs', href: '/agent/runs', label: '运行记录', Icon: RiFileList3Fill, kind: 'route' },
+        { id: 'agent-config', href: '/agent/config', label: '配置管理', Icon: RiSettings2Fill, kind: 'route' },
+      ],
     },
     {
       Icon: MdExtension,
@@ -108,6 +135,7 @@ export const initSiteConfig = async (isRefresh = false) => {
               href: plugin.href,
               label: plugin.label,
               icon: plugin.icon!,
+              kind: 'plugin' as const,
               type: plugin.type,
               hasConfig: plugin.hasConfig,
             }))

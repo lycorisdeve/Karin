@@ -41,7 +41,7 @@ export default defineConfig({
     ...moduleEntries,
   },
   format: ['esm'],
-  target: 'node18',
+  target: 'node20',
   platform: 'node',
   clean: true,
   dts: {

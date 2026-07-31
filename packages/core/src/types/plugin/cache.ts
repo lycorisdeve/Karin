@@ -6,12 +6,14 @@ import type { Command, CommandClass } from './command'
 import type { Task } from './task'
 import type { Handler } from './handler'
 import type { MessageEventMap } from '../event'
+import type { AgentTool } from './tool'
 
 export interface Count {
   accept: number
   command: number
   task: number
   button: number
+  tool: number
   handler: {
     /** 入口key */
     key: number
@@ -32,6 +34,8 @@ export interface Cache {
   task: Array<Task>,
   /** 按钮 */
   button: Button[],
+  /** Agent tools */
+  tool: AgentTool[],
   /** 插件数量统计 */
   count: Count
   /** 插件名称:缺失的依赖 */

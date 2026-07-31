@@ -21,7 +21,7 @@ export const authMiddleware: RequestHandler = async (req, res, next) => {
     return
   }
 
-  if (req.method === 'POST') {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     const verify = await auth.postAuth(req, res)
     if (!verify) return
   } else if (req.method === 'GET') {
