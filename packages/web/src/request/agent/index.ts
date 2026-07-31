@@ -7,6 +7,12 @@ export interface AgentStatus {
   configured: boolean
   apiKeyConfigured: boolean
   ftsAvailable: boolean
+  scriptRuntime: {
+    available: boolean
+    executable: string
+    version?: string
+    reason?: string
+  }
 }
 
 export type AgentProviderKind = 'openai' | 'deepseek' | 'kimi' | 'mimo' | 'custom'
@@ -20,6 +26,9 @@ export interface AgentProviderProfile {
   apiKey: string
   apiKeyConfigured?: boolean
   model: string
+  discoveredModels?: string[]
+  modelsDiscoveredAt?: number
+  visionModels?: string[]
   timeout: number
   clearApiKey?: boolean
   verification?: {
@@ -32,7 +41,7 @@ export interface AgentProviderProfile {
 }
 
 export interface AgentConfig {
-  version: 3
+  version: 7
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: { primary: string; fallback: string[] }
@@ -49,7 +58,43 @@ export interface AgentConfig {
     rules: Array<{ pattern: string; decision: string }>
     defaults: Record<'read' | 'write' | 'external' | 'destructive', string>
   }
-  learning: { memory: boolean; skills: boolean }
+  learning: {
+    memory: boolean
+    skills: boolean
+    reflection: {
+      enabled: boolean
+      afterFailure: boolean
+      successInterval: number
+    }
+    curator: {
+      enabled: boolean
+      intervalHours: number
+      minIdleMinutes: number
+      staleAfterDays: number
+      archiveAfterDays: number
+    }
+    promotion: {
+      autoMemory: boolean
+      autoRouting: boolean
+      autoDeclarativeSkills: boolean
+      minEvidence: number
+      minSuccessRate: number
+      maxRegressionRate: number
+      autoRollback: boolean
+      rollbackWindow: number
+    }
+  }
+  recovery: {
+    enabled: boolean
+    maxCycles: number
+    maxDiagnosticCalls: number
+    maxDurationMs: number
+    researchPolicy: 'evidence-driven' | 'always' | 'explicit'
+    repair: {
+      requireApproval: boolean
+      workspaceRoots: string[]
+    }
+  }
   tools: { disabled: string[]; disabledToolsets: string[] }
   mcp: {
     enabled: boolean
@@ -64,6 +109,13 @@ export interface AgentConfig {
       headers?: Record<string, string>
       env?: Record<string, string>
     }>
+  }
+  scriptRuntime: {
+    pythonExecutable: string
+    defaultTimeoutMs: number
+    maxTimeoutMs: number
+    defaultMaxOutputBytes: number
+    maxOutputBytes: number
   }
 }
 
@@ -89,8 +141,26 @@ export interface AgentThread {
   archivedAt: number | null
   messageCount: number
   lastMessagePreview: string
+  modelProviderId: string | null
+  modelName: string | null
+  channel: string
+  protocol: string
+  accountId: string
+  accountName: string
+  contactKey: string
+  contactId: string
+  contactSubId: string
+  contactName: string
+  depth?: number
   createdAt: number
   updatedAt: number
+}
+
+export interface AgentThreadChannel {
+  channel: string
+  activeCount: number
+  archivedCount: number
+  lastUpdatedAt: number
 }
 
 export interface AgentMessage {
@@ -100,6 +170,16 @@ export interface AgentMessage {
   content: string
   name?: string
   toolCallId?: string
+  attachments?: Array<{
+    id: string
+    messageId: string
+    type: 'image'
+    mime: string
+    size: number
+    name: string
+    url: string
+    createdAt: number
+  }>
   createdAt: number
 }
 
@@ -110,6 +190,7 @@ export interface AgentToolCallView {
   name: string
   source: string
   toolset: string
+  description?: string
   risk: string
   decision: string
   status: string
@@ -123,12 +204,42 @@ export interface AgentToolCallView {
 
 export interface AgentApproval {
   id: string
+  threadId: string
+  turnId: string
+  toolCallId: string
   actorId: string
   toolName: string
   input: Record<string, unknown>
+  approverContactKey: string | null
   status: string
   expiresAt: number
   createdAt: number
+}
+
+export interface AgentActivityView {
+  id: string
+  threadId: string
+  turnId: string
+  kind: 'turn' | 'tool' | 'approval' | 'subagent'
+  status:
+    | 'running'
+    | 'waiting_approval'
+    | 'completed'
+    | 'failed'
+    | 'denied'
+    | 'expired'
+    | 'interrupted'
+  label: string
+  source?: string
+  risk?: string
+  decision?: string
+  parentId?: string
+  input?: unknown
+  output?: unknown
+  error?: string
+  startedAt: number
+  completedAt?: number
+  durationMs?: number
 }
 
 export interface AgentMemory {
@@ -149,6 +260,63 @@ export interface AgentSkill {
   updatedAt: number
 }
 
+export interface AgentScriptToolDefinition {
+  id: string
+  name: string
+  description: string
+  runtime: 'python'
+  source: string
+  sourceHash: string
+  inputSchema: Record<string, unknown>
+  outputSchema?: Record<string, unknown>
+  semantics: {
+    objective: string
+    inputs: string
+    outputs: string
+    sideEffects: string[]
+    idempotent: boolean
+  }
+  stop: {
+    completionCondition: string
+    timeoutMs: number
+    maxOutputBytes: number
+  }
+  failure: {
+    strategy: 'fail' | 'retry'
+    maxAttempts: number
+    retryDelayMs: number
+    userMessage: string
+  }
+}
+
+export interface AgentSkillVersion {
+  id: string
+  skill_id: string
+  version: number
+  name: string
+  description: string
+  content: string
+  tools_json: string
+  source_turn_id: string
+  content_hash: string
+  validation_status: string
+  script_tools_json: string
+  created_at: number
+}
+
+export interface AgentThreadModel {
+  thread: AgentThread
+  inherited: boolean
+  providerId: string
+  providerName: string
+  model: string
+  models: Array<{
+    providerId: string
+    providerName: string
+    model: string
+  }>
+}
+
 export interface AgentJob {
   id: string
   name: string
@@ -162,6 +330,27 @@ export interface AgentJob {
   skillIds: string[]
   enabled: boolean
   lastRunAt: number | null
+}
+
+export interface AgentEvolutionCandidate {
+  id: string
+  target: 'memory' | 'profile' | 'routing' | 'skill' | 'tool' | 'repair'
+  kind: 'declarative' | 'executable'
+  sourceTurnIds: string[]
+  baselineVersion?: string
+  candidateVersion: string
+  state: 'draft' | 'evaluating' | 'ready' | 'active' | 'rejected' | 'rolled_back'
+  summary: string
+  payload: Record<string, unknown>
+  metrics?: {
+    evidence: number
+    successRate: number
+    regressionRate: number
+    toolHitRate: number
+    correctionRate: number
+  }
+  createdAt: number
+  updatedAt: number
 }
 
 const base = '/api/v1/agent'
@@ -194,15 +383,25 @@ export const agentRequest = {
     query?: string
     cursor?: number
     limit?: number
+    channel?: string
+    rootOnly?: boolean
   } = {}) => {
     const query = new URLSearchParams()
     if (options.state) query.set('state', options.state)
     if (options.query) query.set('query', options.query)
     if (options.cursor) query.set('cursor', String(options.cursor))
     if (options.limit) query.set('limit', String(options.limit))
+    if (options.channel) query.set('channel', options.channel)
+    if (options.rootOnly) query.set('rootOnly', 'true')
     const suffix = query.size ? `?${query}` : ''
     return request.serverGet<AgentThread[]>(`${base}/threads${suffix}`)
   },
+  threadChannels: () =>
+    request.serverGet<AgentThreadChannel[]>(`${base}/threads/channels`),
+  threadTree: (threadId: string) =>
+    request.serverGet<{ root: AgentThread, children: AgentThread[] }>(
+      `${base}/threads/${threadId}/tree`
+    ),
   createThread: (threadKey: string) =>
     request.serverPost<AgentThread, { threadKey: string }>(`${base}/threads`, { threadKey }),
   messages: (threadId: string, before?: number) =>
@@ -211,12 +410,23 @@ export const agentRequest = {
     ),
   updateThread: (threadId: string, input: { title?: string; archived?: boolean }) =>
     request.patch(`${base}/threads/${threadId}`, input).then(response => response.data.data as AgentThread),
+  threadModel: (threadId: string) =>
+    request.serverGet<AgentThreadModel>(`${base}/threads/${threadId}/model`),
+  setThreadModel: (
+    threadId: string,
+    providerId: string | null,
+    model: string | null
+  ) =>
+    request.patch(`${base}/threads/${threadId}/model`, { providerId, model })
+      .then(response => response.data.data as AgentThread),
   deleteThread: (threadId: string) =>
     request.delete(`${base}/threads/${threadId}`).then(response => response.data.data as {
       deleted: boolean
     }),
   toolCalls: (threadId: string) =>
     request.serverGet<AgentToolCallView[]>(`${base}/threads/${threadId}/tool-calls`),
+  activity: (threadId: string) =>
+    request.serverGet<AgentActivityView[]>(`${base}/threads/${threadId}/activity`),
   startTurn: (threadId: string, content: string) =>
     request.serverPost<
       { accepted: boolean; requestId: string; threadId: string },
@@ -228,11 +438,34 @@ export const agentRequest = {
       { threadKey: string; content: string }
     >(`${base}/chat`, { threadKey, content }, { timeout: 120000 }),
   interrupt: (threadId: string) => request.serverPost(`${base}/threads/${threadId}/interrupt`),
+  stop: (threadId: string) =>
+    request.serverPost<{
+      interrupted: boolean
+      turns: number
+      subagents: number
+      approvals: number
+    }, Record<string, never>>(`${base}/threads/${threadId}/stop`, {}),
   events: (threadId: string, after = 0) =>
     eventSourcePolyfill(`${base}/threads/${threadId}/events?after=${after}`),
   approvals: () => request.serverGet<AgentApproval[]>(`${base}/approvals`),
-  resolveApproval: (id: string, decision: 'approved' | 'denied') =>
-    request.serverPost(`${base}/approvals/${id}/resolve`, { decision }, { timeout: 120000 }),
+  resolveApproval: (
+    id: string,
+    decision: 'approved' | 'denied',
+    scope: 'once' | 'thread' | 'delegate' = 'once'
+  ) =>
+    request.serverPost(
+      `${base}/approvals/${id}/resolve`,
+      { decision, scope },
+      { timeout: 120000 }
+    ),
+  threadGrants: (threadId: string) =>
+    request.serverGet<Array<Record<string, unknown>>>(`${base}/threads/${threadId}/grants`),
+  revokeThreadGrant: (threadId: string, grantId: string) =>
+    request.delete(`${base}/threads/${threadId}/grants/${grantId}`),
+  feedback: (
+    threadId: string,
+    input: { turnId?: string; rating?: -1 | 0 | 1; correction?: string }
+  ) => request.serverPost(`${base}/threads/${threadId}/feedback`, input),
   memories: () => request.serverGet<AgentMemory[]>(`${base}/memories`),
   createMemory: (input: { scope: string; scopeKey: string; content: string }) =>
     request.serverPost(`${base}/memories`, input),
@@ -245,9 +478,29 @@ export const agentRequest = {
     description: string
     instructions: string
     tools: string[]
+    scriptTools: AgentScriptToolDefinition[]
   }) => request.serverPost(`${base}/skills`, input),
+  updateSkill: (id: string, input: {
+    name: string
+    description: string
+    instructions: string
+    tools: string[]
+    scriptTools: AgentScriptToolDefinition[]
+  }) => request.serverPost(`${base}/skills/${id}/versions`, input),
+  deleteSkill: (id: string, confirmName: string) =>
+    request.delete(`${base}/skills/${id}`, { data: { confirmName } })
+      .then(response => response.data.data as {
+        deleted: boolean
+        name: string
+        versions: number
+        snapshots: number
+        jobsUpdated: number
+        candidatesUpdated: number
+      }),
   skillVersions: (id: string) =>
-    request.serverGet<Array<Record<string, unknown>>>(`${base}/skills/${id}/versions`),
+    request.serverGet<AgentSkillVersion[]>(`${base}/skills/${id}/versions`),
+  skillUsage: (id: string) =>
+    request.serverGet<Record<string, unknown> | null>(`${base}/skills/${id}/usage`),
   setSkillState: (id: string, enabled: boolean) =>
     request.serverPost(`${base}/skills/${id}/state`, { enabled }),
   rollbackSkill: (id: string, versionId: string) =>
@@ -270,6 +523,40 @@ export const agentRequest = {
     ),
   audit: () => request.serverGet<Array<Record<string, unknown>>>(`${base}/audit`),
   usage: () => request.serverGet<Array<Record<string, unknown>>>(`${base}/usage`),
+  evolutionOverview: () =>
+    request.serverGet<{
+      candidates: Record<string, number>
+      outcomes: Record<string, number>
+      feedback: { total: number; corrected: number }
+      retrieval: { total: number; selected: number }
+    }>(`${base}/evolution/overview`),
+  evolutionCandidates: (state?: AgentEvolutionCandidate['state']) =>
+    request.serverGet<AgentEvolutionCandidate[]>(
+      `${base}/evolution/candidates${state ? `?state=${state}` : ''}`
+    ),
+  evolutionAction: (
+    id: string,
+    action: 'evaluate' | 'promote' | 'reject' | 'rollback',
+    reason?: string
+  ) => request.serverPost<AgentEvolutionCandidate, { reason?: string }>(
+    `${base}/evolution/candidates/${id}/${action}`,
+    reason ? { reason } : {}
+  ),
+  evolutionArtifact: (id: string) =>
+    request.serverGet<{
+      candidate: AgentEvolutionCandidate
+      patch: string
+    }>(`${base}/evolution/candidates/${id}/artifact`),
+  applyRepair: (id: string, restartCore = true) =>
+    request.serverPost<AgentEvolutionCandidate, { restartCore: boolean }>(
+      `${base}/evolution/candidates/${id}/apply`,
+      { restartCore }
+    ),
+  rollbackRepair: (id: string, restartCore = true) =>
+    request.serverPost<AgentEvolutionCandidate, { restartCore: boolean }>(
+      `${base}/evolution/candidates/${id}/repair-rollback`,
+      { restartCore }
+    ),
   search: (query: string) =>
     request.serverGet<Array<Record<string, unknown>>>(
       `${base}/search?q=${encodeURIComponent(query)}`

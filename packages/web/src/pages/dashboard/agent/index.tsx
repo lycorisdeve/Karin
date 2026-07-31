@@ -1,57 +1,108 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import toast from 'react-hot-toast'
+import Markdown from '@/components/Markdown'
+import { request } from '@/lib/request'
 import {
   Bot,
   Brain,
   Check,
   Archive,
   ArchiveRestore,
+  BookOpen,
+  ChevronRight,
   CircleStop,
+  Clock3,
   Copy,
   Database,
   Network,
+  Menu,
+  LoaderCircle,
+  Pause,
+  Play,
+  Plus,
   RefreshCw,
   Search,
   Send,
+  Server,
   Settings,
-  ShieldCheck,
   Pencil,
   RotateCcw,
   Trash2,
-  Workflow,
+  ThumbsDown,
+  ThumbsUp,
+  MessageSquareWarning,
   X,
 } from 'lucide-react'
 import {
   agentRequest,
   type AgentApproval,
+  type AgentActivityView,
   type AgentConfig,
   type AgentJob,
   type AgentMemory,
   type AgentMessage,
   type AgentSkill,
+  type AgentScriptToolDefinition,
+  type AgentSkillVersion,
   type AgentStatus,
   type AgentThread,
+  type AgentThreadChannel,
   type AgentToolCallView,
   type AgentProviderKind,
+  type AgentEvolutionCandidate,
 } from '@/request/agent'
+import {
+  channelName,
+  isRenderableChatMessage,
+  readThreadSelections,
+  restoredThreadRoot,
+  threadName,
+  writeThreadSelection,
+} from './thread-selection'
 
-type Page = 'chat' | 'tasks' | 'skills' | 'memories' | 'tools' | 'approvals' | 'runs' | 'config'
+type Page =
+  | 'chat'
+  | 'tasks'
+  | 'skills'
+  | 'memories'
+  | 'evolution'
+  | 'tools'
+  | 'mcp'
+  | 'approvals'
+  | 'runs'
+  | 'config'
 
-const tabs: Array<{ id: Page; label: string; icon: typeof Bot }> = [
-  { id: 'chat', label: '对话', icon: Bot },
-  { id: 'tasks', label: '定时任务', icon: Workflow },
-  { id: 'skills', label: 'Skills', icon: Brain },
-  { id: 'memories', label: '记忆', icon: Database },
-  { id: 'tools', label: 'Tools', icon: Settings },
-  { id: 'approvals', label: '审批', icon: ShieldCheck },
-  { id: 'runs', label: '运行记录', icon: Workflow },
-  { id: 'config', label: '配置', icon: Settings },
+const pages: Page[] = [
+  'chat',
+  'tasks',
+  'skills',
+  'memories',
+  'evolution',
+  'tools',
+  'mcp',
+  'approvals',
+  'runs',
+  'config',
 ]
 
 const date = (value: number | null | undefined) => (value ? new Date(value).toLocaleString() : '—')
+const elapsed = (startedAt: number, completedAt: number | undefined, now: number) => {
+  const value = Math.max(0, (completedAt || now) - startedAt)
+  if (value < 1000) return `${value}ms`
+  const seconds = Math.floor(value / 1000)
+  if (seconds < 60) return `${seconds} 秒`
+  return `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`
+}
+
+const remaining = (expiresAt: number, now: number) => {
+  const seconds = Math.max(0, Math.ceil((expiresAt - now) / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
 const recordLines = (value: Record<string, string> | undefined) =>
-  Object.entries(value || {}).map(([key, item]) => `${key}=${item}`).join('\n')
+  Object.entries(value || {})
+    .map(([key, item]) => `${key}=${item}`)
+    .join('\n')
 const linesRecord = (value: string) =>
   Object.fromEntries(
     value
@@ -66,10 +117,191 @@ const linesRecord = (value: string) =>
 const mcpHeaderExample = ['Authorization=Bearer $', '{MCP_TOKEN}'].join('')
 const mcpEnvExample = ['API_KEY=$', '{MCP_API_KEY}'].join('')
 const environmentReference = ['$', '{ENV_NAME}'].join('')
+const memoryScopeLabels: Record<string, string> = {
+  all: '全部',
+  user: '用户',
+  group: '群组',
+  global: '全局',
+}
+
+const MessageAttachment = ({
+  attachment,
+}: {
+  attachment: NonNullable<AgentMessage['attachments']>[number]
+}) => {
+  const [source, setSource] = useState('')
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let objectUrl = ''
+    request.get<Blob>(attachment.url, {
+      responseType: 'blob',
+      signal: controller.signal,
+    }).then(response => {
+      objectUrl = URL.createObjectURL(response.data)
+      setSource(objectUrl)
+    }).catch(() => {
+      if (!controller.signal.aborted) setFailed(true)
+    })
+    return () => {
+      controller.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [attachment.url])
+
+  if (failed) {
+    return (
+      <span className='block text-xs opacity-70'>
+        图片“{attachment.name}”加载失败
+      </span>
+    )
+  }
+  if (!source) {
+    return <span className='block text-xs opacity-70'>正在加载图片…</span>
+  }
+  return (
+    <img
+      src={source}
+      alt={attachment.name || '会话图片'}
+      className='max-h-80 max-w-full rounded-xl object-contain'
+    />
+  )
+}
+const skillInstructions = (content: string) =>
+  content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim()
+const skillTools = (value: string) => {
+  try {
+    const tools = JSON.parse(value)
+    return Array.isArray(tools) ? tools.map(String) : []
+  } catch {
+    return []
+  }
+}
+interface ScriptToolDraft {
+  id: string
+  name: string
+  description: string
+  source: string
+  inputSchema: string
+  outputSchema: string
+  objective: string
+  inputs: string
+  outputs: string
+  idempotent: boolean
+  completionCondition: string
+  timeoutMs: number
+  maxOutputBytes: number
+  strategy: 'fail' | 'retry'
+  maxAttempts: number
+  retryDelayMs: number
+  userMessage: string
+}
+
+const emptyScriptTool = (): ScriptToolDraft => ({
+  id: '',
+  name: '',
+  description: '',
+  source: 'def run(payload):\n    return payload\n',
+  inputSchema: '{\n  "type": "object",\n  "additionalProperties": false\n}',
+  outputSchema: '',
+  objective: '',
+  inputs: '',
+  outputs: '',
+  idempotent: true,
+  completionCondition: 'run(payload) 返回可序列化结果后结束',
+  timeoutMs: 30000,
+  maxOutputBytes: 65536,
+  strategy: 'fail',
+  maxAttempts: 1,
+  retryDelayMs: 0,
+  userMessage: '脚本执行失败',
+})
+
+const scriptToolDrafts = (value: string): ScriptToolDraft[] => {
+  try {
+    const items = JSON.parse(value) as AgentScriptToolDefinition[]
+    if (!Array.isArray(items)) return []
+    return items.map(item => ({
+      id: item.id,
+      name: item.name,
+      description: item.description,
+      source: item.source,
+      inputSchema: JSON.stringify(item.inputSchema, null, 2),
+      outputSchema: item.outputSchema ? JSON.stringify(item.outputSchema, null, 2) : '',
+      objective: item.semantics.objective,
+      inputs: item.semantics.inputs,
+      outputs: item.semantics.outputs,
+      idempotent: item.semantics.idempotent,
+      completionCondition: item.stop.completionCondition,
+      timeoutMs: item.stop.timeoutMs,
+      maxOutputBytes: item.stop.maxOutputBytes,
+      strategy: item.failure.strategy,
+      maxAttempts: item.failure.maxAttempts,
+      retryDelayMs: item.failure.retryDelayMs,
+      userMessage: item.failure.userMessage,
+    }))
+  } catch {
+    return []
+  }
+}
+
+const compileScriptTools = (items: ScriptToolDraft[]): AgentScriptToolDefinition[] =>
+  items.map(item => ({
+    id: item.id.trim(),
+    name: item.name.trim(),
+    description: item.description.trim(),
+    runtime: 'python',
+    source: item.source,
+    sourceHash: '',
+    inputSchema: JSON.parse(item.inputSchema) as Record<string, unknown>,
+    outputSchema: item.outputSchema.trim()
+      ? JSON.parse(item.outputSchema) as Record<string, unknown>
+      : undefined,
+    semantics: {
+      objective: item.objective.trim(),
+      inputs: item.inputs.trim(),
+      outputs: item.outputs.trim(),
+      sideEffects: [],
+      idempotent: item.idempotent,
+    },
+    stop: {
+      completionCondition: item.completionCondition.trim(),
+      timeoutMs: item.timeoutMs,
+      maxOutputBytes: item.maxOutputBytes,
+    },
+    failure: {
+      strategy: item.strategy,
+      maxAttempts: item.strategy === 'retry' ? item.maxAttempts : 1,
+      retryDelayMs: item.retryDelayMs,
+      userMessage: item.userMessage.trim(),
+    },
+  }))
+
+const scriptToolsComplete = (items: ScriptToolDraft[]) => items.every(item =>
+  item.id.trim() &&
+  item.name.trim() &&
+  item.description.trim() &&
+  item.source.trim() &&
+  item.inputSchema.trim() &&
+  item.objective.trim() &&
+  item.inputs.trim() &&
+  item.outputs.trim() &&
+  item.completionCondition.trim() &&
+  item.userMessage.trim()
+)
+
+const emptySkillDraft = () => ({
+  name: '',
+  description: '',
+  instructions: '',
+  tools: '',
+  scriptTools: [] as ScriptToolDraft[],
+})
 
 const Panel = ({ children, className = '' }: { children: React.ReactNode; className?: string }) => (
   <section
-    className={`rounded-2xl border border-default-200 bg-content1/80 shadow-sm ${className}`}
+    className={`rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(9,20,25,0.04)] ${className}`}
   >
     {children}
   </section>
@@ -93,31 +325,81 @@ const Action = ({
     className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
       danger
         ? 'bg-danger-50 text-danger hover:bg-danger-100'
-        : 'bg-primary-50 text-primary hover:bg-primary-100'
+        : 'bg-primary-50 text-primary-700 hover:bg-primary-100 dark:bg-primary-500/10 dark:text-primary-300'
     }`}
   >
     {children}
   </button>
 )
 
-const ToolCallCard = ({ call }: { call: AgentToolCallView }) => (
-  <details className='w-full rounded-2xl border border-warning-200 bg-warning-50/70 p-3 text-left'>
+const ToolCallCard = ({
+  call,
+  approval,
+  now,
+  onResolve,
+}: {
+  call: AgentToolCallView
+  approval?: AgentApproval
+  now: number
+  onResolve: (
+    approval: AgentApproval,
+    decision: 'approved' | 'denied',
+    scope?: 'once' | 'thread' | 'delegate',
+  ) => void | Promise<void>
+}) => (
+  <details
+    open={approval?.status === 'pending' ? true : undefined}
+    className='w-full rounded-2xl border border-warning-200 bg-warning-50/70 p-3 text-left'
+  >
     <summary className='cursor-pointer list-none'>
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <div className='flex flex-wrap items-center gap-2'>
+          {call.status === 'running' || call.status === 'pending'
+            ? (
+              <LoaderCircle className='animate-spin text-warning' size={15} />
+            )
+            : (
+              <Settings className='text-warning' size={15} />
+            )}
           <span className='font-mono text-xs font-semibold'>{call.name}</span>
-          <span className='rounded-full bg-warning-100 px-2 py-0.5 text-[11px]'>
-            {call.status}
-          </span>
+          <span className='rounded-full bg-warning-100 px-2 py-0.5 text-[11px]'>{call.status}</span>
           <span className='rounded-full bg-default-100 px-2 py-0.5 text-[11px]'>
             {call.risk} · {call.decision}
           </span>
         </div>
         <span className='text-[11px] text-default-400'>
-          {call.source} · {call.durationMs === undefined ? '—' : `${call.durationMs}ms`}
+          {call.source} ·{' '}
+          {call.completedAt
+            ? elapsed(call.createdAt, call.completedAt, now)
+            : elapsed(call.createdAt, undefined, now)}
         </span>
       </div>
+      {call.description && <p className='mt-1 text-xs text-default-500'>{call.description}</p>}
     </summary>
+    {approval?.status === 'pending' && (
+      <div className='mt-3 rounded-xl border border-warning-300 bg-content1 p-3'>
+        <div className='flex flex-wrap items-center justify-between gap-2'>
+          <div>
+            <div className='text-sm font-semibold'>等待你的确认</div>
+            <div className='text-xs text-default-500'>
+              此操作将在 {remaining(approval.expiresAt, now)} 后过期
+            </div>
+          </div>
+          <div className='flex gap-2'>
+            <Action onClick={() => onResolve(approval, 'approved')}>
+              <Check size={15} />
+              本次同意
+            </Action>
+            <Action onClick={() => onResolve(approval, 'approved', 'thread')}>始终同意</Action>
+            <Action onClick={() => onResolve(approval, 'approved', 'delegate')}>替我审批</Action>
+            <Action danger onClick={() => onResolve(approval, 'denied')}>
+              <X size={15} />
+              拒绝
+            </Action>
+          </div>
+        </div>
+      </div>
+    )}
     <div className='mt-3 grid gap-3 lg:grid-cols-2'>
       <div>
         <div className='mb-1 flex items-center justify-between text-xs font-semibold'>
@@ -153,21 +435,64 @@ const ToolCallCard = ({ call }: { call: AgentToolCallView }) => (
   </details>
 )
 
+const ActivityCard = ({ activity, now }: { activity: AgentActivityView; now: number }) => {
+  const active = activity.status === 'running' || activity.status === 'waiting_approval'
+  const label =
+    activity.kind === 'turn'
+      ? activity.label
+      : activity.kind === 'subagent'
+        ? `子 Agent · ${activity.label}`
+        : activity.label
+  return (
+    <div className='signal-rail flex items-center gap-2 rounded-xl py-1.5 text-xs text-default-500'>
+      {active
+        ? (
+          <LoaderCircle className='shrink-0 animate-spin text-primary' size={15} />
+        )
+        : (
+          <Clock3 className='shrink-0' size={15} />
+        )}
+      <span className='min-w-0 truncate'>{label}</span>
+      <span className='shrink-0 text-default-400'>
+        {elapsed(activity.startedAt, activity.completedAt, now)}
+      </span>
+      {activity.error && <span className='truncate text-danger'>{activity.error}</span>}
+    </div>
+  )
+}
+
 export default function AgentDashboard () {
   const location = useLocation()
-  const navigate = useNavigate()
   const routePage = location.pathname.split('/').filter(Boolean)[1] as Page | undefined
-  const tab: Page = tabs.some(item => item.id === routePage) ? routePage! : 'chat'
+  const tab: Page = pages.includes(routePage as Page) ? routePage! : 'chat'
   const [status, setStatus] = useState<AgentStatus | null>(null)
   const [threads, setThreads] = useState<AgentThread[]>([])
+  const [threadChannels, setThreadChannels] = useState<AgentThreadChannel[]>([])
   const [threadState, setThreadState] = useState<'active' | 'archived'>('active')
+  const [selectedChannel, setSelectedChannel] = useState(
+    () => readThreadSelections().active?.channel || 'web'
+  )
   const [current, setCurrent] = useState<AgentThread | null>(null)
+  const [threadTree, setThreadTree] = useState<AgentThread[]>([])
   const [messages, setMessages] = useState<AgentMessage[]>([])
   const [toolCalls, setToolCalls] = useState<AgentToolCallView[]>([])
+  const [activities, setActivities] = useState<AgentActivityView[]>([])
+  const [notices, setNotices] = useState<
+    Array<{
+      id: string
+      content: string
+      createdAt: number
+    }>
+  >([])
   const [streaming, setStreaming] = useState('')
+  const [streamStartedAt, setStreamStartedAt] = useState(0)
   const [prompt, setPrompt] = useState('')
   const [sending, setSending] = useState(false)
   const [chatError, setChatError] = useState('')
+  const [recoveryStatus, setRecoveryStatus] = useState('')
+  const [threadDrawerOpen, setThreadDrawerOpen] = useState(false)
+  const [hasNewActivity, setHasNewActivity] = useState(false)
+  const [now, setNow] = useState(Date.now())
   const [approvals, setApprovals] = useState<AgentApproval[]>([])
   const [memories, setMemories] = useState<AgentMemory[]>([])
   const [skills, setSkills] = useState<AgentSkill[]>([])
@@ -177,7 +502,19 @@ export default function AgentDashboard () {
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([])
   const [audit, setAudit] = useState<Array<Record<string, unknown>>>([])
   const [usage, setUsage] = useState<Array<Record<string, unknown>>>([])
+  const [evolutionOverview, setEvolutionOverview] = useState<{
+    candidates: Record<string, number>
+    outcomes: Record<string, number>
+    feedback: { total: number; corrected: number }
+    retrieval: { total: number; selected: number }
+  } | null>(null)
+  const [evolutionCandidates, setEvolutionCandidates] = useState<AgentEvolutionCandidate[]>([])
+  const [selectedEvolutionId, setSelectedEvolutionId] = useState('')
+  const [repairArtifact, setRepairArtifact] = useState('')
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null)
+  const [agentConfigJson, setAgentConfigJson] = useState('')
+  const [agentConfigJsonDirty, setAgentConfigJsonDirty] = useState(false)
+  const [agentConfigJsonError, setAgentConfigJsonError] = useState('')
   const [providerPresets, setProviderPresets] = useState<
     Array<{ kind: AgentProviderKind; name: string; baseUrl: string }>
   >([])
@@ -201,22 +538,43 @@ export default function AgentDashboard () {
     scopeKey: 'web-admin',
     content: '',
   })
-  const [skillDraft, setSkillDraft] = useState({
-    name: '',
-    description: '',
-    instructions: '',
-    tools: '',
-  })
+  const [skillDraft, setSkillDraft] = useState(emptySkillDraft)
+  const [selectedJobId, setSelectedJobId] = useState('')
+  const [editingJobId, setEditingJobId] = useState('')
+  const [taskEditorOpen, setTaskEditorOpen] = useState(false)
+  const [taskQuery, setTaskQuery] = useState('')
+  const [selectedMemoryId, setSelectedMemoryId] = useState('')
+  const [memoryEditorOpen, setMemoryEditorOpen] = useState(false)
+  const [memoryQuery, setMemoryQuery] = useState('')
+  const [memoryScope, setMemoryScope] = useState('all')
+  const [selectedSkillId, setSelectedSkillId] = useState('')
+  const [skillEditorOpen, setSkillEditorOpen] = useState(false)
+  const [skillQuery, setSkillQuery] = useState('')
+  const [skillVersions, setSkillVersions] = useState<AgentSkillVersion[]>([])
+  const [skillUsage, setSkillUsage] = useState<Record<string, unknown> | null>(null)
+  const [editingSkillId, setEditingSkillId] = useState('')
+  const [selectedMcpName, setSelectedMcpName] = useState('')
+  const [mcpQuery, setMcpQuery] = useState('')
   const threadKey = useMemo(() => `web:${crypto.randomUUID()}`, [])
   const lastEventId = useRef<Record<string, number>>({})
-  const toolCallById = useMemo(
-    () => new Map(toolCalls.map(call => [call.id, call])),
-    [toolCalls]
+  const messageViewportRef = useRef<HTMLDivElement>(null)
+  const followOutputRef = useRef(true)
+  const loadingOlderRef = useRef(false)
+  const toolCallById = useMemo(() => new Map(toolCalls.map(call => [call.id, call])), [toolCalls])
+  const approvalByToolCall = useMemo(
+    () =>
+      new Map(
+        approvals
+          .filter(item => item.threadId === current?.id)
+          .map(item => [item.toolCallId, item])
+      ),
+    [approvals, current?.id]
   )
 
   const refresh = useCallback(async () => {
     const [
       nextStatus,
+      nextThreadChannels,
       nextThreads,
       nextApprovals,
       nextMemories,
@@ -227,10 +585,17 @@ export default function AgentDashboard () {
       nextTools,
       nextAudit,
       nextUsage,
+      nextEvolutionOverview,
+      nextEvolutionCandidates,
       nextConfig,
     ] = await Promise.all([
       agentRequest.status(),
-      agentRequest.threads({ state: threadState }),
+      agentRequest.threadChannels(),
+      agentRequest.threads({
+        state: threadState,
+        channel: selectedChannel,
+        rootOnly: true,
+      }),
       agentRequest.approvals(),
       agentRequest.memories(),
       agentRequest.skills(),
@@ -240,9 +605,12 @@ export default function AgentDashboard () {
       agentRequest.tools(),
       agentRequest.audit(),
       agentRequest.usage(),
+      agentRequest.evolutionOverview(),
+      agentRequest.evolutionCandidates(),
       agentRequest.config(),
     ])
     setStatus(nextStatus)
+    setThreadChannels(nextThreadChannels)
     setThreads(nextThreads)
     setApprovals(nextApprovals)
     setMemories(nextMemories)
@@ -253,81 +621,538 @@ export default function AgentDashboard () {
     setTools(nextTools)
     setAudit(nextAudit)
     setUsage(nextUsage)
+    setEvolutionOverview(nextEvolutionOverview)
+    setEvolutionCandidates(nextEvolutionCandidates)
     setAgentConfig(nextConfig.config)
+    setProviderModels(
+      Object.fromEntries(
+        nextConfig.config.providers.map(provider => [
+          provider.id,
+          provider.discoveredModels || [],
+        ])
+      )
+    )
     setProviderPresets(await agentRequest.providerPresets())
-  }, [threadState])
+  }, [selectedChannel, threadState])
 
   useEffect(() => {
     refresh().catch(error => toast.error(error.message))
   }, [refresh])
 
   useEffect(() => {
-    if (!current) {
-      setMessages([])
-      setToolCalls([])
+    if (!agentConfig || agentConfigJsonDirty) return
+    setAgentConfigJson(JSON.stringify(agentConfig, null, 2))
+  }, [agentConfig, agentConfigJsonDirty])
+
+  useEffect(() => {
+    if (!threadChannels.length) return
+    if (threadChannels.some(item => item.channel === selectedChannel)) return
+    const saved = readThreadSelections()[threadState]?.channel
+    const fallback = threadChannels.find(item => item.channel === saved)?.channel ||
+      threadChannels.find(item =>
+        threadState === 'active' ? item.activeCount > 0 : item.archivedCount > 0
+      )?.channel ||
+      'web'
+    setSelectedChannel(fallback)
+  }, [selectedChannel, threadChannels, threadState])
+
+  useEffect(() => {
+    let cancelled = false
+    const restore = async () => {
+      if (!threads.length) {
+        setCurrent(null)
+        setThreadTree([])
+        return
+      }
+      const saved = readThreadSelections()[threadState]
+      const root = restoredThreadRoot(threads, saved)
+      if (!root) return
+      const tree = await agentRequest.threadTree(root.id)
+      if (cancelled) return
+      const nextTree = [tree.root, ...tree.children]
+      setThreadTree(nextTree)
+      setCurrent(nextTree.find(item => item.id === saved?.threadId) || tree.root)
+    }
+    restore().catch(error => {
+      if (!cancelled) setChatError((error as Error).message)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [selectedChannel, threadState, threads])
+
+  useEffect(() => {
+    if (!current) return
+    const rootId = current.parentThreadId ? threadTree[0]?.id : current.id
+    writeThreadSelection(threadState, {
+      channel: selectedChannel,
+      threadId: current.id,
+      rootId: rootId || current.id,
+    })
+  }, [current, selectedChannel, threadState, threadTree])
+
+  useEffect(() => {
+    if (!jobs.some(item => item.id === selectedJobId)) setSelectedJobId(jobs[0]?.id || '')
+  }, [jobs, selectedJobId])
+
+  useEffect(() => {
+    if (!memories.some(item => item.id === selectedMemoryId)) {
+      setSelectedMemoryId(memories[0]?.id || '')
+    }
+  }, [memories, selectedMemoryId])
+
+  useEffect(() => {
+    if (!skills.some(item => item.id === selectedSkillId)) {
+      setSelectedSkillId(skills[0]?.id || '')
+    }
+  }, [skills, selectedSkillId])
+
+  useEffect(() => {
+    if (!selectedSkillId) {
+      setSkillVersions([])
+      setSkillUsage(null)
       return
     }
     Promise.all([
+      agentRequest.skillVersions(selectedSkillId),
+      agentRequest.skillUsage(selectedSkillId),
+    ])
+      .then(([versions, usageRecord]) => {
+        setSkillVersions(versions)
+        setSkillUsage(usageRecord)
+      })
+      .catch(error => toast.error((error as Error).message))
+  }, [selectedSkillId])
+
+  useEffect(() => {
+    const servers = agentConfig?.mcp.servers || []
+    if (!servers.some(item => item.name === selectedMcpName)) {
+      setSelectedMcpName(servers[0]?.name || '')
+    }
+  }, [agentConfig?.mcp.servers, selectedMcpName])
+
+  useEffect(() => {
+    if (!current) {
+      setMessages([])
+      setToolCalls([])
+      setActivities([])
+      return
+    }
+    followOutputRef.current = true
+    setHasNewActivity(false)
+    Promise.all([
       agentRequest.messages(current.id),
       agentRequest.toolCalls(current.id),
+      agentRequest.activity(current.id),
+      agentRequest.approvals(),
     ])
-      .then(([nextMessages, nextToolCalls]) => {
+      .then(([nextMessages, nextToolCalls, nextActivities, nextApprovals]) => {
         setMessages(nextMessages)
         setToolCalls(nextToolCalls)
+        setActivities(nextActivities)
+        setApprovals(nextApprovals)
       })
       .catch(error => setChatError(error.message))
     const source = agentRequest.events(current.id, lastEventId.current[current.id] || 0)
-    const listen = (type: string, callback: (data: any) => void) => {
+    const listen = (
+      type: string,
+      callback: (payload: {
+        id: number
+        turnId?: string
+        data: Record<string, unknown>
+        createdAt: number
+      }) => void
+    ) => {
       ;(source as any).addEventListener(type, (event: { data: string; lastEventId?: string }) => {
         const payload = JSON.parse(event.data)
         const eventId = Number(event.lastEventId || payload.id || 0)
         if (eventId) lastEventId.current[current.id] = eventId
-        callback(payload.data)
+        callback(payload)
       })
+    }
+    const refreshActivity = () => {
+      agentRequest.activity(current.id).then(setActivities)
+      agentRequest.toolCalls(current.id).then(setToolCalls)
+      agentRequest.approvals().then(setApprovals)
     }
     const refreshConversation = () => {
       agentRequest.messages(current.id).then(setMessages)
-      agentRequest.toolCalls(current.id).then(setToolCalls)
-      agentRequest.threads({ state: threadState }).then(setThreads)
+      refreshActivity()
+      agentRequest.threads({
+        state: threadState,
+        channel: selectedChannel,
+        rootOnly: true,
+      }).then(setThreads)
+    }
+    let streamingBuffer = ''
+    let streamingFrame = 0
+    const clearStreamingBuffer = () => {
+      streamingBuffer = ''
+      if (streamingFrame) window.cancelAnimationFrame(streamingFrame)
+      streamingFrame = 0
+    }
+    const appendStreaming = (delta: string) => {
+      streamingBuffer += delta
+      if (streamingFrame) return
+      streamingFrame = window.requestAnimationFrame(() => {
+        const buffered = streamingBuffer
+        streamingBuffer = ''
+        streamingFrame = 0
+        if (buffered) setStreaming(value => value + buffered)
+      })
     }
     listen('turn.started', () => {
+      clearStreamingBuffer()
       setChatError('')
+      setRecoveryStatus('')
       setSending(true)
       setStreaming('')
+      setStreamStartedAt(0)
+      refreshActivity()
     })
-    listen('text.delta', data => setStreaming(value => value + String(data.delta || '')))
+    listen('text.delta', payload => {
+      setStreamStartedAt(value => value || payload.createdAt || Date.now())
+      appendStreaming(String(payload.data.delta || ''))
+    })
     listen('turn.completed', () => {
+      clearStreamingBuffer()
       setSending(false)
+      setRecoveryStatus('')
       setStreaming('')
+      setStreamStartedAt(0)
       refreshConversation()
     })
-    listen('turn.failed', data => {
+    listen('turn.failed', payload => {
+      clearStreamingBuffer()
       setSending(false)
+      setRecoveryStatus('')
       setStreaming('')
-      setChatError(String(data.error || data.content || 'Agent 回合失败'))
+      setStreamStartedAt(0)
+      setChatError(String(payload.data.error || payload.data.content || 'Agent 回合失败'))
       refreshConversation()
     })
     listen('approval.requested', () => {
       setSending(false)
-      agentRequest.approvals().then(setApprovals)
-      agentRequest.toolCalls(current.id).then(setToolCalls)
+      refreshActivity()
     })
-    listen('tool.started', () => agentRequest.toolCalls(current.id).then(setToolCalls))
-    listen('tool.completed', () => agentRequest.toolCalls(current.id).then(setToolCalls))
-    return () => source.close()
-  }, [current, threadState])
+    listen('approval.resolved', () => {
+      setSending(true)
+      refreshActivity()
+    })
+    listen('tool.started', refreshActivity)
+    listen('tool.completed', refreshActivity)
+    listen('subagent.started', refreshActivity)
+    listen('subagent.completed', refreshActivity)
+    listen('plan.created', payload => {
+      const plan = payload.data.plan as Record<string, unknown> | undefined
+      const goals = Array.isArray(plan?.goals) ? plan.goals.length : 0
+      setRecoveryStatus(goals ? `已生成可验证计划 · ${goals} 个目标` : '已生成可验证计划')
+    })
+    listen('verification.completed', payload => {
+      const missing = Array.isArray(payload.data.missing) ? payload.data.missing : []
+      setRecoveryStatus(
+        missing.length
+          ? `正在核验 · 仍缺少 ${missing.length} 项完成依据`
+          : '完成条件已通过验证'
+      )
+    })
+    listen('recovery.started', payload => {
+      setRecoveryStatus(`正在诊断并恢复 · 第 ${Number(payload.data.cycle || 1)} 轮`)
+      refreshActivity()
+    })
+    listen('recovery.completed', payload => {
+      setRecoveryStatus(
+        payload.data.completed ? '恢复完成，正在生成最终结果' : '恢复周期完成，正在重新规划'
+      )
+      refreshActivity()
+    })
+    listen('repair.candidate', () => {
+      setRecoveryStatus('已生成待管理员审查的修复候选')
+      agentRequest.evolutionCandidates().then(setEvolutionCandidates)
+    })
+    listen('delivery.completed', () => {
+      if (current.channel !== 'web') toast.success(`回复已发送到 ${channelName(current.channel)}`)
+    })
+    listen('delivery.failed', payload => {
+      setChatError(
+        `回复已保存在会话中，但发送到 ${channelName(current.channel)} 失败：${
+          String(payload.data.error || '适配器未返回成功结果')
+        }`
+      )
+    })
+    return () => {
+      clearStreamingBuffer()
+      source.close()
+    }
+  }, [current, selectedChannel, threadState])
+
+  useEffect(() => {
+    const hasRunning =
+      sending ||
+      activities.some(item => item.status === 'running' || item.status === 'waiting_approval')
+    if (!hasRunning) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [activities, sending])
+
+  useEffect(() => {
+    const viewport = messageViewportRef.current
+    if (!viewport) return
+    if (followOutputRef.current) {
+      requestAnimationFrame(() => {
+        viewport.scrollTop = viewport.scrollHeight
+        setHasNewActivity(false)
+      })
+    } else {
+      setHasNewActivity(true)
+    }
+  }, [messages, activities, streaming, notices])
+
+  const openThreadRoot = async (root: AgentThread, preferredId = root.id) => {
+    const tree = await agentRequest.threadTree(root.id)
+    const nextTree = [tree.root, ...tree.children]
+    setThreadTree(nextTree)
+    setCurrent(nextTree.find(item => item.id === preferredId) || tree.root)
+    setThreadDrawerOpen(false)
+  }
+
+  const selectThread = async (threadId: string) => {
+    const root = threads.find(item => item.id === threadId)
+    if (root) {
+      await openThreadRoot(root)
+      return
+    }
+    const child = threadTree.find(item => item.id === threadId)
+    if (child) setCurrent(child)
+  }
+
+  const selectChannel = (channel: string) => {
+    setSelectedChannel(channel)
+    setThreads([])
+    setCurrent(null)
+    setThreadTree([])
+    writeThreadSelection(threadState, { channel })
+  }
 
   const ensureThread = async () => {
+    if (current?.parentThreadId && threadTree[0]) return threadTree[0]
     if (current) return current
     const created = await agentRequest.createThread(threadKey)
+    setSelectedChannel('web')
     setCurrent(created)
-    setThreads(value => [created, ...value.filter(item => item.id !== created.id)])
+    setThreadTree([created])
+    setThreads([created])
     return created
+  }
+
+  const addNotice = (content: string) => {
+    setNotices(value => [...value, { id: crypto.randomUUID(), content, createdAt: Date.now() }])
+  }
+
+  const resolveApproval = async (
+    approval: AgentApproval,
+    decision: 'approved' | 'denied',
+    scope: 'once' | 'thread' | 'delegate' = 'once'
+  ) => {
+    try {
+      setSending(decision === 'approved')
+      await agentRequest.resolveApproval(approval.id, decision, scope)
+      const nextApprovals = await agentRequest.approvals()
+      setApprovals(nextApprovals)
+      if (current) {
+        const [nextMessages, nextToolCalls, nextActivities] = await Promise.all([
+          agentRequest.messages(current.id),
+          agentRequest.toolCalls(current.id),
+          agentRequest.activity(current.id),
+        ])
+        setMessages(nextMessages)
+        setToolCalls(nextToolCalls)
+        setActivities(nextActivities)
+      }
+    } catch (error) {
+      setSending(false)
+      toast.error((error as Error).message)
+    }
+  }
+
+  const stopCurrent = async () => {
+    const target = current?.parentThreadId ? threadTree[0] : current
+    if (!target) {
+      addNotice('当前没有可停止的会话。')
+      return
+    }
+    try {
+      const result = await agentRequest.stop(target.id)
+      setSending(false)
+      setStreaming('')
+      setStreamStartedAt(0)
+      addNotice(
+        result.interrupted
+          ? `已停止：${result.turns} 个回合、${result.subagents} 个子 Agent、${result.approvals} 个审批。`
+          : '当前会话没有正在运行的操作。'
+      )
+      setActivities(await agentRequest.activity(current?.id || target.id))
+    } catch (error) {
+      setChatError((error as Error).message)
+    }
+  }
+
+  const newConversation = async () => {
+    const target = current?.parentThreadId ? threadTree[0] : current
+    if (target) await agentRequest.stop(target.id)
+    const created = await agentRequest.createThread(`web:web-admin:${crypto.randomUUID()}`)
+    setThreadState('active')
+    setSelectedChannel('web')
+    setCurrent(created)
+    setThreadTree([created])
+    setThreads(value =>
+      selectedChannel === 'web'
+        ? [created, ...value.filter(item => item.id !== created.id)]
+        : [created]
+    )
+    setMessages([])
+    setToolCalls([])
+    setActivities([])
+    setStreaming('')
+    setSending(false)
+    setChatError('')
+    setThreadDrawerOpen(false)
+    setNotices([
+      {
+        id: crypto.randomUUID(),
+        content: '已创建新会话。你可以直接描述想完成的事情。',
+        createdAt: Date.now(),
+      },
+    ])
+  }
+
+  const handleSessionCommand = async (content: string) => {
+    if (
+      !/^(?:\/model(?:\s+.+)?|\/(?:new|stop|help|同意|始终同意|拒绝)|\/(?:approve|deny)\s+[0-9a-f-]{36}|同意|允许|拒绝)$/i.test(
+        content
+      )
+    ) {
+      return false
+    }
+    if (/^\/new$/i.test(content)) {
+      await newConversation()
+      return true
+    }
+    if (/^\/stop$/i.test(content)) {
+      await stopCurrent()
+      return true
+    }
+    if (/^\/help$/i.test(content)) {
+      addNotice(
+        [
+          'Karin Agent 会话命令',
+          '/new 新建会话',
+          '/stop 停止当前会话及子 Agent',
+          '/model 查看或切换当前会话模型',
+          '/model reset 恢复全局主模型',
+          '/同意 本次同意',
+          '/始终同意 本会话内始终同意该 Tool',
+          '/拒绝 拒绝本次调用',
+          '/help 查看帮助',
+        ].join('\n')
+      )
+      return true
+    }
+    if (/^\/model(?:\s|$)/i.test(content)) {
+      const thread = await ensureThread()
+      const argument = content.replace(/^\/model\b/i, '').trim()
+      const description = await agentRequest.threadModel(thread.id)
+      if (!argument) {
+        addNotice(
+          [
+            `当前模型：${description.providerName} · ${description.model || '未配置'}`,
+            description.inherited ? '来源：全局主模型' : '来源：当前会话',
+            '',
+            '可用模型：',
+            ...description.models.map(
+              (item, index) =>
+                `${index + 1}. ${item.providerName} · ${item.model} (${item.providerId})`
+            ),
+            '',
+            '使用 /model <序号> 或 /model <providerId> <model> 切换',
+            '使用 /model reset 恢复全局主模型',
+          ].join('\n')
+        )
+        return true
+      }
+      if (/^reset$/i.test(argument)) {
+        const updated = await agentRequest.setThreadModel(thread.id, null, null)
+        setCurrent(updated)
+        setThreads(value => value.map(item => (item.id === updated.id ? updated : item)))
+        addNotice('当前会话已恢复使用全局主模型。')
+        return true
+      }
+      const number = Number(argument)
+      const selected = Number.isInteger(number) && number > 0
+        ? description.models[number - 1]
+        : (() => {
+          const match = argument.match(/^(\S+)\s+(.+)$/)
+          if (!match) return undefined
+          return description.models.find(
+            item => item.providerId === match[1] && item.model === match[2].trim()
+          )
+        })()
+      if (!selected) {
+        addNotice('模型选择无效，请先使用 /model 查看可用模型。')
+        return true
+      }
+      const updated = await agentRequest.setThreadModel(
+        thread.id,
+        selected.providerId,
+        selected.model
+      )
+      setCurrent(updated)
+      setThreads(value => value.map(item => (item.id === updated.id ? updated : item)))
+      addNotice(`当前会话将在下一回合使用 ${selected.providerName} · ${selected.model}。`)
+      return true
+    }
+
+    let candidates = approvals.filter(
+      item => item.threadId === current?.id && item.status === 'pending'
+    )
+    const explicit = content.match(/^\/(approve|deny)\s+([0-9a-f-]{36})$/i)
+    if (explicit) candidates = candidates.filter(item => item.id === explicit[2])
+    if (!candidates.length) {
+      addNotice('当前会话没有匹配的待审批操作。')
+      return true
+    }
+    if (candidates.length > 1) {
+      addNotice(
+        [
+          '当前会话有多个待审批操作，请指定审批 ID：',
+          ...candidates.map(item => `${item.toolName} · ${item.id}`),
+        ].join('\n')
+      )
+      return true
+    }
+    const decision =
+      explicit?.[1].toLowerCase() === 'deny' || /^\/?拒绝$/i.test(content) ? 'denied' : 'approved'
+    await resolveApproval(
+      candidates[0],
+      decision,
+      decision === 'approved' && /^\/始终同意$/i.test(content) ? 'thread' : 'once'
+    )
+    return true
   }
 
   const send = async (override?: string) => {
     const content = (override ?? prompt).trim()
-    if (!content || sending) return
+    if (!content) return
+    if (current?.parentThreadId) {
+      addNotice('子 Agent 会话只读，请返回父会话继续对话。')
+      return
+    }
+    if (await handleSessionCommand(content)) {
+      setPrompt('')
+      return
+    }
+    if (sending) return
     setSending(true)
     setChatError('')
     setPrompt('')
@@ -350,39 +1175,66 @@ export default function AgentDashboard () {
     }
   }
 
-  const resolveApproval = async (approval: AgentApproval, decision: 'approved' | 'denied') => {
+  const handleMessageScroll = async () => {
+    const viewport = messageViewportRef.current
+    if (!viewport) return
+    const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight
+    followOutputRef.current = distanceFromBottom < 96
+    if (followOutputRef.current) setHasNewActivity(false)
+    if (viewport.scrollTop > 48 || loadingOlderRef.current || !current || !messages.length) return
+    loadingOlderRef.current = true
+    const previousHeight = viewport.scrollHeight
     try {
-      await agentRequest.resolveApproval(approval.id, decision)
-      setApprovals(await agentRequest.approvals())
-      if (current) setMessages(await agentRequest.messages(current.id))
-    } catch (error) {
-      toast.error((error as Error).message)
+      const older = await agentRequest.messages(current.id, messages[0].createdAt)
+      if (older.length) {
+        const existing = new Set(messages.map(item => item.id))
+        setMessages(value => [...older.filter(item => !existing.has(item.id)), ...value])
+        requestAnimationFrame(() => {
+          viewport.scrollTop += viewport.scrollHeight - previousHeight
+        })
+      }
+    } finally {
+      loadingOlderRef.current = false
     }
   }
 
   const saveConfig = async () => {
     if (!agentConfig) return
     try {
-      await agentRequest.saveConfig(agentConfig)
+      let next = agentConfig
+      if (agentConfigJsonDirty) {
+        const parsed = JSON.parse(agentConfigJson) as unknown
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('agent.json 顶层必须是 JSON 对象')
+        }
+        next = parsed as AgentConfig
+        setAgentConfig(next)
+      }
+      await agentRequest.saveConfig(next)
+      setAgentConfigJsonDirty(false)
+      setAgentConfigJsonError('')
       toast.success('Agent 配置已保存并重新加载')
       await refresh()
     } catch (error) {
-      toast.error((error as Error).message)
+      const message = error instanceof SyntaxError
+        ? `JSON 语法错误：${error.message}`
+        : (error as Error).message
+      setAgentConfigJsonError(message)
+      toast.error(message)
     }
   }
 
-  const updateProvider = (
-    id: string,
-    patch: Partial<AgentConfig['providers'][number]>
-  ) => {
-    setAgentConfig(value => value
-      ? {
-        ...value,
-        providers: value.providers.map(provider =>
-          provider.id === id ? { ...provider, ...patch } : provider
-        ),
-      }
-      : value)
+  const updateProvider = (id: string, patch: Partial<AgentConfig['providers'][number]>) => {
+    setAgentConfig(value =>
+      value
+        ? {
+          ...value,
+          providers: value.providers.map(provider =>
+            provider.id === id ? { ...provider, ...patch } : provider
+          ),
+        }
+        : value
+    )
   }
 
   const addProvider = () => {
@@ -415,6 +1267,22 @@ export default function AgentDashboard () {
       await agentRequest.saveConfig(agentConfig)
       const models = await agentRequest.providerModels(id)
       setProviderModels(value => ({ ...value, [id]: models }))
+      setAgentConfig(value =>
+        value
+          ? {
+            ...value,
+            providers: value.providers.map(provider =>
+              provider.id === id
+                ? {
+                  ...provider,
+                  discoveredModels: models,
+                  modelsDiscoveredAt: Date.now(),
+                }
+                : provider
+            ),
+          }
+          : value
+      )
       toast.success(`发现 ${models.length} 个模型`)
     } catch (error) {
       toast.error((error as Error).message)
@@ -429,9 +1297,7 @@ export default function AgentDashboard () {
     try {
       await agentRequest.saveConfig(agentConfig)
       const result = await agentRequest.testProvider(id)
-      toast.success(
-        `认证/对话/SSE/Tool 均通过，${result.latency}ms，模型 ${result.model}`
-      )
+      toast.success(`认证/对话/SSE/Tool 均通过，${result.latency}ms，模型 ${result.model}`)
     } catch (error) {
       toast.error((error as Error).message)
     } finally {
@@ -441,10 +1307,14 @@ export default function AgentDashboard () {
 
   const search = async () => {
     try {
-      setThreads(await agentRequest.threads({
-        state: threadState,
-        query: searchText.trim() || undefined,
-      }))
+      setThreads(
+        await agentRequest.threads({
+          state: threadState,
+          channel: selectedChannel,
+          rootOnly: true,
+          query: searchText.trim() || undefined,
+        })
+      )
       setSearchResults([])
     } catch (error) {
       toast.error((error as Error).message)
@@ -457,7 +1327,7 @@ export default function AgentDashboard () {
     if (title === null || !title.trim()) return
     const updated = await agentRequest.updateThread(current.id, { title })
     setCurrent(updated)
-    setThreads(value => value.map(item => item.id === updated.id ? updated : item))
+    setThreads(value => value.map(item => (item.id === updated.id ? updated : item)))
   }
 
   const archiveCurrent = async (archived: boolean) => {
@@ -465,6 +1335,7 @@ export default function AgentDashboard () {
     try {
       const updated = await agentRequest.updateThread(current.id, { archived })
       setCurrent(null)
+      setThreadTree([])
       setThreads(value => value.filter(item => item.id !== updated.id))
       toast.success(archived ? '对话已归档' : '对话已恢复')
     } catch (error) {
@@ -482,6 +1353,7 @@ export default function AgentDashboard () {
       delete lastEventId.current[current.id]
       const next = threads.filter(item => item.id !== current.id)
       setThreads(next)
+      setThreadTree([])
       setCurrent(next[0] || null)
       toast.success('对话已永久删除')
     } catch (error) {
@@ -520,6 +1392,7 @@ export default function AgentDashboard () {
   const saveJob = async () => {
     try {
       await agentRequest.saveJob({
+        id: editingJobId || undefined,
         ...jobDraft,
         runAt: jobDraft.runAt ? new Date(jobDraft.runAt).getTime() : null,
         enabled: true,
@@ -532,12 +1405,63 @@ export default function AgentDashboard () {
           .map(value => value.trim())
           .filter(Boolean),
       })
-      setJobs(await agentRequest.jobs())
-      setJobDraft(value => ({ ...value, name: '', prompt: '' }))
-      toast.success('自动任务已保存')
+      const nextJobs = await agentRequest.jobs()
+      setJobs(nextJobs)
+      const saved = nextJobs.find(item =>
+        editingJobId ? item.id === editingJobId : item.name === jobDraft.name
+      )
+      if (saved) setSelectedJobId(saved.id)
+      setEditingJobId('')
+      setTaskEditorOpen(false)
+      setJobDraft({
+        name: '',
+        scheduleType: 'cron',
+        cron: '0 9 * * *',
+        runAt: '',
+        timezone: 'Asia/Shanghai',
+        prompt: '',
+        target: 'web',
+        toolAllowlist: '',
+        skillIds: '',
+      })
+      toast.success(editingJobId ? '自动任务已更新' : '自动任务已创建')
     } catch (error) {
       toast.error((error as Error).message)
     }
+  }
+
+  const openNewJob = () => {
+    setEditingJobId('')
+    setJobDraft({
+      name: '',
+      scheduleType: 'cron',
+      cron: '0 9 * * *',
+      runAt: '',
+      timezone: 'Asia/Shanghai',
+      prompt: '',
+      target: 'web',
+      toolAllowlist: '',
+      skillIds: '',
+    })
+    setTaskEditorOpen(true)
+  }
+
+  const openJobEditor = (job: AgentJob) => {
+    setEditingJobId(job.id)
+    setJobDraft({
+      name: job.name,
+      scheduleType: job.scheduleType,
+      cron: job.cron,
+      runAt: job.runAt
+        ? new Date(job.runAt - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
+        : '',
+      timezone: job.timezone,
+      prompt: job.prompt,
+      target: job.target,
+      toolAllowlist: job.toolAllowlist.join(', '),
+      skillIds: job.skillIds.join(', '),
+    })
+    setTaskEditorOpen(true)
   }
 
   const createMemory = async () => {
@@ -551,92 +1475,337 @@ export default function AgentDashboard () {
     }
   }
 
-  const createSkill = async () => {
+  const saveSkill = async () => {
     try {
-      await agentRequest.createSkill({
-        ...skillDraft,
+      const { scriptTools, ...draft } = skillDraft
+      const input = {
+        ...draft,
         tools: skillDraft.tools
           .split(',')
           .map(value => value.trim())
           .filter(Boolean),
-      })
-      setSkills(await agentRequest.skills())
-      setSkillDraft({ name: '', description: '', instructions: '', tools: '' })
-      toast.success('Skill 版本已创建')
+        scriptTools: compileScriptTools(scriptTools),
+      }
+      const result = editingSkillId
+        ? await agentRequest.updateSkill(editingSkillId, input)
+        : await agentRequest.createSkill(input)
+      const nextSkills = await agentRequest.skills()
+      setSkills(nextSkills)
+      const skillId = String((result as { skillId?: string })?.skillId || editingSkillId)
+      if (skillId) setSelectedSkillId(skillId)
+      setSkillDraft(emptySkillDraft())
+      setEditingSkillId('')
+      setSkillEditorOpen(false)
+      toast.success(editingSkillId ? 'Skill 新版本已保存' : 'Skill 已创建')
     } catch (error) {
       toast.error((error as Error).message)
     }
   }
 
-  return (
-    <div className='mx-auto flex w-full max-w-[1600px] flex-col gap-5'>
-      <header className='flex flex-col gap-4 rounded-3xl border border-primary-200/50 bg-gradient-to-br from-primary-50 via-content1 to-secondary-50 p-6 md:flex-row md:items-center md:justify-between'>
-        <div>
-          <div className='mb-2 flex items-center gap-3'>
-            <div className='rounded-2xl bg-primary p-3 text-primary-foreground'>
-              <Bot />
-            </div>
-            <h1 className='text-2xl font-semibold tracking-tight'>Karin Agent</h1>
-          </div>
-          <p className='text-sm text-default-500'>
-            固定命令优先，未匹配消息通过受策略约束的 Tool Runtime 处理。
-          </p>
-        </div>
-        <div className='flex items-center gap-3'>
-          <span
-            className={`rounded-full px-3 py-1.5 text-sm font-medium ${
-              status?.state === 'ready'
-                ? 'bg-success-100 text-success-700'
-                : status?.state === 'failed'
-                  ? 'bg-danger-100 text-danger-700'
-                  : 'bg-warning-100 text-warning-700'
-            }`}
-          >
-            {status?.state || 'loading'} · {status?.reason || `${tools.length} tools`}
-          </span>
-          <Action onClick={refresh}>
-            <RefreshCw size={16} />
-            刷新
-          </Action>
-        </div>
-      </header>
+  const openNewSkill = () => {
+    setEditingSkillId('')
+    setSkillDraft(emptySkillDraft())
+    setSkillEditorOpen(true)
+  }
 
-      <nav className='flex gap-2 overflow-x-auto rounded-2xl border border-default-200 bg-content1 p-2'>
-        {tabs.map(item => {
-          const Icon = item.icon
-          return (
-            <button
-              key={item.id}
-              type='button'
-              onClick={() => navigate(`/agent/${item.id}`)}
-              className={`flex shrink-0 items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition ${
-                tab === item.id
-                  ? 'bg-primary text-primary-foreground'
-                  : 'text-default-500 hover:bg-default-100'
+  const updateScriptTool = (index: number, patch: Partial<ScriptToolDraft>) => {
+    setSkillDraft(value => ({
+      ...value,
+      scriptTools: value.scriptTools.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, ...patch } : item
+      ),
+    }))
+  }
+
+  const openSkillEditor = (skill: AgentSkill) => {
+    const version = skillVersions.find(item => item.id === skill.activeVersionId)
+    if (!version) {
+      toast.error('当前 Skill 版本尚未加载')
+      return
+    }
+    setEditingSkillId(skill.id)
+    setSkillDraft({
+      name: version.name || skill.name,
+      description: version.description || skill.description,
+      instructions: skillInstructions(version.content),
+      tools: skillTools(version.tools_json)
+        .filter(name => !name.startsWith('skill.skill_'))
+        .join(', '),
+      scriptTools: scriptToolDrafts(version.script_tools_json || '[]'),
+    })
+    setSkillEditorOpen(true)
+  }
+
+  const deleteSkill = async (skill: AgentSkill) => {
+    const confirmName = window.prompt(
+      `此操作会永久删除 Skill、全部版本和运行引用。\n请输入完整名称确认：${skill.name}`
+    )
+    if (confirmName === null) return
+    try {
+      const result = await agentRequest.deleteSkill(skill.id, confirmName)
+      const next = await agentRequest.skills()
+      setSkills(next)
+      setSelectedSkillId(next[0]?.id || '')
+      setSkillEditorOpen(false)
+      setEditingSkillId('')
+      toast.success(
+        `已永久删除 ${result.name}：${result.versions} 个版本，更新 ${result.jobsUpdated} 个任务`
+      )
+    } catch (error) {
+      toast.error((error as Error).message)
+    }
+  }
+
+  const saveMcp = async () => {
+    if (!agentConfig) return
+    try {
+      await agentRequest.saveConfig(agentConfig)
+      setMcp(await agentRequest.reloadMcp())
+      toast.success('MCP 配置已保存并重新连接')
+    } catch (error) {
+      toast.error((error as Error).message)
+    }
+  }
+
+  const updateMcpServer = (
+    index: number,
+    patch: Partial<AgentConfig['mcp']['servers'][number]>
+  ) => {
+    if (!agentConfig) return
+    const previousName = agentConfig.mcp.servers[index]?.name
+    const nextName = patch.name
+    setAgentConfig({
+      ...agentConfig,
+      mcp: {
+        ...agentConfig.mcp,
+        servers: agentConfig.mcp.servers.map((server, serverIndex) =>
+          serverIndex === index ? { ...server, ...patch } : server
+        ),
+      },
+    })
+    if (nextName && previousName === selectedMcpName) setSelectedMcpName(nextName)
+  }
+
+  const addMcpServer = () => {
+    if (!agentConfig) return
+    const name = `server-${agentConfig.mcp.servers.length + 1}`
+    setAgentConfig({
+      ...agentConfig,
+      mcp: {
+        ...agentConfig.mcp,
+        servers: [...agentConfig.mcp.servers, { name, enabled: true, transport: 'http', url: '' }],
+      },
+    })
+    setSelectedMcpName(name)
+  }
+
+  const runEvolutionAction = async (
+    candidate: AgentEvolutionCandidate,
+    action: 'evaluate' | 'promote' | 'reject' | 'rollback'
+  ) => {
+    try {
+      await agentRequest.evolutionAction(candidate.id, action)
+      const [overview, candidates] = await Promise.all([
+        agentRequest.evolutionOverview(),
+        agentRequest.evolutionCandidates(),
+      ])
+      setEvolutionOverview(overview)
+      setEvolutionCandidates(candidates)
+      toast.success(
+        {
+          evaluate: '候选评测已完成',
+          promote: '候选已晋升',
+          reject: '候选已拒绝',
+          rollback: '候选已回滚',
+        }[action]
+      )
+    } catch (error) {
+      toast.error((error as Error).message)
+    }
+  }
+
+  const reviewRepairArtifact = async (candidate: AgentEvolutionCandidate) => {
+    try {
+      const artifact = await agentRequest.evolutionArtifact(candidate.id)
+      setRepairArtifact(artifact.patch)
+    } catch (error) {
+      setRepairArtifact('')
+      toast.error((error as Error).message)
+    }
+  }
+
+  const applyRepairCandidate = async (candidate: AgentEvolutionCandidate) => {
+    if (!window.confirm('将应用该 Diff、执行固定验证，并在成功后重启 Core。确认继续？')) return
+    try {
+      await agentRequest.applyRepair(candidate.id, true)
+      toast.success('修复已验证并应用，Core 正在重启')
+      const candidates = await agentRequest.evolutionCandidates()
+      setEvolutionCandidates(candidates)
+    } catch (error) {
+      toast.error((error as Error).message)
+    }
+  }
+
+  const rollbackRepairCandidate = async (candidate: AgentEvolutionCandidate) => {
+    if (!window.confirm('将恢复该候选应用前的文件快照并重启 Core。确认回滚？')) return
+    try {
+      await agentRequest.rollbackRepair(candidate.id, true)
+      toast.success('源码快照已恢复，Core 正在重启')
+      const candidates = await agentRequest.evolutionCandidates()
+      setEvolutionCandidates(candidates)
+    } catch (error) {
+      toast.error((error as Error).message)
+    }
+  }
+
+  const submitFeedback = async (message: AgentMessage, rating: -1 | 1, correction?: string) => {
+    if (!current) return
+    try {
+      await agentRequest.feedback(current.id, {
+        turnId: message.turnId || undefined,
+        rating,
+        correction,
+      })
+      const [overview, candidates] = await Promise.all([
+        agentRequest.evolutionOverview(),
+        agentRequest.evolutionCandidates(),
+      ])
+      setEvolutionOverview(overview)
+      setEvolutionCandidates(candidates)
+      toast.success(correction ? '纠正已进入进化评测队列' : '反馈已记录')
+    } catch (error) {
+      toast.error((error as Error).message)
+    }
+  }
+
+  const timeline = [
+    ...messages
+      .filter(isRenderableChatMessage)
+      .map(message => ({ kind: 'message' as const, createdAt: message.createdAt, message })),
+    ...activities
+      .filter(
+        activity =>
+          activity.kind !== 'approval' ||
+          !activity.parentId ||
+          !toolCallById.has(activity.parentId.replace(/^tool:/, ''))
+      )
+      .map(activity => ({
+        kind: 'activity' as const,
+        createdAt: activity.startedAt,
+        activity,
+      })),
+    ...notices.map(notice => ({
+      kind: 'notice' as const,
+      createdAt: notice.createdAt,
+      notice,
+    })),
+  ].sort((left, right) => left.createdAt - right.createdAt)
+  const waitingActivity =
+    activities.find(item => item.kind === 'approval' && item.status === 'waiting_approval') ||
+    activities.find(item => item.kind === 'tool' && item.status === 'waiting_approval') ||
+    activities.find(item => item.status === 'waiting_approval')
+  const runningTool = activities.find(item => item.kind === 'tool' && item.status === 'running')
+  const runningSubagent = activities.find(
+    item => item.kind === 'subagent' && item.status === 'running'
+  )
+  let activeLabel = '思考中'
+  if (streaming) activeLabel = '正在生成回复'
+  if (runningSubagent) activeLabel = `子 Agent 正在运行 · ${runningSubagent.label}`
+  if (runningTool) {
+    activeLabel = `正在调用 ${runningTool.source ? `${runningTool.source} / ` : ''}${
+      runningTool.label
+    }`
+  }
+  if (recoveryStatus) activeLabel = recoveryStatus
+  if (waitingActivity) activeLabel = `等待确认 · ${waitingActivity.label}`
+  const selectedEvolution =
+    evolutionCandidates.find(item => item.id === selectedEvolutionId) || evolutionCandidates[0]
+  const filteredJobs = jobs.filter(item =>
+    `${item.name} ${item.prompt} ${item.target}`.toLowerCase().includes(taskQuery.toLowerCase())
+  )
+  const selectedJob = jobs.find(item => item.id === selectedJobId) || filteredJobs[0]
+  const selectedJobRuns = selectedJob
+    ? jobRuns.filter(item => String(item.job_id) === selectedJob.id)
+    : []
+  const filteredMemories = memories.filter(item => {
+    const matchesScope = memoryScope === 'all' || item.scope === memoryScope
+    const matchesQuery = `${item.content} ${item.scope} ${item.scopeKey}`
+      .toLowerCase()
+      .includes(memoryQuery.toLowerCase())
+    return matchesScope && matchesQuery
+  })
+  const selectedMemory = memories.find(item => item.id === selectedMemoryId) || filteredMemories[0]
+  const filteredSkills = skills.filter(item =>
+    `${item.name} ${item.description}`.toLowerCase().includes(skillQuery.toLowerCase())
+  )
+  const selectedSkill = skills.find(item => item.id === selectedSkillId) || filteredSkills[0]
+  const mcpServers = agentConfig?.mcp.servers || []
+  const filteredMcpServers = mcpServers.filter(item =>
+    `${item.name} ${item.transport} ${item.command || ''} ${item.url || ''}`
+      .toLowerCase()
+      .includes(mcpQuery.toLowerCase())
+  )
+  const selectedMcpIndex = mcpServers.findIndex(item => item.name === selectedMcpName)
+  const selectedMcp = selectedMcpIndex >= 0 ? mcpServers[selectedMcpIndex] : filteredMcpServers[0]
+  const selectedMcpStatus = mcp.find(item => String(item.name) === selectedMcp?.name)
+
+  return (
+    <div
+      className={
+        tab === 'chat'
+          ? 'agent-chat-workspace flex h-full min-h-0 w-full flex-col'
+          : 'mx-auto flex w-full max-w-[1600px] flex-col gap-5'
+      }
+    >
+      {tab !== 'chat' && (
+        <header className='flex items-center justify-between gap-4 rounded-2xl border border-default-200 bg-content1 px-5 py-4'>
+          <div>
+            <h1 className='text-xl font-semibold tracking-tight'>Karin Agent</h1>
+            <p className='text-sm text-default-500'>
+              固定命令优先，未匹配消息通过受策略约束的 Tool Runtime 处理。
+            </p>
+          </div>
+          <div className='flex items-center gap-3'>
+            <span
+              className={`rounded-full px-3 py-1.5 text-sm font-medium ${
+                status?.state === 'ready'
+                  ? 'bg-success-100 text-success-700'
+                  : status?.state === 'failed'
+                    ? 'bg-danger-100 text-danger-700'
+                    : 'bg-warning-100 text-warning-700'
               }`}
             >
-              <Icon size={17} />
-              {item.label}
-            </button>
-          )
-        })}
-      </nav>
+              {status?.state || 'loading'} · {status?.reason || `${tools.length} tools`}
+            </span>
+            <Action onClick={refresh}>
+              <RefreshCw size={16} />
+              刷新
+            </Action>
+          </div>
+        </header>
+      )}
 
       {tab === 'chat' && (
-        <div className='grid min-h-[680px] gap-5 xl:grid-cols-[320px_1fr]'>
-          <Panel className='flex flex-col overflow-hidden'>
+        <div className='relative grid h-full min-h-0 w-full gap-3 md:grid-cols-[300px_minmax(0,1fr)]'>
+          {threadDrawerOpen && (
+            <button
+              type='button'
+              aria-label='关闭对话列表'
+              className='fixed inset-0 z-40 bg-black/30 md:hidden'
+              onClick={() => setThreadDrawerOpen(false)}
+            />
+          )}
+          <Panel
+            className={`min-h-0 flex-col overflow-hidden ${
+              threadDrawerOpen
+                ? 'fixed inset-y-3 left-3 z-50 flex w-[min(320px,calc(100vw-24px))]'
+                : 'hidden'
+            } md:relative md:inset-auto md:z-auto md:flex md:w-auto`}
+          >
             <div className='border-b border-default-200 p-4'>
               <div className='mb-3 flex items-center justify-between'>
-                <h2 className='font-semibold'>Threads</h2>
-                <Action
-                  onClick={() => {
-                    setCurrent(null)
-                    setThreadState('active')
-                    setChatError('')
-                  }}
-                >
-                  新建
-                </Action>
+                <h2 className='font-semibold'>对话</h2>
+                <Action onClick={newConversation}>新建网页会话</Action>
               </div>
               <div className='mb-3 grid grid-cols-2 gap-2 rounded-xl bg-default-100 p-1'>
                 {(['active', 'archived'] as const).map(state => (
@@ -645,10 +1814,17 @@ export default function AgentDashboard () {
                     type='button'
                     onClick={() => {
                       setThreadState(state)
+                      setSelectedChannel(
+                        readThreadSelections()[state]?.channel || selectedChannel
+                      )
+                      setThreads([])
                       setCurrent(null)
+                      setThreadTree([])
                     }}
                     className={`rounded-lg px-3 py-1.5 text-xs font-medium ${
-                      threadState === state ? 'bg-content1 text-primary shadow-sm' : 'text-default-500'
+                      threadState === state
+                        ? 'bg-content1 text-primary shadow-sm'
+                        : 'text-default-500'
                     }`}
                   >
                     {state === 'active' ? '活动对话' : '已归档'}
@@ -670,7 +1846,7 @@ export default function AgentDashboard () {
                 </Action>
               </div>
             </div>
-            <div className='flex-1 space-y-2 overflow-y-auto p-3'>
+            <div className='min-h-0 flex-1 space-y-2 overflow-y-scroll p-3 [scrollbar-color:#a1a1aa_transparent] [scrollbar-width:thin]'>
               {searchResults.length > 0 && (
                 <div className='mb-4 rounded-xl bg-warning-50 p-3 text-xs'>
                   <div className='mb-2 font-semibold'>搜索结果</div>
@@ -682,86 +1858,237 @@ export default function AgentDashboard () {
                 </div>
               )}
               {threads.map(thread => (
-                <button
-                  key={thread.id}
-                  type='button'
-                  onClick={() => setCurrent(thread)}
-                  className={`w-full rounded-xl border p-3 text-left transition ${
-                    current?.id === thread.id
-                      ? 'border-primary bg-primary-50'
-                      : 'border-transparent hover:bg-default-100'
-                  }`}
-                >
-                  <div className='flex items-center justify-between gap-2'>
-                    <span className='truncate text-sm font-medium'>
-                      {thread.title || thread.threadKey}
-                    </span>
-                    <span className='text-[11px] text-default-400'>{thread.state}</span>
-                  </div>
-                  <div className='mt-1 text-xs text-default-400'>
-                    {thread.parentThreadId ? '子 Agent' : thread.scene} · {date(thread.updatedAt)}
-                  </div>
-                  {thread.lastMessagePreview && (
-                    <div className='mt-1 truncate text-xs text-default-500'>
-                      {thread.lastMessagePreview}
+                <div key={thread.id} className='space-y-1'>
+                  <button
+                    type='button'
+                    onClick={() => openThreadRoot(thread).catch(error => {
+                      setChatError((error as Error).message)
+                    })}
+                    className={`w-full rounded-xl border p-3 text-left transition ${
+                      current?.id === thread.id
+                        ? 'border-primary bg-primary-50'
+                        : 'border-transparent hover:bg-default-100'
+                    }`}
+                  >
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='truncate text-sm font-medium'>{threadName(thread)}</span>
+                      <span className='text-[11px] text-default-400'>{thread.state}</span>
                     </div>
-                  )}
-                </button>
+                    <div className='mt-1 truncate text-xs text-default-400'>
+                      {thread.accountName || thread.accountId || channelName(thread.channel)}
+                      {' · '}
+                      {thread.scene} · {date(thread.updatedAt)}
+                    </div>
+                    {thread.lastMessagePreview && (
+                      <div className='mt-1 truncate text-xs text-default-500'>
+                        {thread.lastMessagePreview}
+                      </div>
+                    )}
+                  </button>
+                  {threadTree[0]?.id === thread.id && threadTree.slice(1).map(child => (
+                    <button
+                      key={child.id}
+                      type='button'
+                      onClick={() => {
+                        setCurrent(child)
+                        setThreadDrawerOpen(false)
+                      }}
+                      className={`ml-4 w-[calc(100%_-_1rem)] rounded-xl border px-3 py-2 text-left transition ${
+                        current?.id === child.id
+                          ? 'border-primary bg-primary-50'
+                          : 'border-transparent hover:bg-default-100'
+                      }`}
+                    >
+                      <div className='flex items-center justify-between gap-2'>
+                        <span className='truncate text-xs font-medium'>
+                          {'↳ '.repeat(Math.max(1, child.depth || 1))}
+                          {child.title || child.lastMessagePreview || '子 Agent'}
+                        </span>
+                        <span className='text-[10px] text-default-400'>{child.state}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
               ))}
             </div>
           </Panel>
 
-          <Panel className='flex min-h-[680px] flex-col overflow-hidden'>
-            <div className='flex items-center justify-between border-b border-default-200 px-5 py-4'>
-              <div>
-                <h2 className='font-semibold'>
-                  {current ? current.title || current.threadKey : '新对话'}
-                </h2>
-                <p className='text-xs text-default-400'>
-                  {current ? `Thread ${current.id}` : '发送第一条消息后创建 Thread'}
-                </p>
-              </div>
-              {current && (
-                <div className='flex flex-wrap justify-end gap-2'>
-                  <Action onClick={renameCurrent}>
-                    <Pencil size={15} />
-                    重命名
-                  </Action>
-                  <Action onClick={() => archiveCurrent(!current.archivedAt)}>
-                    {current.archivedAt
-                      ? <ArchiveRestore size={15} />
-                      : <Archive size={15} />}
-                    {current.archivedAt ? '恢复' : '归档'}
-                  </Action>
-                  <Action
-                    onClick={async () => {
-                      await agentRequest.interrupt(current.id)
-                    }}
-                    danger
+          <Panel className='flex min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl'>
+            <div className='flex shrink-0 items-center justify-between gap-3 border-b border-default-200 px-3 py-2.5 md:px-4'>
+              <div className='flex min-w-0 flex-1 items-center gap-2'>
+                <button
+                  type='button'
+                  aria-label='打开对话列表'
+                  onClick={() => setThreadDrawerOpen(true)}
+                  className='rounded-lg p-2 text-default-500 hover:bg-default-100 md:hidden'
+                >
+                  <Menu size={18} />
+                </button>
+                <div className='grid min-w-0 flex-1 gap-1 sm:grid-cols-[minmax(110px,0.6fr)_minmax(150px,1fr)]'>
+                  <select
+                    aria-label='选择渠道'
+                    value={selectedChannel}
+                    onChange={event => selectChannel(event.target.value)}
+                    className='min-w-0 rounded-lg border border-default-200 bg-default-50 px-2 py-1.5 text-xs font-medium outline-none focus:border-primary'
                   >
-                    <CircleStop size={16} />
-                    中断
-                  </Action>
-                  <Action onClick={deleteCurrent} danger>
-                    <Trash2 size={15} />
-                    删除
-                  </Action>
+                    {threadChannels.map(item => (
+                      <option key={item.channel} value={item.channel}>
+                        {channelName(item.channel)}
+                        {' · '}
+                        {threadState === 'active' ? item.activeCount : item.archivedCount}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    aria-label='选择会话'
+                    value={current?.id || ''}
+                    onChange={event => {
+                      selectThread(event.target.value).catch(error => {
+                        setChatError((error as Error).message)
+                      })
+                    }}
+                    className='min-w-0 rounded-lg border border-default-200 bg-default-50 px-2 py-1.5 text-xs font-medium outline-none focus:border-primary'
+                  >
+                    {!threads.length && <option value=''>暂无会话</option>}
+                    {threads.map(thread => (
+                      <option key={thread.id} value={thread.id}>
+                        {threadName(thread)}
+                      </option>
+                    ))}
+                    {threadTree.slice(1).map(child => (
+                      <option key={child.id} value={child.id}>
+                        {'　'.repeat(Math.max(1, child.depth || 1))}↳{' '}
+                        {child.title || child.lastMessagePreview || '子 Agent'}
+                      </option>
+                    ))}
+                  </select>
+                  <p className='truncate text-[11px] text-default-400 sm:col-span-2'>
+                    {current?.accountName || current?.accountId || channelName(selectedChannel)}
+                    {' · '}
+                    {current?.modelProviderId ||
+                      agentConfig?.routing.primary ||
+                      '未配置 Provider'}
+                    {' · '}
+                    {current?.modelName ||
+                      agentConfig?.providers.find(
+                        provider =>
+                          provider.id ===
+                          (current?.modelProviderId || agentConfig.routing.primary)
+                      )?.model ||
+                      '未选择模型'}
+                  </p>
                 </div>
-              )}
+              </div>
+              <div className='flex shrink-0 items-center gap-1'>
+                <span
+                  className={`hidden rounded-full px-2 py-1 text-[11px] sm:inline ${
+                    status?.state === 'ready'
+                      ? 'bg-success-100 text-success-700'
+                      : 'bg-warning-100 text-warning-700'
+                  }`}
+                >
+                  {status?.state === 'ready' ? '已连接' : status?.reason || '未就绪'}
+                </span>
+                {current?.parentThreadId && threadTree[0] && (
+                  <button
+                    type='button'
+                    title='返回父会话'
+                    onClick={() => setCurrent(threadTree[0])}
+                    className='flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-primary hover:bg-primary-50'
+                  >
+                    <ChevronRight className='rotate-180' size={15} />
+                    父会话
+                  </button>
+                )}
+                {current && !current.parentThreadId && (
+                  <>
+                    <button
+                      type='button'
+                      title='重命名'
+                      onClick={renameCurrent}
+                      className='rounded-lg p-2 text-default-500 hover:bg-default-100'
+                    >
+                      <Pencil size={15} />
+                    </button>
+                    <button
+                      type='button'
+                      title={current.archivedAt ? '恢复' : '归档'}
+                      onClick={() => archiveCurrent(!current.archivedAt)}
+                      className='rounded-lg p-2 text-default-500 hover:bg-default-100'
+                    >
+                      {current.archivedAt ? <ArchiveRestore size={15} /> : <Archive size={15} />}
+                    </button>
+                    <button
+                      type='button'
+                      title='停止'
+                      onClick={stopCurrent}
+                      className='rounded-lg p-2 text-danger hover:bg-danger-50'
+                    >
+                      <CircleStop size={16} />
+                    </button>
+                    <button
+                      type='button'
+                      title='永久删除'
+                      onClick={deleteCurrent}
+                      className='rounded-lg p-2 text-danger hover:bg-danger-50'
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
             {chatError && (
-              <div className='border-b border-danger-200 bg-danger-50 px-5 py-3 text-sm text-danger'>
+              <div className='shrink-0 border-b border-danger-200 bg-danger-50 px-4 py-2 text-sm text-danger'>
                 {chatError}
               </div>
             )}
-            <div className='flex-1 space-y-4 overflow-y-auto bg-default-50/40 p-5'>
-              {messages.map(message => {
-                const call = message.toolCallId
-                  ? toolCallById.get(message.toolCallId)
-                  : undefined
-                if (message.role === 'tool' && call) {
-                  return <ToolCallCard key={message.id} call={call} />
+            <div
+              ref={messageViewportRef}
+              onScroll={handleMessageScroll}
+              className='relative min-h-0 flex-1 space-y-3 overflow-y-scroll bg-default-50/40 p-3 [scrollbar-color:#a1a1aa_transparent] [scrollbar-width:thin] md:p-5'
+            >
+              {!timeline.length && !streaming && (
+                <div className='grid h-full place-items-center'>
+                  <div className='max-w-md text-center'>
+                    <Bot className='mx-auto mb-3 text-primary' size={30} />
+                    <h3 className='font-semibold'>从一个明确的目标开始</h3>
+                    <p className='mt-1 text-sm text-default-500'>
+                      直接描述任务，或输入 /help 查看会话命令。
+                    </p>
+                  </div>
+                </div>
+              )}
+              {timeline.map(item => {
+                if (item.kind === 'notice') {
+                  return (
+                    <div
+                      key={item.notice.id}
+                      className='mx-auto max-w-[92%] whitespace-pre-wrap rounded-xl border border-primary-200 bg-primary-50 px-3 py-2 text-xs text-primary-700'
+                    >
+                      {item.notice.content}
+                    </div>
+                  )
                 }
+                if (item.kind === 'activity') {
+                  const activity = item.activity
+                  if (activity.kind === 'tool') {
+                    const call = toolCallById.get(activity.id.replace(/^tool:/, ''))
+                    if (call) {
+                      return (
+                        <ToolCallCard
+                          key={activity.id}
+                          call={call}
+                          approval={approvalByToolCall.get(call.id)}
+                          now={now}
+                          onResolve={resolveApproval}
+                        />
+                      )
+                    }
+                  }
+                  return <ActivityCard key={activity.id} activity={activity} now={now} />
+                }
+                const message = item.message
                 return (
                   <div
                     key={message.id}
@@ -776,26 +2103,76 @@ export default function AgentDashboard () {
                     {message.name && (
                       <div className='mb-1 text-[11px] font-semibold'>{message.name}</div>
                     )}
-                    <div className='whitespace-pre-wrap break-words'>{message.content}</div>
-                    <button
-                      type='button'
-                      title='复制'
-                      onClick={() => navigator.clipboard.writeText(message.content)}
+                    {Boolean(message.attachments?.length) && (
+                      <div className='mb-2 grid gap-2'>
+                        {message.attachments?.map(attachment => (
+                          <MessageAttachment
+                            key={attachment.id}
+                            attachment={attachment}
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {message.role === 'assistant'
+                      ? <Markdown content={message.content} />
+                      : <div className='whitespace-pre-wrap break-words'>{message.content}</div>}
+                    <div
                       className={`absolute -bottom-3 ${
                         message.role === 'user' ? 'right-2' : 'left-2'
-                      } rounded-full border border-default-200 bg-content1 p-1 text-default-500 opacity-0 shadow-sm transition group-hover:opacity-100`}
+                      } flex items-center overflow-hidden rounded-full border border-default-200 bg-content1 text-default-500 opacity-0 shadow-sm transition group-hover:opacity-100`}
                     >
-                      <Copy size={13} />
-                    </button>
+                      <button
+                        type='button'
+                        title='复制'
+                        onClick={() => navigator.clipboard.writeText(message.content)}
+                        className='p-1.5 hover:bg-default-100 hover:text-primary'
+                      >
+                        <Copy size={13} />
+                      </button>
+                      {message.role === 'assistant' && (
+                        <>
+                          <button
+                            type='button'
+                            title='这次解决了问题'
+                            onClick={() => submitFeedback(message, 1)}
+                            className='p-1.5 hover:bg-success-50 hover:text-success'
+                          >
+                            <ThumbsUp size={13} />
+                          </button>
+                          <button
+                            type='button'
+                            title='这次没有解决问题'
+                            onClick={() => submitFeedback(message, -1)}
+                            className='p-1.5 hover:bg-danger-50 hover:text-danger'
+                          >
+                            <ThumbsDown size={13} />
+                          </button>
+                          <button
+                            type='button'
+                            title='告诉 Agent 正确做法'
+                            onClick={() => {
+                              const correction = window.prompt(
+                                '正确做法是什么？这条纠正会进入评测队列，不会直接改写运行时。'
+                              )
+                              if (correction?.trim()) submitFeedback(message, -1, correction)
+                            }}
+                            className='p-1.5 hover:bg-warning-50 hover:text-warning'
+                          >
+                            <MessageSquareWarning size={13} />
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </div>
                 )
               })}
-              {toolCalls
-                .filter(call => !messages.some(message => message.toolCallId === call.id))
-                .map(call => <ToolCallCard key={call.id} call={call} />)}
               {streaming && (
                 <div className='max-w-[86%] rounded-2xl border border-primary-200 bg-content1 px-4 py-3 text-sm leading-6'>
-                  <div className='whitespace-pre-wrap'>{streaming}</div>
+                  <div className='mb-1 flex items-center gap-2 text-[11px] text-primary'>
+                    <LoaderCircle className='animate-spin' size={13} />
+                    正在生成回复 · {elapsed(streamStartedAt || Date.now(), undefined, now)}
+                  </div>
+                  <Markdown content={streaming} />
                 </div>
               )}
               {chatError && messages.some(message => message.role === 'user') && (
@@ -811,9 +2188,45 @@ export default function AgentDashboard () {
                   </Action>
                 </div>
               )}
+              {hasNewActivity && (
+                <button
+                  type='button'
+                  onClick={() => {
+                    const viewport = messageViewportRef.current
+                    if (viewport) viewport.scrollTop = viewport.scrollHeight
+                    followOutputRef.current = true
+                    setHasNewActivity(false)
+                  }}
+                  className='sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full bg-primary px-3 py-1.5 text-xs text-primary-foreground shadow-lg'
+                >
+                  有新消息
+                </button>
+              )}
             </div>
-            <div className='border-t border-default-200 p-4'>
-              <div className='flex items-end gap-3'>
+            <div className='sticky bottom-0 z-20 shrink-0 border-t border-default-200 bg-content1/95 p-3 backdrop-blur md:p-4'>
+              {current?.parentThreadId && (
+                <div className='mb-2 flex items-center justify-between rounded-xl bg-default-100 px-3 py-2 text-xs text-default-600'>
+                  <span>子 Agent 会话只读，请返回父会话继续输入。</span>
+                  {threadTree[0] && (
+                    <button
+                      type='button'
+                      onClick={() => setCurrent(threadTree[0])}
+                      className='font-medium text-primary'
+                    >
+                      返回父会话
+                    </button>
+                  )}
+                </div>
+              )}
+              {activities.some(
+                item => item.status === 'running' || item.status === 'waiting_approval'
+              ) && (
+                <div className='mb-2 flex items-center gap-2 text-xs text-default-500'>
+                  <LoaderCircle className='animate-spin text-primary' size={14} />
+                  {activeLabel}
+                </div>
+              )}
+              <div className='flex items-end gap-2'>
                 <textarea
                   value={prompt}
                   onChange={event => setPrompt(event.target.value)}
@@ -823,20 +2236,24 @@ export default function AgentDashboard () {
                       send()
                     }
                   }}
-                  rows={3}
-                  disabled={Boolean(current?.archivedAt)}
-                  placeholder='输入自然语言；群聊中仅 @机器人或唤醒词触发。'
-                  className='min-h-[84px] flex-1 resize-none rounded-2xl border border-default-200 bg-default-50 px-4 py-3 outline-none focus:border-primary'
+                  rows={2}
+                  disabled={Boolean(current?.archivedAt || current?.parentThreadId)}
+                  placeholder={
+                    current?.parentThreadId
+                      ? '子 Agent 会话只读'
+                      : '输入消息；/model 切换模型，/help 查看命令'
+                  }
+                  className='max-h-32 min-h-[56px] flex-1 resize-none rounded-2xl border border-default-200 bg-default-50 px-4 py-3 text-sm outline-none focus:border-primary'
                 />
                 <button
                   type='button'
                   disabled={
                     (!sending && (!prompt.trim() || status?.state !== 'ready')) ||
-                    Boolean(current?.archivedAt)
+                    Boolean(current?.archivedAt || current?.parentThreadId)
                   }
                   onClick={() => {
                     if (sending && current) {
-                      agentRequest.interrupt(current.id)
+                      stopCurrent()
                     } else {
                       send()
                     }
@@ -856,7 +2273,7 @@ export default function AgentDashboard () {
           <div className='border-b border-default-200 p-5'>
             <h2 className='text-lg font-semibold'>工具审批队列</h2>
             <p className='text-sm text-default-500'>
-              只有原始发起者或管理员可处理，默认 5 分钟过期。
+              原始发起者、绑定渠道的会话发起人或管理员可处理，默认 5 分钟过期。
             </p>
           </div>
           <div className='divide-y divide-default-200'>
@@ -880,7 +2297,10 @@ export default function AgentDashboard () {
                   <div className='flex gap-2'>
                     <Action onClick={() => resolveApproval(item, 'approved')}>
                       <Check size={16} />
-                      允许一次
+                      本次同意
+                    </Action>
+                    <Action onClick={() => resolveApproval(item, 'approved', 'thread')}>
+                      始终同意
                     </Action>
                     <Action onClick={() => resolveApproval(item, 'denied')} danger>
                       <X size={16} />
@@ -894,351 +2314,1793 @@ export default function AgentDashboard () {
         </Panel>
       )}
 
-      {(tab === 'memories' || tab === 'skills') && (
-        <div className='grid gap-5'>
-          {tab === 'memories' && (
-            <Panel>
-              <div className='border-b border-default-200 p-5'>
-                <h2 className='flex items-center gap-2 text-lg font-semibold'>
-                  <Database size={19} />
-                  长期记忆
-                </h2>
+      {tab === 'memories' && (
+        <Panel className='overflow-hidden'>
+          <div className='flex flex-wrap items-center justify-between gap-4 border-b border-default-200 px-5 py-4'>
+            <div>
+              <div className='flex items-center gap-2'>
+                <Database className='text-primary' size={19} />
+                <h2 className='text-lg font-semibold'>长期记忆</h2>
+                <span className='rounded-full bg-default-100 px-2 py-0.5 font-mono text-xs'>
+                  {memories.filter(item => item.enabled).length}/{memories.length}
+                </span>
               </div>
-              <div className='grid gap-3 border-b border-default-200 p-5 md:grid-cols-3'>
-                <select
-                  value={memoryDraft.scope}
-                  onChange={event =>
-                    setMemoryDraft(value => ({ ...value, scope: event.target.value }))}
-                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2'
-                >
-                  <option value='user'>用户</option>
-                  <option value='group'>群组</option>
-                  <option value='global'>全局</option>
-                </select>
-                <input
-                  value={memoryDraft.scopeKey}
-                  onChange={event =>
-                    setMemoryDraft(value => ({ ...value, scopeKey: event.target.value }))}
-                  placeholder='作用域标识'
-                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2'
-                />
-                <Action
-                  disabled={!memoryDraft.content.trim() || !memoryDraft.scopeKey.trim()}
-                  onClick={createMemory}
-                >
-                  创建记忆
-                </Action>
-                <textarea
-                  value={memoryDraft.content}
-                  onChange={event =>
-                    setMemoryDraft(value => ({ ...value, content: event.target.value }))}
-                  placeholder='只保存稳定、有长期价值且不含凭据的信息'
-                  className='min-h-24 rounded-xl border border-default-200 bg-default-50 px-3 py-2 md:col-span-3'
-                />
+              <p className='mt-1 text-sm text-default-500'>
+                按作用域保存稳定事实；凭据和临时上下文不应进入长期记忆。
+              </p>
+            </div>
+            <Action onClick={() => setMemoryEditorOpen(true)}>
+              <Plus size={16} />
+              新建记忆
+            </Action>
+          </div>
+          <div className='grid min-h-[640px] xl:grid-cols-[360px_minmax(0,1fr)]'>
+            <aside className='border-b border-default-200 bg-default-50/40 xl:border-b-0 xl:border-r'>
+              <div className='space-y-3 border-b border-default-200 p-4'>
+                <label className='flex items-center gap-2 rounded-xl border border-default-200 bg-content1 px-3 py-2'>
+                  <Search className='text-default-400' size={16} />
+                  <input
+                    value={memoryQuery}
+                    onChange={event => setMemoryQuery(event.target.value)}
+                    placeholder='搜索内容或作用域'
+                    className='min-w-0 flex-1 bg-transparent text-sm outline-none'
+                  />
+                </label>
+                <div className='flex gap-2'>
+                  {['all', 'user', 'group', 'global'].map(scope => (
+                    <button
+                      key={scope}
+                      type='button'
+                      onClick={() => setMemoryScope(scope)}
+                      className={`rounded-full px-2.5 py-1 text-xs transition ${
+                        memoryScope === scope
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-content1 text-default-500 hover:text-foreground'
+                      }`}
+                    >
+                      {memoryScopeLabels[scope]}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className='max-h-[720px] divide-y divide-default-200 overflow-auto'>
-                {memories.map(item => (
-                  <div key={item.id} className='p-4'>
-                    <div className='mb-2 flex items-center justify-between gap-3'>
-                      <span className='rounded-full bg-primary-50 px-2 py-1 text-xs text-primary'>
+              <div className='karin-scrollbar max-h-[540px] space-y-1 overflow-y-auto p-2'>
+                {filteredMemories.map(item => (
+                  <button
+                    key={item.id}
+                    type='button'
+                    onClick={() => {
+                      setSelectedMemoryId(item.id)
+                      setMemoryEditorOpen(false)
+                    }}
+                    className={`relative w-full overflow-hidden rounded-xl px-4 py-3 text-left transition ${
+                      selectedMemory?.id === item.id && !memoryEditorOpen
+                        ? 'bg-content1 shadow-sm'
+                        : 'hover:bg-content1/70'
+                    }`}
+                  >
+                    {selectedMemory?.id === item.id && !memoryEditorOpen && (
+                      <span className='absolute inset-y-2 left-0 w-0.5 rounded-full bg-primary' />
+                    )}
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='font-mono text-[11px] uppercase tracking-wide text-primary'>
                         {item.scope}:{item.scopeKey}
                       </span>
-                      <div className='flex gap-2'>
-                        <Action
-                          onClick={async () => {
-                            await agentRequest.setMemoryState(item.id, !item.enabled)
-                            setMemories(await agentRequest.memories())
-                          }}
-                        >
-                          {item.enabled ? '禁用' : '启用'}
-                        </Action>
-                        <Action
-                          danger
-                          onClick={async () => {
-                            if (!window.confirm('永久删除此条长期记忆？此操作不可恢复。')) return
-                            await agentRequest.deleteMemory(item.id)
-                            setMemories(await agentRequest.memories())
-                          }}
-                        >
-                          <Trash2 size={15} />
-                        </Action>
-                      </div>
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          item.enabled ? 'bg-success' : 'bg-default-300'
+                        }`}
+                      />
                     </div>
-                    <p className='whitespace-pre-wrap text-sm'>{item.content}</p>
-                    <p className='mt-2 text-xs text-default-400'>{date(item.createdAt)}</p>
-                  </div>
+                    <p className='mt-2 line-clamp-2 text-sm leading-5'>{item.content}</p>
+                    <p className='mt-2 text-[11px] text-default-400'>{date(item.createdAt)}</p>
+                  </button>
                 ))}
+                {!filteredMemories.length && (
+                  <div className='p-8 text-center text-sm text-default-400'>没有匹配的记忆。</div>
+                )}
               </div>
-            </Panel>
-          )}
-          {tab === 'skills' && (
-            <Panel>
-              <div className='border-b border-default-200 p-5'>
-                <h2 className='flex items-center gap-2 text-lg font-semibold'>
-                  <Brain size={19} />
-                  技能版本
-                </h2>
-                <p className='text-sm text-default-500'>新版本只对新 Thread 生效。</p>
-              </div>
-              <div className='grid gap-3 border-b border-default-200 p-5 md:grid-cols-2'>
-                <input
-                  value={skillDraft.name}
-                  onChange={event =>
-                    setSkillDraft(value => ({ ...value, name: event.target.value }))}
-                  placeholder='skill-name（小写字母、数字、连字符）'
-                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2'
-                />
-                <input
-                  value={skillDraft.description}
-                  onChange={event =>
-                    setSkillDraft(value => ({ ...value, description: event.target.value }))}
-                  placeholder='简单描述'
-                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2'
-                />
-                <textarea
-                  value={skillDraft.instructions}
-                  onChange={event =>
-                    setSkillDraft(value => ({ ...value, instructions: event.target.value }))}
-                  placeholder='声明式操作说明；不允许脚本、依赖安装或权限绕过'
-                  className='min-h-28 rounded-xl border border-default-200 bg-default-50 px-3 py-2 md:col-span-2'
-                />
-                <input
-                  value={skillDraft.tools}
-                  onChange={event =>
-                    setSkillDraft(value => ({ ...value, tools: event.target.value }))}
-                  placeholder='引用的已注册 Tool，逗号分隔'
-                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2'
-                />
-                <Action
-                  disabled={
-                  !skillDraft.name.trim() ||
-                  !skillDraft.description.trim() ||
-                  !skillDraft.instructions.trim()
-                }
-                  onClick={createSkill}
-                >
-                  创建 Skill 版本
-                </Action>
-              </div>
-              <div className='divide-y divide-default-200'>
-                {skills.map(item => (
-                  <div key={item.id} className='p-4'>
-                    <div className='flex items-start justify-between gap-3'>
+            </aside>
+            <div className='min-w-0'>
+              {memoryEditorOpen
+                ? (
+                  <div className='mx-auto max-w-3xl p-5 md:p-8'>
+                    <div className='mb-6 flex items-start justify-between gap-3'>
                       <div>
-                        <h3 className='font-semibold'>{item.name}</h3>
-                        <p className='mt-1 text-sm text-default-500'>{item.description}</p>
-                        <p className='mt-2 text-xs text-default-400'>
-                          active {item.activeVersionId || 'none'} · {date(item.updatedAt)}
-                        </p>
+                        <div className='text-xs font-medium uppercase tracking-[0.18em] text-primary'>
+                          New memory
+                        </div>
+                        <h3 className='mt-2 text-xl font-semibold'>记录一条长期事实</h3>
                       </div>
+                      <button
+                        type='button'
+                        onClick={() => setMemoryEditorOpen(false)}
+                        className='rounded-lg p-2 text-default-400 hover:bg-default-100'
+                        aria-label='关闭记忆编辑器'
+                      >
+                        <X size={18} />
+                      </button>
+                    </div>
+                    <div className='grid gap-4 md:grid-cols-2'>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        作用域
+                        <select
+                          value={memoryDraft.scope}
+                          onChange={event =>
+                            setMemoryDraft(value => ({ ...value, scope: event.target.value }))}
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        >
+                          <option value='user'>用户</option>
+                          <option value='group'>群组</option>
+                          <option value='global'>全局</option>
+                        </select>
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        作用域标识
+                        <input
+                          value={memoryDraft.scopeKey}
+                          onChange={event =>
+                            setMemoryDraft(value => ({ ...value, scopeKey: event.target.value }))}
+                          placeholder='例如 web-admin'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium md:col-span-2'>
+                        记忆内容
+                        <textarea
+                          value={memoryDraft.content}
+                          onChange={event =>
+                            setMemoryDraft(value => ({ ...value, content: event.target.value }))}
+                          placeholder='只写入未来对话仍然有帮助的稳定信息'
+                          className='min-h-56 resize-y rounded-xl border border-default-200 bg-default-50 px-3 py-3 leading-6'
+                        />
+                        <span className='text-right font-mono text-xs text-default-400'>
+                          {memoryDraft.content.length}/2000
+                        </span>
+                      </label>
+                    </div>
+                    <div className='mt-6 flex justify-end gap-2'>
+                      <Action onClick={() => setMemoryEditorOpen(false)}>取消</Action>
                       <Action
+                        disabled={
+                        !memoryDraft.content.trim() ||
+                        !memoryDraft.scopeKey.trim() ||
+                        memoryDraft.content.length > 2000
+                      }
                         onClick={async () => {
-                          await agentRequest.setSkillState(item.id, !item.enabled)
-                          setSkills(await agentRequest.skills())
+                          await createMemory()
+                          setMemoryEditorOpen(false)
                         }}
                       >
-                        {item.enabled ? '禁用' : '启用'}
+                        保存记忆
                       </Action>
                     </div>
-                    <Action
-                      onClick={async () => {
-                        const versions = await agentRequest.skillVersions(item.id)
-                        const selected = window.prompt(
-                        `输入要回滚的 version id：\n${versions.map(value => `${value.id} (v${value.version})`).join('\n')}`
-                        )
-                        if (!selected) return
-                        await agentRequest.rollbackSkill(item.id, selected)
-                        setSkills(await agentRequest.skills())
-                      }}
-                    >
-                      回滚版本
-                    </Action>
                   </div>
-                ))}
+                )
+                : selectedMemory
+                  ? (
+                    <div className='flex h-full min-h-[520px] flex-col'>
+                      <div className='border-b border-default-200 p-5 md:p-7'>
+                        <div className='flex flex-wrap items-start justify-between gap-4'>
+                          <div>
+                            <div className='flex flex-wrap items-center gap-2'>
+                              <span className='rounded-full bg-primary-50 px-2.5 py-1 font-mono text-xs text-primary'>
+                                {selectedMemory.scope}:{selectedMemory.scopeKey}
+                              </span>
+                              <span
+                                className={`rounded-full px-2.5 py-1 text-xs ${
+                              selectedMemory.enabled
+                                ? 'bg-success-50 text-success-700'
+                                : 'bg-default-100 text-default-500'
+                            }`}
+                              >
+                                {selectedMemory.enabled ? '已启用' : '已禁用'}
+                              </span>
+                            </div>
+                            <p className='mt-3 text-xs text-default-400'>
+                              创建于 {date(selectedMemory.createdAt)}
+                            </p>
+                          </div>
+                          <div className='flex gap-2'>
+                            <Action
+                              onClick={async () => {
+                                await agentRequest.setMemoryState(
+                                  selectedMemory.id,
+                                  !selectedMemory.enabled
+                                )
+                                setMemories(await agentRequest.memories())
+                              }}
+                            >
+                              {selectedMemory.enabled ? '禁用' : '启用'}
+                            </Action>
+                            <Action
+                              danger
+                              onClick={async () => {
+                                if (!window.confirm('永久删除此条长期记忆？此操作不可恢复。')) return
+                                await agentRequest.deleteMemory(selectedMemory.id)
+                                setMemories(await agentRequest.memories())
+                              }}
+                            >
+                              <Trash2 size={15} />
+                              删除
+                            </Action>
+                          </div>
+                        </div>
+                      </div>
+                      <article className='karin-scrollbar flex-1 overflow-y-auto p-5 md:p-8'>
+                        <div className='max-w-3xl whitespace-pre-wrap text-[15px] leading-7'>
+                          {selectedMemory.content}
+                        </div>
+                      </article>
+                    </div>
+                  )
+                  : (
+                    <div className='grid min-h-[520px] place-items-center p-8 text-center text-sm text-default-400'>
+                      选择一条记忆查看详情，或新建第一条记忆。
+                    </div>
+                  )}
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      {tab === 'skills' && (
+        <Panel className='overflow-hidden'>
+          <div className='flex flex-wrap items-center justify-between gap-4 border-b border-default-200 px-5 py-4'>
+            <div>
+              <div className='flex items-center gap-2'>
+                <Brain className='text-primary' size={19} />
+                <h2 className='text-lg font-semibold'>技能库</h2>
+                <span className='rounded-full bg-default-100 px-2 py-0.5 font-mono text-xs'>
+                  {skills.filter(item => item.enabled).length}/{skills.length}
+                </span>
               </div>
-            </Panel>
-          )}
-        </div>
+              <p className='mt-1 text-sm text-default-500'>
+                声明式技能按版本保存；新版本只进入新会话的技能快照。
+              </p>
+            </div>
+            <Action onClick={openNewSkill}>
+              <Plus size={16} />
+              新建 Skill
+            </Action>
+          </div>
+          <div className='grid min-h-[640px] xl:grid-cols-[360px_minmax(0,1fr)]'>
+            <aside className='border-b border-default-200 bg-default-50/40 xl:border-b-0 xl:border-r'>
+              <div className='border-b border-default-200 p-4'>
+                <label className='flex items-center gap-2 rounded-xl border border-default-200 bg-content1 px-3 py-2'>
+                  <Search className='text-default-400' size={16} />
+                  <input
+                    value={skillQuery}
+                    onChange={event => setSkillQuery(event.target.value)}
+                    placeholder='搜索技能名称或描述'
+                    className='min-w-0 flex-1 bg-transparent text-sm outline-none'
+                  />
+                </label>
+              </div>
+              <div className='karin-scrollbar max-h-[560px] space-y-1 overflow-y-auto p-2'>
+                {filteredSkills.map(item => (
+                  <button
+                    key={item.id}
+                    type='button'
+                    onClick={() => {
+                      setSelectedSkillId(item.id)
+                      setSkillEditorOpen(false)
+                    }}
+                    className={`relative w-full overflow-hidden rounded-xl px-4 py-3 text-left transition ${
+                      selectedSkill?.id === item.id && !skillEditorOpen
+                        ? 'bg-content1 shadow-sm'
+                        : 'hover:bg-content1/70'
+                    }`}
+                  >
+                    {selectedSkill?.id === item.id && !skillEditorOpen && (
+                      <span className='absolute inset-y-2 left-0 w-0.5 rounded-full bg-primary' />
+                    )}
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='truncate font-semibold'>{item.name}</span>
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          item.enabled ? 'bg-success' : 'bg-default-300'
+                        }`}
+                      />
+                    </div>
+                    <p className='mt-1 line-clamp-2 text-xs leading-5 text-default-500'>
+                      {item.description}
+                    </p>
+                    <div className='mt-2 flex items-center justify-between font-mono text-[10px] text-default-400'>
+                      <span>{item.activeVersionId || 'no active version'}</span>
+                      <ChevronRight size={13} />
+                    </div>
+                  </button>
+                ))}
+                {!filteredSkills.length && (
+                  <div className='p-8 text-center text-sm text-default-400'>没有匹配的技能。</div>
+                )}
+              </div>
+            </aside>
+            <div className='min-w-0'>
+              {skillEditorOpen
+                ? (
+                  <div className='mx-auto max-w-3xl p-5 md:p-8'>
+                    <div className='mb-6 flex items-start justify-between gap-3'>
+                      <div>
+                        <div className='text-xs font-medium uppercase tracking-[0.18em] text-primary'>
+                          Declarative workflow
+                        </div>
+                        <h3 className='mt-2 text-xl font-semibold'>
+                          {editingSkillId ? '编辑 Skill 并创建新版本' : '创建 Skill'}
+                        </h3>
+                        <p className='mt-1 text-sm text-default-500'>
+                          不允许脚本、依赖安装、密钥或权限绕过指令。
+                        </p>
+                      </div>
+                      <button
+                        type='button'
+                        onClick={() => setSkillEditorOpen(false)}
+                        className='rounded-lg p-2 text-default-400 hover:bg-default-100'
+                        aria-label='关闭 Skill 编辑器'
+                      >
+                        <X size={18} />
+                      </button>
+                    </div>
+                    <div className='grid gap-4 md:grid-cols-2'>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        Skill 名称
+                        <input
+                          value={skillDraft.name}
+                          onChange={event =>
+                            setSkillDraft(value => ({ ...value, name: event.target.value }))}
+                          placeholder='skill-name'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        简短描述
+                        <input
+                          value={skillDraft.description}
+                          onChange={event =>
+                            setSkillDraft(value => ({ ...value, description: event.target.value }))}
+                          placeholder='何时以及为什么使用'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium md:col-span-2'>
+                        操作说明
+                        <textarea
+                          value={skillDraft.instructions}
+                          onChange={event =>
+                            setSkillDraft(value => ({ ...value, instructions: event.target.value }))}
+                          placeholder='按步骤描述可复用工作流'
+                          className='min-h-64 resize-y rounded-xl border border-default-200 bg-default-50 px-3 py-3 font-mono text-sm leading-6'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium md:col-span-2'>
+                        可用 Tools
+                        <input
+                          value={skillDraft.tools}
+                          onChange={event =>
+                            setSkillDraft(value => ({ ...value, tools: event.target.value }))}
+                          placeholder='karin.tool.one, karin.tool.two'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                        />
+                      </label>
+                      <section className='grid gap-3 md:col-span-2'>
+                        <div className='flex flex-wrap items-center justify-between gap-3'>
+                          <div>
+                            <h4 className='font-semibold'>Python Script Tools</h4>
+                            <p className='mt-1 text-xs leading-5 text-default-500'>
+                              仅允许受控标准库和纯计算；业务语义、停止条件与失败策略均为必填。
+                            </p>
+                          </div>
+                          <Action
+                            onClick={() =>
+                              setSkillDraft(value => ({
+                                ...value,
+                                scriptTools: [...value.scriptTools, emptyScriptTool()],
+                              }))}
+                          >
+                            <Plus size={14} />
+                            添加脚本
+                          </Action>
+                        </div>
+                        {skillDraft.scriptTools.map((script, index) => (
+                          <div
+                            key={`${script.id}-${index}`}
+                            className='grid gap-3 rounded-2xl border border-default-200 bg-default-50/60 p-4 md:grid-cols-2'
+                          >
+                            <div className='flex items-center justify-between md:col-span-2'>
+                              <span className='font-mono text-xs text-primary'>
+                                script {index + 1}
+                              </span>
+                              <Action
+                                danger
+                                onClick={() =>
+                                  setSkillDraft(value => ({
+                                    ...value,
+                                    scriptTools: value.scriptTools.filter(
+                                      (_item, itemIndex) => itemIndex !== index
+                                    ),
+                                  }))}
+                              >
+                                <Trash2 size={14} />
+                                移除
+                              </Action>
+                            </div>
+                            <label className='grid gap-1 text-xs text-default-500'>
+                              稳定 ID
+                              <input
+                                value={script.id}
+                                onChange={event =>
+                                  updateScriptTool(index, { id: event.target.value })}
+                                placeholder='normalize_data'
+                                className='rounded-xl border border-default-200 bg-background p-2 font-mono text-sm'
+                              />
+                            </label>
+                            <label className='grid gap-1 text-xs text-default-500'>
+                              名称
+                              <input
+                                value={script.name}
+                                onChange={event =>
+                                  updateScriptTool(index, { name: event.target.value })}
+                                placeholder='规范化数据'
+                                className='rounded-xl border border-default-200 bg-background p-2 text-sm'
+                              />
+                            </label>
+                            <label className='grid gap-1 text-xs text-default-500 md:col-span-2'>
+                              描述
+                              <input
+                                value={script.description}
+                                onChange={event =>
+                                  updateScriptTool(index, { description: event.target.value })}
+                                placeholder='说明模型何时调用这个 Tool'
+                                className='rounded-xl border border-default-200 bg-background p-2 text-sm'
+                              />
+                            </label>
+                            <label className='grid gap-1 text-xs text-default-500 md:col-span-2'>
+                              Python 源码
+                              <textarea
+                                value={script.source}
+                                onChange={event =>
+                                  updateScriptTool(index, { source: event.target.value })}
+                                className='min-h-52 resize-y rounded-xl border border-default-200 bg-background p-3 font-mono text-xs leading-5'
+                              />
+                            </label>
+                            <label className='grid gap-1 text-xs text-default-500'>
+                              Input JSON Schema
+                              <textarea
+                                value={script.inputSchema}
+                                onChange={event =>
+                                  updateScriptTool(index, { inputSchema: event.target.value })}
+                                className='min-h-36 resize-y rounded-xl border border-default-200 bg-background p-2 font-mono text-xs'
+                              />
+                            </label>
+                            <label className='grid gap-1 text-xs text-default-500'>
+                              Output JSON Schema（可选）
+                              <textarea
+                                value={script.outputSchema}
+                                onChange={event =>
+                                  updateScriptTool(index, { outputSchema: event.target.value })}
+                                className='min-h-36 resize-y rounded-xl border border-default-200 bg-background p-2 font-mono text-xs'
+                              />
+                            </label>
+                            {[
+                              ['业务目标', 'objective', script.objective],
+                              ['输入语义', 'inputs', script.inputs],
+                              ['输出语义', 'outputs', script.outputs],
+                              ['完成条件', 'completionCondition', script.completionCondition],
+                              ['失败提示', 'userMessage', script.userMessage],
+                            ].map(([label, key, value]) => (
+                              <label
+                                key={key}
+                                className='grid gap-1 text-xs text-default-500'
+                              >
+                                {label}
+                                <textarea
+                                  value={String(value)}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      [key]: event.target.value,
+                                    } as Partial<ScriptToolDraft>)}
+                                  className='min-h-20 resize-y rounded-xl border border-default-200 bg-background p-2 text-sm'
+                                />
+                              </label>
+                            ))}
+                            <div className='grid gap-3 md:col-span-2 md:grid-cols-4'>
+                              <label className='grid gap-1 text-xs text-default-500'>
+                                超时（ms）
+                                <input
+                                  type='number'
+                                  min={1000}
+                                  max={120000}
+                                  value={script.timeoutMs}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      timeoutMs: Number(event.target.value),
+                                    })}
+                                  className='rounded-xl border border-default-200 bg-background p-2 text-sm'
+                                />
+                              </label>
+                              <label className='grid gap-1 text-xs text-default-500'>
+                                最大输出（bytes）
+                                <input
+                                  type='number'
+                                  min={1024}
+                                  max={1048576}
+                                  value={script.maxOutputBytes}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      maxOutputBytes: Number(event.target.value),
+                                    })}
+                                  className='rounded-xl border border-default-200 bg-background p-2 text-sm'
+                                />
+                              </label>
+                              <label className='grid gap-1 text-xs text-default-500'>
+                                失败策略
+                                <select
+                                  value={script.strategy}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      strategy: event.target.value as 'fail' | 'retry',
+                                    })}
+                                  className='rounded-xl border border-default-200 bg-background p-2 text-sm'
+                                >
+                                  <option value='fail'>立即失败</option>
+                                  <option value='retry'>有限重试</option>
+                                </select>
+                              </label>
+                              <label className='grid gap-1 text-xs text-default-500'>
+                                最大尝试
+                                <input
+                                  type='number'
+                                  min={1}
+                                  max={3}
+                                  disabled={script.strategy === 'fail'}
+                                  value={script.strategy === 'fail' ? 1 : script.maxAttempts}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      maxAttempts: Number(event.target.value),
+                                    })}
+                                  className='rounded-xl border border-default-200 bg-background p-2 text-sm'
+                                />
+                              </label>
+                            </div>
+                            <div className='flex flex-wrap items-center gap-4 md:col-span-2'>
+                              <label className='flex items-center gap-2 text-sm'>
+                                <input
+                                  type='checkbox'
+                                  checked={script.idempotent}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      idempotent: event.target.checked,
+                                    })}
+                                />
+                                幂等脚本
+                              </label>
+                              <label className='flex items-center gap-2 text-xs text-default-500'>
+                                重试间隔（ms）
+                                <input
+                                  type='number'
+                                  min={0}
+                                  max={10000}
+                                  disabled={script.strategy === 'fail'}
+                                  value={script.retryDelayMs}
+                                  onChange={event =>
+                                    updateScriptTool(index, {
+                                      retryDelayMs: Number(event.target.value),
+                                    })}
+                                  className='w-28 rounded-xl border border-default-200 bg-background p-2 text-sm'
+                                />
+                              </label>
+                              <span className='text-xs text-default-400'>
+                                副作用固定为空；第一版不允许网络、持久化文件或子进程。
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </section>
+                    </div>
+                    <div className='mt-6 flex justify-end gap-2'>
+                      <Action onClick={() => setSkillEditorOpen(false)}>取消</Action>
+                      <Action
+                        disabled={
+                        !skillDraft.name.trim() ||
+                        !skillDraft.description.trim() ||
+                        !skillDraft.instructions.trim() ||
+                        !scriptToolsComplete(skillDraft.scriptTools)
+                      }
+                        onClick={saveSkill}
+                      >
+                        保存新版本
+                      </Action>
+                    </div>
+                  </div>
+                )
+                : selectedSkill
+                  ? (
+                    <div className='flex h-full min-h-[520px] flex-col'>
+                      <div className='border-b border-default-200 p-5 md:p-7'>
+                        <div className='flex flex-wrap items-start justify-between gap-4'>
+                          <div className='min-w-0'>
+                            <div className='flex flex-wrap items-center gap-2'>
+                              <span className='rounded-full bg-primary-50 px-2.5 py-1 font-mono text-xs text-primary'>
+                                {selectedSkill.activeVersionId || '未激活'}
+                              </span>
+                              <span
+                                className={`rounded-full px-2.5 py-1 text-xs ${
+                              selectedSkill.enabled
+                                ? 'bg-success-50 text-success-700'
+                                : 'bg-default-100 text-default-500'
+                            }`}
+                              >
+                                {selectedSkill.enabled ? '已启用' : '已禁用'}
+                              </span>
+                            </div>
+                            <h3 className='mt-3 text-2xl font-semibold tracking-tight'>
+                              {selectedSkill.name}
+                            </h3>
+                            <p className='mt-2 max-w-2xl text-sm leading-6 text-default-500'>
+                              {selectedSkill.description}
+                            </p>
+                          </div>
+                          <div className='flex flex-wrap gap-2'>
+                            <Action onClick={() => openSkillEditor(selectedSkill)}>
+                              <Pencil size={15} />
+                              编辑
+                            </Action>
+                            <Action
+                              onClick={async () => {
+                                await agentRequest.setSkillState(
+                                  selectedSkill.id,
+                                  !selectedSkill.enabled
+                                )
+                                setSkills(await agentRequest.skills())
+                              }}
+                            >
+                              {selectedSkill.enabled ? '禁用技能' : '启用技能'}
+                            </Action>
+                            <Action danger onClick={() => deleteSkill(selectedSkill)}>
+                              <Trash2 size={15} />
+                              永久删除
+                            </Action>
+                          </div>
+                        </div>
+                      </div>
+                      <div className='karin-scrollbar grid flex-1 gap-5 overflow-y-auto p-5 md:p-7 lg:grid-cols-[minmax(0,1fr)_280px]'>
+                        <section>
+                          <div className='mb-3 flex items-center gap-2'>
+                            <BookOpen size={16} />
+                            <h4 className='font-semibold'>版本记录</h4>
+                          </div>
+                          <div className='space-y-2'>
+                            {skillVersions.map(version => {
+                              const versionId = String(version.id || '')
+                              const active = versionId === selectedSkill.activeVersionId
+                              return (
+                                <div
+                                  key={versionId}
+                                  className={`rounded-xl border p-4 ${
+                                active
+                                  ? 'border-primary-200 bg-primary-50/50'
+                                  : 'border-default-200'
+                              }`}
+                                >
+                                  <div className='flex flex-wrap items-center justify-between gap-3'>
+                                    <div>
+                                      <div className='flex items-center gap-2'>
+                                        <span className='font-mono text-sm font-semibold'>
+                                          v{String(version.version || '?')}
+                                        </span>
+                                        {active && (
+                                          <span className='rounded-full bg-primary px-2 py-0.5 text-[10px] text-primary-foreground'>
+                                            当前
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className='mt-1 font-mono text-[10px] text-default-400'>
+                                        {versionId}
+                                      </p>
+                                    </div>
+                                    {!active && (
+                                      <Action
+                                        onClick={async () => {
+                                          if (!window.confirm(`回滚到 v${String(version.version)}？`)) { return }
+                                          await agentRequest.rollbackSkill(selectedSkill.id, versionId)
+                                          setSkills(await agentRequest.skills())
+                                          setSkillVersions(
+                                            await agentRequest.skillVersions(selectedSkill.id)
+                                          )
+                                        }}
+                                      >
+                                        回滚到此版本
+                                      </Action>
+                                    )}
+                                  </div>
+                                  <p className='mt-3 text-xs text-default-400'>
+                                    {date(Number(version.created_at))}
+                                  </p>
+                                </div>
+                              )
+                            })}
+                            {!skillVersions.length && (
+                              <div className='rounded-xl border border-dashed border-default-200 p-6 text-center text-sm text-default-400'>
+                                暂无版本记录。
+                              </div>
+                            )}
+                          </div>
+                        </section>
+                        <aside className='space-y-3'>
+                          <h4 className='font-semibold'>使用情况</h4>
+                          {[
+                            ['调用', Number(skillUsage?.use_count || 0)],
+                            ['成功', Number(skillUsage?.success_count || 0)],
+                            ['失败', Number(skillUsage?.failure_count || 0)],
+                            ['纠正', Number(skillUsage?.correction_count || 0)],
+                          ].map(([label, value]) => (
+                            <div key={String(label)} className='rounded-xl bg-default-50 p-3'>
+                              <div className='text-xs text-default-400'>{label}</div>
+                              <div className='mt-1 font-mono text-xl font-semibold'>{value}</div>
+                            </div>
+                          ))}
+                          <p className='text-xs text-default-400'>
+                            最近使用 {date(Number(skillUsage?.last_used_at || 0))}
+                          </p>
+                        </aside>
+                      </div>
+                    </div>
+                  )
+                  : (
+                    <div className='grid min-h-[520px] place-items-center p-8 text-center text-sm text-default-400'>
+                      选择一个技能查看版本与使用情况，或创建第一个 Skill。
+                    </div>
+                  )}
+            </div>
+          </div>
+        </Panel>
       )}
 
       {tab === 'tasks' && (
-        <div className='grid gap-5'>
-          <Panel>
-            <div className='border-b border-default-200 p-5'>
-              <h2 className='text-lg font-semibold'>持久化自动任务</h2>
-            </div>
-            <div className='grid gap-3 p-5'>
-              <select
-                value={jobDraft.scheduleType}
-                onChange={event =>
-                  setJobDraft(value => ({
-                    ...value,
-                    scheduleType: event.target.value as 'cron' | 'once',
-                  }))}
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2'
-              >
-                <option value='cron'>Cron 周期</option>
-                <option value='once'>一次性时间</option>
-              </select>
-              <input
-                value={jobDraft.name}
-                onChange={event =>
-                  setJobDraft(value => ({ ...value, name: event.target.value }))}
-                placeholder='任务名称'
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-              />
-              {jobDraft.scheduleType === 'cron'
-                ? (
-                  <input
-                    value={jobDraft.cron}
-                    onChange={event =>
-                      setJobDraft(value => ({ ...value, cron: event.target.value }))}
-                    placeholder='Cron 表达式'
-                    className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-                  />
-                )
-                : (
-                  <input
-                    type='datetime-local'
-                    value={jobDraft.runAt}
-                    onChange={event =>
-                      setJobDraft(value => ({ ...value, runAt: event.target.value }))}
-                    className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-                  />
-                )}
-              <input
-                value={jobDraft.timezone}
-                onChange={event =>
-                  setJobDraft(value => ({ ...value, timezone: event.target.value }))}
-                placeholder='时区，例如 Asia/Shanghai'
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-              />
-              <input
-                value={jobDraft.target}
-                onChange={event =>
-                  setJobDraft(value => ({ ...value, target: event.target.value }))}
-                placeholder='投递目标'
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-              />
-              <textarea
-                value={jobDraft.prompt}
-                onChange={event => setJobDraft(value => ({ ...value, prompt: event.target.value }))}
-                placeholder='每次运行的 Prompt'
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-              />
-              <input
-                value={jobDraft.toolAllowlist}
-                onChange={event =>
-                  setJobDraft(value => ({ ...value, toolAllowlist: event.target.value }))}
-                placeholder='预授权 Tool，逗号分隔'
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-              />
-              <input
-                value={jobDraft.skillIds}
-                onChange={event =>
-                  setJobDraft(value => ({ ...value, skillIds: event.target.value }))}
-                placeholder='附加 Skill ID，逗号分隔'
-                className='rounded-xl border border-default-200 bg-default-50 px-3 py-2 outline-none focus:border-primary'
-              />
-              <Action onClick={saveJob}>保存任务</Action>
-            </div>
-            <div className='divide-y divide-default-200'>
-              {jobs.map(item => (
-                <div key={item.id} className='flex items-center justify-between gap-3 p-4'>
-                  <div>
-                    <h3 className='font-semibold'>{item.name}</h3>
-                    <p className='text-sm text-default-500'>
-                      {item.scheduleType === 'once' ? date(item.runAt) : item.cron} · {item.timezone} · {item.target}
-                    </p>
-                    <p className='text-xs text-default-400'>上次运行 {date(item.lastRunAt)}</p>
-                  </div>
-                  <Action
-                    danger
-                    onClick={async () => {
-                      if (!window.confirm('永久删除此自动任务？')) return
-                      await agentRequest.deleteJob(item.id)
-                      setJobs(await agentRequest.jobs())
-                    }}
-                  >
-                    <Trash2 size={15} />
-                    删除
-                  </Action>
-                  <Action
-                    onClick={async () => {
-                      await agentRequest.setJobState(item.id, !item.enabled)
-                      setJobs(await agentRequest.jobs())
-                    }}
-                  >
-                    {item.enabled ? '暂停' : '恢复'}
-                  </Action>
-                  <Action
-                    onClick={async () => {
-                      await agentRequest.runJob(item.id)
-                      setJobs(await agentRequest.jobs())
-                      setJobRuns(await agentRequest.jobRuns())
-                      toast.success('任务已运行')
-                    }}
-                  >
-                    立即运行
-                  </Action>
-                </div>
-              ))}
-            </div>
-            <div className='border-t border-default-200 p-5'>
-              <h3 className='mb-3 font-semibold'>最近运行</h3>
-              <div className='grid gap-2'>
-                {jobRuns.slice(0, 20).map(item => (
-                  <div
-                    key={String(item.id)}
-                    className='flex flex-wrap items-center justify-between gap-2 rounded-xl bg-default-50 p-3 text-sm'
-                  >
-                    <span className='font-mono text-xs'>{String(item.job_id)}</span>
-                    <span>{String(item.status)}</span>
-                    <span className='text-default-400'>{date(Number(item.started_at))}</span>
-                    {item.error ? <span className='text-danger'>{String(item.error)}</span> : null}
-                  </div>
-                ))}
+        <Panel className='overflow-hidden'>
+          <div className='grid border-b border-default-200 sm:grid-cols-[minmax(0,1fr)_repeat(3,auto)]'>
+            <div className='p-5'>
+              <div className='flex items-center gap-2'>
+                <Clock3 className='text-primary' size={19} />
+                <h2 className='text-lg font-semibold'>定时任务</h2>
               </div>
+              <p className='mt-1 text-sm text-default-500'>
+                周期任务和一次性提醒由 Core 持久化，并投递到指定会话。
+              </p>
             </div>
-          </Panel>
-          <Panel>
-            <div className='flex items-center justify-between border-b border-default-200 p-5'>
+            {[
+              ['运行中', jobs.filter(item => item.enabled).length],
+              ['已暂停', jobs.filter(item => !item.enabled).length],
+              ['运行记录', jobRuns.length],
+            ].map(([label, value]) => (
+              <div
+                key={String(label)}
+                className='hidden min-w-28 border-l border-default-200 px-5 py-4 sm:block'
+              >
+                <div className='text-xs text-default-400'>{label}</div>
+                <div className='mt-1 font-mono text-2xl font-semibold'>{value}</div>
+              </div>
+            ))}
+          </div>
+          <div className='grid min-h-[680px] xl:grid-cols-[380px_minmax(0,1fr)]'>
+            <aside className='border-b border-default-200 bg-default-50/40 xl:border-b-0 xl:border-r'>
+              <div className='space-y-3 border-b border-default-200 p-4'>
+                <Action onClick={openNewJob}>
+                  <Plus size={16} />
+                  新建任务
+                </Action>
+                <label className='flex items-center gap-2 rounded-xl border border-default-200 bg-content1 px-3 py-2'>
+                  <Search className='text-default-400' size={16} />
+                  <input
+                    value={taskQuery}
+                    onChange={event => setTaskQuery(event.target.value)}
+                    placeholder='搜索名称、Prompt 或目标'
+                    className='min-w-0 flex-1 bg-transparent text-sm outline-none'
+                  />
+                </label>
+              </div>
+              <div className='karin-scrollbar max-h-[570px] space-y-1 overflow-y-auto p-2'>
+                {filteredJobs.map(item => (
+                  <button
+                    key={item.id}
+                    type='button'
+                    onClick={() => {
+                      setSelectedJobId(item.id)
+                      setTaskEditorOpen(false)
+                    }}
+                    className={`relative w-full overflow-hidden rounded-xl px-4 py-3 text-left transition ${
+                      selectedJob?.id === item.id && !taskEditorOpen
+                        ? 'bg-content1 shadow-sm'
+                        : 'hover:bg-content1/70'
+                    }`}
+                  >
+                    {selectedJob?.id === item.id && !taskEditorOpen && (
+                      <span className='absolute inset-y-2 left-0 w-0.5 rounded-full bg-primary' />
+                    )}
+                    <div className='flex items-center justify-between gap-3'>
+                      <span className='truncate font-semibold'>{item.name}</span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] ${
+                          item.enabled
+                            ? 'bg-success-50 text-success-700'
+                            : 'bg-default-100 text-default-500'
+                        }`}
+                      >
+                        {item.enabled ? '运行中' : '已暂停'}
+                      </span>
+                    </div>
+                    <div className='mt-2 font-mono text-xs text-default-500'>
+                      {item.scheduleType === 'once' ? date(item.runAt) : item.cron}
+                    </div>
+                    <div className='mt-2 flex items-center justify-between text-[11px] text-default-400'>
+                      <span className='truncate'>{item.target}</span>
+                      <span>上次 {date(item.lastRunAt)}</span>
+                    </div>
+                  </button>
+                ))}
+                {!filteredJobs.length && (
+                  <div className='p-8 text-center text-sm text-default-400'>没有匹配的任务。</div>
+                )}
+              </div>
+            </aside>
+            <div className='min-w-0'>
+              {taskEditorOpen
+                ? (
+                  <div className='mx-auto max-w-3xl p-5 md:p-8'>
+                    <div className='mb-6 flex items-start justify-between gap-3'>
+                      <div>
+                        <div className='text-xs font-medium uppercase tracking-[0.18em] text-primary'>
+                          {editingJobId ? 'Edit schedule' : 'New schedule'}
+                        </div>
+                        <h3 className='mt-2 text-xl font-semibold'>
+                          {editingJobId ? '编辑自动任务' : '创建自动任务'}
+                        </h3>
+                      </div>
+                      <button
+                        type='button'
+                        onClick={() => setTaskEditorOpen(false)}
+                        className='rounded-lg p-2 text-default-400 hover:bg-default-100'
+                        aria-label='关闭任务编辑器'
+                      >
+                        <X size={18} />
+                      </button>
+                    </div>
+                    <div className='grid gap-4 md:grid-cols-2'>
+                      <label className='grid gap-1.5 text-sm font-medium md:col-span-2'>
+                        任务名称
+                        <input
+                          value={jobDraft.name}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, name: event.target.value }))}
+                          placeholder='例如 每日工作摘要'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        计划类型
+                        <select
+                          value={jobDraft.scheduleType}
+                          onChange={event =>
+                            setJobDraft(value => ({
+                              ...value,
+                              scheduleType: event.target.value as 'cron' | 'once',
+                            }))}
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        >
+                          <option value='cron'>Cron 周期</option>
+                          <option value='once'>一次性时间</option>
+                        </select>
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        {jobDraft.scheduleType === 'cron' ? 'Cron 表达式' : '运行时间'}
+                        {jobDraft.scheduleType === 'cron'
+                          ? (
+                            <input
+                              value={jobDraft.cron}
+                              onChange={event =>
+                                setJobDraft(value => ({ ...value, cron: event.target.value }))}
+                              placeholder='0 9 * * *'
+                              className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono'
+                            />
+                          )
+                          : (
+                            <input
+                              type='datetime-local'
+                              value={jobDraft.runAt}
+                              onChange={event =>
+                                setJobDraft(value => ({ ...value, runAt: event.target.value }))}
+                              className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono'
+                            />
+                          )}
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        时区
+                        <input
+                          value={jobDraft.timezone}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, timezone: event.target.value }))}
+                          placeholder='Asia/Shanghai'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        投递目标
+                        <input
+                          value={jobDraft.target}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, target: event.target.value }))}
+                          placeholder='web 或渠道会话目标'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium md:col-span-2'>
+                        运行 Prompt
+                        <textarea
+                          value={jobDraft.prompt}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, prompt: event.target.value }))}
+                          placeholder='描述每次运行时 Agent 要完成的任务'
+                          className='min-h-40 resize-y rounded-xl border border-default-200 bg-default-50 px-3 py-3 leading-6'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        预授权 Tools
+                        <input
+                          value={jobDraft.toolAllowlist}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, toolAllowlist: event.target.value }))}
+                          placeholder='逗号分隔'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        附加 Skill ID
+                        <input
+                          value={jobDraft.skillIds}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, skillIds: event.target.value }))}
+                          placeholder='逗号分隔'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                        />
+                      </label>
+                    </div>
+                    <div className='mt-6 flex justify-end gap-2'>
+                      <Action onClick={() => setTaskEditorOpen(false)}>取消</Action>
+                      <Action
+                        disabled={
+                        !jobDraft.name.trim() ||
+                        !jobDraft.prompt.trim() ||
+                        !jobDraft.target.trim() ||
+                        (jobDraft.scheduleType === 'cron' ? !jobDraft.cron.trim() : !jobDraft.runAt)
+                      }
+                        onClick={saveJob}
+                      >
+                        {editingJobId ? '保存修改' : '创建任务'}
+                      </Action>
+                    </div>
+                  </div>
+                )
+                : selectedJob
+                  ? (
+                    <div className='flex h-full min-h-[560px] flex-col'>
+                      <div className='border-b border-default-200 p-5 md:p-7'>
+                        <div className='flex flex-wrap items-start justify-between gap-4'>
+                          <div className='min-w-0'>
+                            <div className='flex flex-wrap items-center gap-2'>
+                              <span
+                                className={`rounded-full px-2.5 py-1 text-xs ${
+                              selectedJob.enabled
+                                ? 'bg-success-50 text-success-700'
+                                : 'bg-default-100 text-default-500'
+                            }`}
+                              >
+                                {selectedJob.enabled ? '运行中' : '已暂停'}
+                              </span>
+                              <span className='rounded-full bg-primary-50 px-2.5 py-1 font-mono text-xs text-primary'>
+                                {selectedJob.scheduleType === 'once' ? 'ONCE' : 'CRON'}
+                              </span>
+                            </div>
+                            <h3 className='mt-3 text-2xl font-semibold tracking-tight'>
+                              {selectedJob.name}
+                            </h3>
+                            <p className='mt-2 font-mono text-sm text-default-500'>
+                              {selectedJob.scheduleType === 'once'
+                                ? date(selectedJob.runAt)
+                                : selectedJob.cron}
+                              {' · '}
+                              {selectedJob.timezone}
+                            </p>
+                          </div>
+                          <div className='flex flex-wrap gap-2'>
+                            <Action onClick={() => openJobEditor(selectedJob)}>
+                              <Pencil size={15} />
+                              编辑
+                            </Action>
+                            <Action
+                              onClick={async () => {
+                                await agentRequest.setJobState(selectedJob.id, !selectedJob.enabled)
+                                setJobs(await agentRequest.jobs())
+                              }}
+                            >
+                              {selectedJob.enabled
+                                ? (
+                                  <>
+                                    <Pause size={15} />
+                                    暂停
+                                  </>
+                                )
+                                : (
+                                  <>
+                                    <Play size={15} />
+                                    恢复
+                                  </>
+                                )}
+                            </Action>
+                            <Action
+                              onClick={async () => {
+                                await agentRequest.runJob(selectedJob.id)
+                                setJobs(await agentRequest.jobs())
+                                setJobRuns(await agentRequest.jobRuns())
+                                toast.success('任务已运行')
+                              }}
+                            >
+                              <Play size={15} />
+                              立即运行
+                            </Action>
+                            <Action
+                              danger
+                              onClick={async () => {
+                                if (!window.confirm('永久删除此自动任务？')) return
+                                await agentRequest.deleteJob(selectedJob.id)
+                                setJobs(await agentRequest.jobs())
+                              }}
+                            >
+                              <Trash2 size={15} />
+                            </Action>
+                          </div>
+                        </div>
+                      </div>
+                      <div className='karin-scrollbar flex-1 overflow-y-auto p-5 md:p-7'>
+                        <div className='grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]'>
+                          <div className='space-y-5'>
+                            <section>
+                              <h4 className='mb-2 text-sm font-semibold'>运行指令</h4>
+                              <div className='whitespace-pre-wrap rounded-xl bg-default-50 p-4 text-sm leading-6'>
+                                {selectedJob.prompt}
+                              </div>
+                            </section>
+                            <section>
+                              <h4 className='mb-2 text-sm font-semibold'>最近运行</h4>
+                              <div className='space-y-2'>
+                                {selectedJobRuns.slice(0, 20).map(run => (
+                                  <div
+                                    key={String(run.id)}
+                                    className='rounded-xl border border-default-200 p-3'
+                                  >
+                                    <div className='flex flex-wrap items-center justify-between gap-2'>
+                                      <span className='font-mono text-xs font-semibold'>
+                                        {String(run.status)}
+                                      </span>
+                                      <span className='text-xs text-default-400'>
+                                        {date(Number(run.started_at))}
+                                      </span>
+                                    </div>
+                                    {Boolean(run.error) && (
+                                      <p className='mt-2 text-xs text-danger'>{String(run.error)}</p>
+                                    )}
+                                  </div>
+                                ))}
+                                {!selectedJobRuns.length && (
+                                  <div className='rounded-xl border border-dashed border-default-200 p-6 text-center text-sm text-default-400'>
+                                    此任务还没有运行记录。
+                                  </div>
+                                )}
+                              </div>
+                            </section>
+                          </div>
+                          <aside className='space-y-3'>
+                            {[
+                              ['投递目标', selectedJob.target],
+                              ['上次运行', date(selectedJob.lastRunAt)],
+                              ['预授权 Tools', selectedJob.toolAllowlist.join(', ') || '无'],
+                              ['附加 Skills', selectedJob.skillIds.join(', ') || '无'],
+                            ].map(([label, value]) => (
+                              <div key={label} className='rounded-xl bg-default-50 p-3'>
+                                <div className='text-xs text-default-400'>{label}</div>
+                                <div className='mt-1 break-words font-mono text-xs leading-5'>
+                                  {value}
+                                </div>
+                              </div>
+                            ))}
+                          </aside>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                  : (
+                    <div className='grid min-h-[560px] place-items-center p-8 text-center text-sm text-default-400'>
+                      选择一个任务查看详情，或创建第一个自动任务。
+                    </div>
+                  )}
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      {tab === 'mcp' && (
+        <Panel className='overflow-hidden'>
+          <div className='grid border-b border-default-200 sm:grid-cols-[minmax(0,1fr)_repeat(3,auto)]'>
+            <div className='flex flex-wrap items-center justify-between gap-4 p-5'>
               <div>
-                <h2 className='flex items-center gap-2 text-lg font-semibold'>
-                  <Network size={19} />
-                  MCP Client
-                </h2>
-                <p className='text-sm text-default-500'>
-                  stdio 与 Streamable HTTP；默认 external 风险。
+                <div className='flex items-center gap-2'>
+                  <Network className='text-primary' size={19} />
+                  <h2 className='text-lg font-semibold'>MCP 服务</h2>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-xs ${
+                      agentConfig?.mcp.enabled
+                        ? 'bg-success-50 text-success-700'
+                        : 'bg-default-100 text-default-500'
+                    }`}
+                  >
+                    {agentConfig?.mcp.enabled ? 'Client 已启用' : 'Client 已关闭'}
+                  </span>
+                </div>
+                <p className='mt-1 text-sm text-default-500'>
+                  管理 stdio 与 Streamable HTTP 服务；所有远程 Tool 至少按 external 风险审批。
                 </p>
               </div>
-              <Action onClick={async () => setMcp(await agentRequest.reloadMcp())}>
-                <RefreshCw size={16} />
-                重新连接
-              </Action>
+              <label className='flex items-center gap-2 rounded-xl border border-default-200 px-3 py-2 text-sm'>
+                <input
+                  type='checkbox'
+                  checked={Boolean(agentConfig?.mcp.enabled)}
+                  onChange={event => {
+                    if (!agentConfig) return
+                    setAgentConfig({
+                      ...agentConfig,
+                      mcp: { ...agentConfig.mcp, enabled: event.target.checked },
+                    })
+                  }}
+                />
+                启用 MCP Client
+              </label>
             </div>
-            <div className='divide-y divide-default-200'>
-              {mcp.map((item, index) => (
-                <div key={index} className='p-4'>
-                  <div className='flex items-center justify-between'>
-                    <span className='font-semibold'>{String(item.name)}</span>
-                    <span
-                      className={`rounded-full px-2 py-1 text-xs ${
-                        item.connected
-                          ? 'bg-success-100 text-success-700'
-                          : 'bg-danger-100 text-danger-700'
+            {[
+              ['服务', mcpServers.length],
+              ['在线', mcp.filter(item => item.connected).length],
+              [
+                'Tools',
+                mcp.reduce(
+                  (total, item) => total + (Array.isArray(item.tools) ? item.tools.length : 0),
+                  0
+                ),
+              ],
+            ].map(([label, value]) => (
+              <div
+                key={String(label)}
+                className='hidden min-w-24 border-l border-default-200 px-5 py-4 sm:block'
+              >
+                <div className='text-xs text-default-400'>{label}</div>
+                <div className='mt-1 font-mono text-2xl font-semibold'>{value}</div>
+              </div>
+            ))}
+          </div>
+          <div className='grid min-h-[680px] xl:grid-cols-[380px_minmax(0,1fr)]'>
+            <aside className='border-b border-default-200 bg-default-50/40 xl:border-b-0 xl:border-r'>
+              <div className='space-y-3 border-b border-default-200 p-4'>
+                <div className='flex flex-wrap gap-2'>
+                  <Action onClick={addMcpServer}>
+                    <Plus size={16} />
+                    新增服务
+                  </Action>
+                  <Action onClick={saveMcp}>
+                    <RefreshCw size={15} />
+                    保存并重连
+                  </Action>
+                </div>
+                <label className='flex items-center gap-2 rounded-xl border border-default-200 bg-content1 px-3 py-2'>
+                  <Search className='text-default-400' size={16} />
+                  <input
+                    value={mcpQuery}
+                    onChange={event => setMcpQuery(event.target.value)}
+                    placeholder='搜索服务、传输或地址'
+                    className='min-w-0 flex-1 bg-transparent text-sm outline-none'
+                  />
+                </label>
+              </div>
+              <div className='karin-scrollbar max-h-[570px] space-y-1 overflow-y-auto p-2'>
+                {filteredMcpServers.map(server => {
+                  const serverStatus = mcp.find(item => String(item.name) === server.name)
+                  const connected = Boolean(serverStatus?.connected)
+                  return (
+                    <button
+                      key={server.name}
+                      type='button'
+                      onClick={() => setSelectedMcpName(server.name)}
+                      className={`relative w-full overflow-hidden rounded-xl px-4 py-3 text-left transition ${
+                        selectedMcp?.name === server.name
+                          ? 'bg-content1 shadow-sm'
+                          : 'hover:bg-content1/70'
                       }`}
                     >
-                      {item.connected ? 'connected' : 'offline'}
-                    </span>
+                      {selectedMcp?.name === server.name && (
+                        <span className='absolute inset-y-2 left-0 w-0.5 rounded-full bg-primary' />
+                      )}
+                      <div className='flex items-center justify-between gap-3'>
+                        <span className='truncate font-semibold'>{server.name}</span>
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[10px] ${
+                            connected
+                              ? 'bg-success-50 text-success-700'
+                              : server.enabled
+                                ? 'bg-danger-50 text-danger'
+                                : 'bg-default-100 text-default-500'
+                          }`}
+                        >
+                          {connected ? '在线' : server.enabled ? '离线' : '已禁用'}
+                        </span>
+                      </div>
+                      <div className='mt-2 flex items-center gap-2'>
+                        <span className='rounded bg-default-100 px-1.5 py-0.5 font-mono text-[10px] uppercase'>
+                          {server.transport}
+                        </span>
+                        <span className='truncate font-mono text-[11px] text-default-400'>
+                          {server.transport === 'http'
+                            ? server.url || '尚未配置 URL'
+                            : server.command || '尚未配置 Command'}
+                        </span>
+                      </div>
+                      <div className='mt-2 text-[11px] text-default-400'>
+                        {Array.isArray(serverStatus?.tools) ? serverStatus.tools.length : 0} 个
+                        Tools
+                      </div>
+                    </button>
+                  )
+                })}
+                {!filteredMcpServers.length && (
+                  <div className='p-8 text-center text-sm text-default-400'>
+                    还没有 MCP 服务。新增一个服务开始连接。
                   </div>
-                  <pre className='mt-3 overflow-auto rounded-xl bg-default-50 p-3 text-xs'>
-                    {JSON.stringify(item, null, 2)}
-                  </pre>
-                </div>
-              ))}
+                )}
+              </div>
+            </aside>
+            <div className='min-w-0'>
+              {selectedMcp && selectedMcpIndex >= 0
+                ? (
+                  <div className='flex h-full min-h-[560px] flex-col'>
+                    <div className='border-b border-default-200 p-5 md:p-7'>
+                      <div className='flex flex-wrap items-start justify-between gap-4'>
+                        <div>
+                          <div className='flex flex-wrap items-center gap-2'>
+                            <span
+                              className={`rounded-full px-2.5 py-1 text-xs ${
+                              selectedMcpStatus?.connected
+                                ? 'bg-success-50 text-success-700'
+                                : 'bg-danger-50 text-danger'
+                            }`}
+                            >
+                              {selectedMcpStatus?.connected ? '已连接' : '未连接'}
+                            </span>
+                            <span className='rounded-full bg-primary-50 px-2.5 py-1 font-mono text-xs uppercase text-primary'>
+                              {selectedMcp.transport}
+                            </span>
+                          </div>
+                          <h3 className='mt-3 text-2xl font-semibold tracking-tight'>
+                            {selectedMcp.name}
+                          </h3>
+                          <p className='mt-2 text-sm text-default-500'>
+                            {Array.isArray(selectedMcpStatus?.tools)
+                              ? `${selectedMcpStatus.tools.length} 个远程 Tool 已注册`
+                              : '等待 Tool 发现'}
+                          </p>
+                        </div>
+                        <div className='flex flex-wrap gap-2'>
+                          <Action onClick={saveMcp}>保存并重连</Action>
+                          <Action
+                            danger
+                            onClick={() => {
+                              if (!window.confirm(`删除 MCP 服务“${selectedMcp.name}”？`)) return
+                              setAgentConfig({
+                                ...agentConfig!,
+                                mcp: {
+                                  ...agentConfig!.mcp,
+                                  servers: agentConfig!.mcp.servers.filter(
+                                    (_, index) => index !== selectedMcpIndex
+                                  ),
+                                },
+                              })
+                            }}
+                          >
+                            <Trash2 size={15} />
+                            删除
+                          </Action>
+                        </div>
+                      </div>
+                      {Boolean(selectedMcpStatus?.error) && (
+                        <div className='mt-4 rounded-xl border border-danger-200 bg-danger-50 p-3 text-sm text-danger'>
+                          {String(selectedMcpStatus?.error)}
+                        </div>
+                      )}
+                    </div>
+                    <div className='karin-scrollbar grid flex-1 gap-6 overflow-y-auto p-5 md:p-7 lg:grid-cols-[minmax(0,1fr)_320px]'>
+                      <section className='space-y-4'>
+                        <div className='grid gap-4 md:grid-cols-2'>
+                          <label className='grid gap-1.5 text-sm font-medium'>
+                            服务名称
+                            <input
+                              value={selectedMcp.name}
+                              onChange={event =>
+                                updateMcpServer(selectedMcpIndex, { name: event.target.value })}
+                              className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                            />
+                          </label>
+                          <label className='grid gap-1.5 text-sm font-medium'>
+                            传输方式
+                            <select
+                              value={selectedMcp.transport}
+                              onChange={event =>
+                                updateMcpServer(selectedMcpIndex, {
+                                  transport: event.target.value as 'stdio' | 'http',
+                                })}
+                              className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                            >
+                              <option value='http'>Streamable HTTP</option>
+                              <option value='stdio'>stdio</option>
+                            </select>
+                          </label>
+                        </div>
+                        <label className='flex items-center justify-between rounded-xl border border-default-200 p-3'>
+                          <span>
+                            <span className='block text-sm font-medium'>启用此服务</span>
+                            <span className='text-xs text-default-400'>
+                              保存后重新建立连接并发现 Tools
+                            </span>
+                          </span>
+                          <input
+                            type='checkbox'
+                            checked={selectedMcp.enabled}
+                            onChange={event =>
+                              updateMcpServer(selectedMcpIndex, { enabled: event.target.checked })}
+                          />
+                        </label>
+                        {selectedMcp.transport === 'http'
+                          ? (
+                            <>
+                              <label className='grid gap-1.5 text-sm font-medium'>
+                                Streamable HTTP URL
+                                <input
+                                  value={selectedMcp.url || ''}
+                                  onChange={event =>
+                                    updateMcpServer(selectedMcpIndex, { url: event.target.value })}
+                                  placeholder='https://example.com/mcp'
+                                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                                />
+                              </label>
+                              <label className='grid gap-1.5 text-sm font-medium'>
+                                HTTP Headers
+                                <textarea
+                                  value={recordLines(selectedMcp.headers)}
+                                  onChange={event =>
+                                    updateMcpServer(selectedMcpIndex, {
+                                      headers: linesRecord(event.target.value),
+                                    })}
+                                  placeholder={mcpHeaderExample}
+                                  className='min-h-32 resize-y rounded-xl border border-default-200 bg-default-50 px-3 py-3 font-mono text-sm'
+                                />
+                                <span className='text-xs font-normal text-default-400'>
+                                  每行 KEY=VALUE；敏感值必须通过 {environmentReference} 引用环境变量。
+                                </span>
+                              </label>
+                            </>
+                          )
+                          : (
+                            <>
+                              <label className='grid gap-1.5 text-sm font-medium'>
+                                Command
+                                <input
+                                  value={selectedMcp.command || ''}
+                                  onChange={event =>
+                                    updateMcpServer(selectedMcpIndex, {
+                                      command: event.target.value,
+                                    })}
+                                  placeholder='npx'
+                                  className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                                />
+                              </label>
+                              <div className='grid gap-4 md:grid-cols-2'>
+                                <label className='grid gap-1.5 text-sm font-medium'>
+                                  Arguments
+                                  <input
+                                    value={(selectedMcp.args || []).join(', ')}
+                                    onChange={event =>
+                                      updateMcpServer(selectedMcpIndex, {
+                                        args: event.target.value
+                                          .split(',')
+                                          .map(value => value.trim())
+                                          .filter(Boolean),
+                                      })}
+                                    placeholder='-y, @scope/server'
+                                    className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                                  />
+                                </label>
+                                <label className='grid gap-1.5 text-sm font-medium'>
+                                  Working directory
+                                  <input
+                                    value={selectedMcp.cwd || ''}
+                                    onChange={event =>
+                                      updateMcpServer(selectedMcpIndex, { cwd: event.target.value })}
+                                    placeholder='可选'
+                                    className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono text-sm'
+                                  />
+                                </label>
+                              </div>
+                              <label className='grid gap-1.5 text-sm font-medium'>
+                                环境变量
+                                <textarea
+                                  value={recordLines(selectedMcp.env)}
+                                  onChange={event =>
+                                    updateMcpServer(selectedMcpIndex, {
+                                      env: linesRecord(event.target.value),
+                                    })}
+                                  placeholder={mcpEnvExample}
+                                  className='min-h-32 resize-y rounded-xl border border-default-200 bg-default-50 px-3 py-3 font-mono text-sm'
+                                />
+                                <span className='text-xs font-normal text-default-400'>
+                                  每行 KEY={environmentReference}；不得在配置中写入真实凭据。
+                                </span>
+                              </label>
+                            </>
+                          )}
+                      </section>
+                      <aside>
+                        <div className='mb-3 flex items-center gap-2'>
+                          <Server size={16} />
+                          <h4 className='font-semibold'>已发现 Tools</h4>
+                        </div>
+                        <div className='space-y-2'>
+                          {(Array.isArray(selectedMcpStatus?.tools)
+                            ? selectedMcpStatus.tools
+                            : []
+                          ).map(tool => (
+                            <div
+                              key={String(tool)}
+                              className='rounded-xl border border-default-200 bg-default-50 p-3 font-mono text-xs'
+                            >
+                              {String(tool)}
+                            </div>
+                          ))}
+                          {!Array.isArray(selectedMcpStatus?.tools) ||
+                        !selectedMcpStatus.tools.length
+                            ? (
+                              <div className='rounded-xl border border-dashed border-default-200 p-6 text-center text-sm text-default-400'>
+                                连接成功后会在这里显示远程 Tools。
+                              </div>
+                            )
+                            : null}
+                        </div>
+                      </aside>
+                    </div>
+                  </div>
+                )
+                : (
+                  <div className='grid min-h-[560px] place-items-center p-8 text-center text-sm text-default-400'>
+                    选择一个 MCP 服务查看连接与 Tool 状态，或新增第一个服务。
+                  </div>
+                )}
             </div>
-          </Panel>
+          </div>
+        </Panel>
+      )}
+
+      {tab === 'evolution' && (
+        <div className='grid gap-5'>
+          <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+            {[
+              {
+                label: '累计经验',
+                value: Object.values(evolutionOverview?.outcomes || {}).reduce(
+                  (total, count) => total + count,
+                  0
+                ),
+                note: `${evolutionOverview?.outcomes.completed || 0} 次完成`,
+              },
+              {
+                label: '等待验证',
+                value:
+                  (evolutionOverview?.candidates.draft || 0) +
+                  (evolutionOverview?.candidates.ready || 0),
+                note: '候选不会直接污染运行时',
+              },
+              {
+                label: '用户纠正',
+                value: evolutionOverview?.feedback.corrected || 0,
+                note: `共 ${evolutionOverview?.feedback.total || 0} 条反馈`,
+              },
+              {
+                label: '已生效改进',
+                value: evolutionOverview?.candidates.active || 0,
+                note: `${evolutionOverview?.candidates.rolled_back || 0} 次回滚`,
+              },
+            ].map(item => (
+              <Panel key={item.label} className='relative overflow-hidden p-4'>
+                <div className='absolute inset-y-4 left-0 w-0.5 rounded-full bg-primary' />
+                <div className='text-xs font-medium text-default-400'>{item.label}</div>
+                <div className='mt-2 font-mono text-3xl font-semibold tracking-tight'>
+                  {item.value}
+                </div>
+                <div className='mt-1 text-xs text-default-500'>{item.note}</div>
+              </Panel>
+            ))}
+          </div>
+
+          <div className='grid min-h-[620px] gap-4 xl:grid-cols-[360px_minmax(0,1fr)]'>
+            <Panel className='flex min-h-0 flex-col overflow-hidden'>
+              <div className='border-b border-default-200 p-4'>
+                <div className='flex items-center justify-between gap-3'>
+                  <div>
+                    <h2 className='font-semibold'>进化候选</h2>
+                    <p className='mt-1 text-xs text-default-500'>
+                      真实轨迹产生，评测后按风险分级晋升。
+                    </p>
+                  </div>
+                  <Action onClick={refresh}>
+                    <RefreshCw size={15} />
+                  </Action>
+                </div>
+              </div>
+              <div className='karin-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3'>
+                {evolutionCandidates.map(candidate => (
+                  <button
+                    key={candidate.id}
+                    type='button'
+                    onClick={() => {
+                      setSelectedEvolutionId(candidate.id)
+                      setRepairArtifact('')
+                    }}
+                    className={`w-full rounded-xl border p-3 text-left transition-colors ${
+                      selectedEvolution?.id === candidate.id
+                        ? 'border-primary bg-primary-50 dark:bg-primary-500/10'
+                        : 'border-transparent bg-default-50 hover:border-default-200'
+                    }`}
+                  >
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='truncate text-sm font-semibold'>{candidate.summary}</span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${
+                          candidate.state === 'active'
+                            ? 'bg-success-100 text-success-700'
+                            : candidate.state === 'rejected' || candidate.state === 'rolled_back'
+                              ? 'bg-danger-50 text-danger'
+                              : 'bg-warning-50 text-warning-700'
+                        }`}
+                      >
+                        {candidate.state}
+                      </span>
+                    </div>
+                    <div className='mt-2 flex items-center gap-2 font-mono text-[10px] text-default-400'>
+                      <span>{candidate.target}</span>
+                      <span>·</span>
+                      <span>{candidate.kind}</span>
+                      <span>·</span>
+                      <span>{candidate.sourceTurnIds.length} evidence</span>
+                    </div>
+                  </button>
+                ))}
+                {!evolutionCandidates.length && (
+                  <div className='rounded-xl border border-dashed border-default-200 p-6 text-center text-sm text-default-400'>
+                    完成任务或提交纠正后，候选会显示在这里。
+                  </div>
+                )}
+              </div>
+            </Panel>
+
+            <Panel className='min-w-0 overflow-hidden'>
+              {selectedEvolution
+                ? (
+                  <div className='flex h-full min-h-0 flex-col'>
+                    <div className='flex flex-wrap items-start justify-between gap-3 border-b border-default-200 p-5'>
+                      <div className='min-w-0'>
+                        <div className='mb-2 flex flex-wrap items-center gap-2'>
+                          <span className='rounded-full bg-primary-50 px-2 py-1 text-xs font-medium text-primary'>
+                            {selectedEvolution.target}
+                          </span>
+                          <span className='rounded-full bg-default-100 px-2 py-1 font-mono text-xs'>
+                            {selectedEvolution.candidateVersion}
+                          </span>
+                        </div>
+                        <h2 className='text-lg font-semibold'>{selectedEvolution.summary}</h2>
+                        <p className='mt-1 text-xs text-default-400'>
+                          创建于 {date(selectedEvolution.createdAt)} · 最近更新{' '}
+                          {date(selectedEvolution.updatedAt)}
+                        </p>
+                      </div>
+                      <div className='flex flex-wrap gap-2'>
+                        {selectedEvolution.kind === 'declarative' &&
+                        ['draft', 'rejected'].includes(selectedEvolution.state) && (
+                          <Action onClick={() => runEvolutionAction(selectedEvolution, 'evaluate')}>
+                            重新评测
+                          </Action>
+                        )}
+                        {selectedEvolution.kind === 'declarative' &&
+                        selectedEvolution.state === 'ready' && (
+                          <>
+                            <Action onClick={() => runEvolutionAction(selectedEvolution, 'promote')}>
+                              晋升
+                            </Action>
+                            <Action
+                              danger
+                              onClick={() => runEvolutionAction(selectedEvolution, 'reject')}
+                            >
+                              拒绝
+                            </Action>
+                          </>
+                        )}
+                        {selectedEvolution.kind === 'executable' &&
+                        !['rejected', 'rolled_back'].includes(selectedEvolution.state) && (
+                          <>
+                            {selectedEvolution.payload.patchHash && (
+                              <Action onClick={() => reviewRepairArtifact(selectedEvolution)}>
+                                查看 Diff
+                              </Action>
+                            )}
+                            {selectedEvolution.state === 'ready' &&
+                            selectedEvolution.payload.patchHash && (
+                              <Action onClick={() => applyRepairCandidate(selectedEvolution)}>
+                                批准并应用
+                              </Action>
+                            )}
+                            {selectedEvolution.state === 'active' &&
+                            selectedEvolution.payload.patchHash && (
+                              <Action
+                                danger
+                                onClick={() => rollbackRepairCandidate(selectedEvolution)}
+                              >
+                                回滚修复
+                              </Action>
+                            )}
+                            {selectedEvolution.state !== 'active' && (
+                              <Action
+                                danger
+                                onClick={() => runEvolutionAction(selectedEvolution, 'reject')}
+                              >
+                                拒绝候选
+                              </Action>
+                            )}
+                          </>
+                        )}
+                        {selectedEvolution.state === 'active' && (
+                          <Action
+                            danger
+                            onClick={() => runEvolutionAction(selectedEvolution, 'rollback')}
+                          >
+                            回滚
+                          </Action>
+                        )}
+                      </div>
+                    </div>
+                    <div className='karin-scrollbar grid min-h-0 flex-1 gap-4 overflow-y-auto p-5 lg:grid-cols-2'>
+                      {['tool', 'repair'].includes(selectedEvolution.target) && (
+                        <div className='grid gap-3 rounded-2xl border border-warning-200 bg-warning-50/60 p-4 lg:col-span-2 dark:bg-warning-500/5'>
+                          <div className='flex flex-wrap items-center justify-between gap-2'>
+                            <div>
+                              <h3 className='text-sm font-semibold'>可验证恢复候选</h3>
+                              <p className='mt-1 text-xs text-default-500'>
+                                可执行候选不会自动晋升；补丁、隔离验证和管理员审批全部通过后才能应用。
+                              </p>
+                            </div>
+                            <span className='rounded-full bg-warning-100 px-2.5 py-1 font-mono text-xs text-warning-700'>
+                              {String(selectedEvolution.payload.fingerprint || '').slice(0, 12) ||
+                                'no fingerprint'}
+                            </span>
+                          </div>
+                          <div className='grid gap-3 md:grid-cols-3'>
+                            {[
+                              ['问题', selectedEvolution.payload.problem],
+                              ['根因', selectedEvolution.payload.rootCause],
+                              ['停止条件', selectedEvolution.payload.stopCondition],
+                            ].map(([label, value]) => (
+                              <div
+                                key={String(label)}
+                                className='rounded-xl border border-default-200 bg-background/80 p-3'
+                              >
+                                <div className='text-[11px] font-medium text-default-400'>
+                                  {String(label)}
+                                </div>
+                                <div className='mt-1 text-sm leading-6'>
+                                  {String(value || '尚未生成')}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className='grid gap-3 md:grid-cols-2'>
+                            <div className='rounded-xl border border-default-200 bg-background/80 p-3'>
+                              <div className='text-[11px] font-medium text-default-400'>诊断证据</div>
+                              <div className='mt-2 space-y-1 font-mono text-xs'>
+                                {(Array.isArray(selectedEvolution.payload.evidence)
+                                  ? selectedEvolution.payload.evidence
+                                  : []
+                                ).map((evidence, index) => (
+                                  <div key={`${String(evidence)}-${index}`}>
+                                    {String(evidence)}
+                                  </div>
+                                ))}
+                                {!Array.isArray(selectedEvolution.payload.evidence) && '暂无证据'}
+                              </div>
+                            </div>
+                            <div className='rounded-xl border border-default-200 bg-background/80 p-3'>
+                              <div className='text-[11px] font-medium text-default-400'>补丁与验证</div>
+                              <div className='mt-2 text-xs leading-6 text-default-500'>
+                                {selectedEvolution.payload.patchHash
+                                  ? `补丁 ${String(selectedEvolution.payload.patchHash).slice(0, 16)}`
+                                  : '尚未生成可应用补丁'}
+                                <br />
+                                出现次数：{Number(selectedEvolution.payload.occurrences || 1)}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <div className='space-y-4'>
+                        <div>
+                          <h3 className='mb-2 text-sm font-semibold'>证据与质量门槛</h3>
+                          <div className='grid grid-cols-2 gap-2'>
+                            {[
+                              [
+                                '证据数',
+                                selectedEvolution.metrics?.evidence ??
+                                selectedEvolution.sourceTurnIds.length,
+                              ],
+                              [
+                                '成功率',
+                              `${Math.round((selectedEvolution.metrics?.successRate || 0) * 100)}%`,
+                              ],
+                              [
+                                '回归率',
+                              `${Math.round((selectedEvolution.metrics?.regressionRate || 0) * 100)}%`,
+                              ],
+                              [
+                                '纠正权重',
+                              `${Math.round((selectedEvolution.metrics?.correctionRate || 0) * 100)}%`,
+                              ],
+                            ].map(([label, value]) => (
+                              <div key={String(label)} className='rounded-xl bg-default-50 p-3'>
+                                <div className='text-xs text-default-400'>{label}</div>
+                                <div className='mt-1 font-mono text-lg font-semibold'>{value}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div>
+                          <h3 className='mb-2 text-sm font-semibold'>来源 Turn</h3>
+                          <div className='space-y-2'>
+                            {selectedEvolution.sourceTurnIds.map(turnId => (
+                              <div
+                                key={turnId}
+                                className='rounded-lg border border-default-200 bg-default-50 px-3 py-2 font-mono text-xs'
+                              >
+                                {turnId}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                      <div>
+                        <h3 className='mb-2 text-sm font-semibold'>
+                          {repairArtifact ? '受管 Diff' : '候选内容'}
+                        </h3>
+                        <pre className='karin-scrollbar max-h-[520px] overflow-auto rounded-xl bg-[#091419] p-4 font-mono text-xs leading-5 text-[#F3F7F6]'>
+                          {repairArtifact || JSON.stringify(selectedEvolution.payload, null, 2)}
+                        </pre>
+                      </div>
+                    </div>
+                  </div>
+                )
+                : (
+                  <div className='grid h-full min-h-[420px] place-items-center text-sm text-default-400'>
+                    选择一个候选查看评测结果
+                  </div>
+                )}
+            </Panel>
+          </div>
         </div>
       )}
 
@@ -1258,9 +4120,7 @@ export default function AgentDashboard () {
                     type='button'
                     onClick={() => toggleToolset(toolset)}
                     className={`rounded-full px-3 py-1.5 text-xs ${
-                      disabled
-                        ? 'bg-danger-50 text-danger'
-                        : 'bg-success-50 text-success-700'
+                      disabled ? 'bg-danger-50 text-danger' : 'bg-success-50 text-success-700'
                     }`}
                   >
                     {toolset} · {disabled ? '已禁用' : '已启用'}
@@ -1271,7 +4131,10 @@ export default function AgentDashboard () {
           </div>
           <div className='grid gap-3 p-5 lg:grid-cols-2'>
             {tools.map((item, index) => (
-              <details key={String(item.name || index)} className='rounded-2xl border border-default-200 p-4'>
+              <details
+                key={String(item.name || index)}
+                className='rounded-2xl border border-default-200 p-4'
+              >
                 <summary className='cursor-pointer'>
                   <div className='inline-flex flex-wrap items-center gap-2'>
                     <span className='font-semibold'>{String(item.name || '')}</span>
@@ -1316,7 +4179,9 @@ export default function AgentDashboard () {
                     <span className='font-semibold'>
                       {String(item.provider || '')} · {String(item.model || '')}
                     </span>
-                    <span className='text-xs text-default-400'>{Number(item.latency_ms || 0)}ms</span>
+                    <span className='text-xs text-default-400'>
+                      {Number(item.latency_ms || 0)}ms
+                    </span>
                   </div>
                   <p className='mt-1 text-xs text-default-500'>
                     tokens {Number(item.input_tokens || 0)} / {Number(item.output_tokens || 0)}
@@ -1335,7 +4200,9 @@ export default function AgentDashboard () {
                 <div key={index} className='p-4 text-sm'>
                   <div className='font-semibold'>{String(item.action || '')}</div>
                   <div className='mt-1 break-all text-default-500'>{String(item.target || '')}</div>
-                  <div className='mt-2 text-xs text-default-400'>{date(Number(item.created_at))}</div>
+                  <div className='mt-2 text-xs text-default-400'>
+                    {date(Number(item.created_at))}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1385,7 +4252,8 @@ export default function AgentDashboard () {
                       <div className='mb-3 flex items-center justify-between gap-3'>
                         <input
                           value={provider.name}
-                          onChange={event => updateProvider(provider.id, { name: event.target.value })}
+                          onChange={event =>
+                            updateProvider(provider.id, { name: event.target.value })}
                           className='min-w-0 flex-1 bg-transparent font-semibold outline-none'
                           aria-label='Provider 名称'
                         />
@@ -1400,21 +4268,25 @@ export default function AgentDashboard () {
                         </label>
                         <Action
                           danger
-                          onClick={() => setAgentConfig(value => {
-                            if (!value) return value
-                            const providers = value.providers.filter(item => item.id !== provider.id)
-                            const primary = value.routing.primary === provider.id
-                              ? providers[0]?.id || ''
-                              : value.routing.primary
-                            return {
-                              ...value,
-                              providers,
-                              routing: {
-                                primary,
-                                fallback: value.routing.fallback.filter(id => id !== provider.id),
-                              },
-                            }
-                          })}
+                          onClick={() =>
+                            setAgentConfig(value => {
+                              if (!value) return value
+                              const providers = value.providers.filter(
+                                item => item.id !== provider.id
+                              )
+                              const primary =
+                                value.routing.primary === provider.id
+                                  ? providers[0]?.id || ''
+                                  : value.routing.primary
+                              return {
+                                ...value,
+                                providers,
+                                routing: {
+                                  primary,
+                                  fallback: value.routing.fallback.filter(id => id !== provider.id),
+                                },
+                              }
+                            })}
                         >
                           删除
                         </Action>
@@ -1429,14 +4301,17 @@ export default function AgentDashboard () {
                               const preset = providerPresets.find(item => item.kind === kind)
                               updateProvider(provider.id, {
                                 kind,
-                                name: kind === 'custom' ? provider.name : preset?.name || provider.name,
+                                name:
+                                  kind === 'custom' ? provider.name : preset?.name || provider.name,
                                 baseUrl: preset?.baseUrl || provider.baseUrl,
                               })
                             }}
                             className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                           >
                             {providerPresets.map(preset => (
-                              <option key={preset.kind} value={preset.kind}>{preset.name}</option>
+                              <option key={preset.kind} value={preset.kind}>
+                                {preset.name}
+                              </option>
                             ))}
                           </select>
                         </label>
@@ -1467,26 +4342,44 @@ export default function AgentDashboard () {
                                 apiKey: event.target.value,
                                 clearApiKey: false,
                               })}
-                            placeholder={provider.apiKeyConfigured ? '已配置（留空保留）' : '未配置'}
+                            placeholder={
+                              provider.apiKeyConfigured ? '已配置（留空保留）' : '未配置'
+                            }
                             className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                             autoComplete='new-password'
                           />
                         </label>
                         <label className='text-xs text-default-500'>
                           模型
-                          <input
-                            list={`models-${provider.id}`}
-                            value={provider.model}
-                            onChange={event =>
-                              updateProvider(provider.id, { model: event.target.value })}
-                            placeholder='自由填写模型名称'
-                            className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
-                          />
-                          <datalist id={`models-${provider.id}`}>
-                            {(providerModels[provider.id] || []).map(model => (
-                              <option key={model} value={model} />
-                            ))}
-                          </datalist>
+                          {(providerModels[provider.id] || []).length
+                            ? (
+                              <select
+                                value={provider.model}
+                                onChange={event =>
+                                  updateProvider(provider.id, { model: event.target.value })}
+                                className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                              >
+                                {!provider.model && <option value=''>请选择模型</option>}
+                                {provider.model &&
+                                  !providerModels[provider.id]?.includes(provider.model) && (
+                                    <option value={provider.model}>
+                                      {provider.model}（当前配置，发现结果未返回）
+                                    </option>
+                                )}
+                                {providerModels[provider.id].map(model => (
+                                  <option key={model} value={model}>{model}</option>
+                                ))}
+                              </select>
+                            )
+                            : (
+                              <input
+                                value={provider.model}
+                                onChange={event =>
+                                  updateProvider(provider.id, { model: event.target.value })}
+                                placeholder='自由填写模型名称'
+                                className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                              />
+                            )}
                         </label>
                         <label className='text-xs text-default-500'>
                           超时（ms）
@@ -1512,6 +4405,25 @@ export default function AgentDashboard () {
                           />
                           保存时清除 API Key
                         </label>
+                        <label className='flex items-center gap-2 self-end pb-2 text-xs text-default-500'>
+                          <input
+                            type='checkbox'
+                            disabled={!provider.model}
+                            checked={Boolean(
+                              provider.model &&
+                              provider.visionModels?.includes(provider.model)
+                            )}
+                            onChange={event => {
+                              const current = new Set(provider.visionModels || [])
+                              if (event.target.checked) current.add(provider.model)
+                              else current.delete(provider.model)
+                              updateProvider(provider.id, {
+                                visionModels: [...current].filter(Boolean).sort(),
+                              })
+                            }}
+                          />
+                          当前模型支持图片理解
+                        </label>
                       </div>
                       <div className='mt-3 flex flex-wrap gap-2'>
                         <Action
@@ -1536,14 +4448,17 @@ export default function AgentDashboard () {
                     主 Provider
                     <select
                       value={agentConfig.routing.primary}
-                      onChange={event => setAgentConfig({
-                        ...agentConfig,
-                        routing: { ...agentConfig.routing, primary: event.target.value },
-                      })}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          routing: { ...agentConfig.routing, primary: event.target.value },
+                        })}
                       className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     >
                       {agentConfig.providers.map(provider => (
-                        <option key={provider.id} value={provider.id}>{provider.name}</option>
+                        <option key={provider.id} value={provider.id}>
+                          {provider.name}
+                        </option>
                       ))}
                     </select>
                   </label>
@@ -1551,13 +4466,17 @@ export default function AgentDashboard () {
                     Fallback 顺序（逗号分隔 ID）
                     <input
                       value={agentConfig.routing.fallback.join(', ')}
-                      onChange={event => setAgentConfig({
-                        ...agentConfig,
-                        routing: {
-                          ...agentConfig.routing,
-                          fallback: event.target.value.split(',').map(value => value.trim()).filter(Boolean),
-                        },
-                      })}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          routing: {
+                            ...agentConfig.routing,
+                            fallback: event.target.value
+                              .split(',')
+                              .map(value => value.trim())
+                              .filter(Boolean),
+                          },
+                        })}
                       className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     />
                   </label>
@@ -1565,18 +4484,21 @@ export default function AgentDashboard () {
 
                 <div className='grid gap-4 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
                   <h3 className='md:col-span-2 font-semibold'>触发与学习</h3>
-                  {([
-                    ['private', '未匹配私聊自动触发'],
-                    ['groupMention', '群聊 @机器人触发'],
-                  ] as const).map(([key, label]) => (
+                  {(
+                    [
+                      ['private', '未匹配私聊自动触发'],
+                      ['groupMention', '群聊 @机器人触发'],
+                    ] as const
+                  ).map(([key, label]) => (
                     <label key={key} className='flex items-center gap-2 text-sm'>
                       <input
                         type='checkbox'
                         checked={agentConfig.trigger[key]}
-                        onChange={event => setAgentConfig({
-                          ...agentConfig,
-                          trigger: { ...agentConfig.trigger, [key]: event.target.checked },
-                        })}
+                        onChange={event =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            trigger: { ...agentConfig.trigger, [key]: event.target.checked },
+                          })}
                       />
                       {label}
                     </label>
@@ -1585,71 +4507,367 @@ export default function AgentDashboard () {
                     群聊唤醒词（逗号分隔）
                     <input
                       value={agentConfig.trigger.wakeWords.join(', ')}
-                      onChange={event => setAgentConfig({
-                        ...agentConfig,
-                        trigger: {
-                          ...agentConfig.trigger,
-                          wakeWords: event.target.value.split(',').map(value => value.trim()).filter(Boolean),
-                        },
-                      })}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          trigger: {
+                            ...agentConfig.trigger,
+                            wakeWords: event.target.value
+                              .split(',')
+                              .map(value => value.trim())
+                              .filter(Boolean),
+                          },
+                        })}
                       className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     />
                   </label>
-                  {([
-                    ['memory', '自动记忆'],
-                    ['skills', '自动技能学习'],
-                  ] as const).map(([key, label]) => (
+                  {(
+                    [
+                      ['memory', '自动记忆'],
+                      ['skills', '自动技能学习'],
+                    ] as const
+                  ).map(([key, label]) => (
                     <label key={key} className='flex items-center gap-2 text-sm'>
                       <input
                         type='checkbox'
                         checked={agentConfig.learning[key]}
-                        onChange={event => setAgentConfig({
-                          ...agentConfig,
-                          learning: { ...agentConfig.learning, [key]: event.target.checked },
-                        })}
+                        onChange={event =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            learning: { ...agentConfig.learning, [key]: event.target.checked },
+                          })}
                       />
                       {label}
                     </label>
                   ))}
+                  <label className='flex items-center gap-2 text-sm'>
+                    <input
+                      type='checkbox'
+                      checked={agentConfig.learning.reflection.enabled}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          learning: {
+                            ...agentConfig.learning,
+                            reflection: {
+                              ...agentConfig.learning.reflection,
+                              enabled: event.target.checked,
+                            },
+                          },
+                        })}
+                    />
+                    后台反思
+                  </label>
+                  <label className='flex items-center gap-2 text-sm'>
+                    <input
+                      type='checkbox'
+                      checked={agentConfig.learning.curator.enabled}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          learning: {
+                            ...agentConfig.learning,
+                            curator: {
+                              ...agentConfig.learning.curator,
+                              enabled: event.target.checked,
+                            },
+                          },
+                        })}
+                    />
+                    Skill Curator
+                  </label>
+                  <label className='text-xs text-default-500'>
+                    成功反思间隔（回合）
+                    <input
+                      type='number'
+                      min={1}
+                      max={100}
+                      value={agentConfig.learning.reflection.successInterval}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          learning: {
+                            ...agentConfig.learning,
+                            reflection: {
+                              ...agentConfig.learning.reflection,
+                              successInterval: Number(event.target.value),
+                            },
+                          },
+                        })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>
+                    Skill 最少证据数
+                    <input
+                      type='number'
+                      min={1}
+                      max={100}
+                      value={agentConfig.learning.promotion.minEvidence}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          learning: {
+                            ...agentConfig.learning,
+                            promotion: {
+                              ...agentConfig.learning.promotion,
+                              minEvidence: Number(event.target.value),
+                            },
+                          },
+                        })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>
+                    Curator 周期（小时）
+                    <input
+                      type='number'
+                      min={1}
+                      value={agentConfig.learning.curator.intervalHours}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          learning: {
+                            ...agentConfig.learning,
+                            curator: {
+                              ...agentConfig.learning.curator,
+                              intervalHours: Number(event.target.value),
+                            },
+                          },
+                        })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <div className='grid grid-cols-1 gap-2 rounded-xl bg-default-50 p-3 text-xs md:col-span-2 md:grid-cols-2'>
+                    {(
+                      [
+                        ['autoMemory', '记忆验证后自动生效'],
+                        ['autoRouting', '路由策略验证后自动生效'],
+                        ['autoDeclarativeSkills', '声明式 Skill 达标后自动生效'],
+                        ['autoRollback', '指标回退时自动回滚'],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <label key={key} className='flex items-center gap-2'>
+                        <input
+                          type='checkbox'
+                          checked={agentConfig.learning.promotion[key]}
+                          onChange={event =>
+                            setAgentConfig({
+                              ...agentConfig,
+                              learning: {
+                                ...agentConfig.learning,
+                                promotion: {
+                                  ...agentConfig.learning.promotion,
+                                  [key]: event.target.checked,
+                                },
+                              },
+                            })}
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
                 </div>
 
-                <div className='grid gap-3 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
-                  <h3 className='md:col-span-2 font-semibold'>运行限制</h3>
-                  {(Object.keys(agentConfig.limits) as Array<keyof AgentConfig['limits']>).map(key => (
+                <div className='grid gap-4 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
+                  <div className='flex items-start justify-between gap-4 md:col-span-2'>
+                    <div>
+                      <h3 className='font-semibold'>任务恢复闭环</h3>
+                      <p className='mt-1 text-xs text-default-500'>
+                        行动类任务只有通过 Tool 回执验证才会完成；失败时先诊断、再重新召回能力。
+                      </p>
+                    </div>
+                    <label className='flex items-center gap-2 text-sm'>
+                      <input
+                        type='checkbox'
+                        checked={agentConfig.recovery.enabled}
+                        onChange={event =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            recovery: {
+                              ...agentConfig.recovery,
+                              enabled: event.target.checked,
+                            },
+                          })}
+                      />
+                      启用
+                    </label>
+                  </div>
+                  {(
+                    [
+                      ['maxCycles', '最多恢复周期', 0, 5],
+                      ['maxDiagnosticCalls', '诊断 Tool 上限', 1, 32],
+                      ['maxDurationMs', '恢复总时限（毫秒）', 10000, 600000],
+                    ] as const
+                  ).map(([key, label, min, max]) => (
                     <label key={key} className='text-xs text-default-500'>
-                      {key}
+                      {label}
                       <input
                         type='number'
-                        value={agentConfig.limits[key]}
-                        onChange={event => setAgentConfig({
-                          ...agentConfig,
-                          limits: { ...agentConfig.limits, [key]: Number(event.target.value) },
-                        })}
+                        min={min}
+                        max={max}
+                        value={agentConfig.recovery[key]}
+                        onChange={event =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            recovery: {
+                              ...agentConfig.recovery,
+                              [key]: Number(event.target.value),
+                            },
+                          })}
                         className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                       />
                     </label>
                   ))}
+                  <label className='text-xs text-default-500'>
+                    网络检索策略
+                    <select
+                      value={agentConfig.recovery.researchPolicy}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          recovery: {
+                            ...agentConfig.recovery,
+                            researchPolicy: event.target.value as
+                              AgentConfig['recovery']['researchPolicy'],
+                          },
+                        })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    >
+                      <option value='evidence-driven'>证据驱动：本地优先，必要时搜索</option>
+                      <option value='always'>积极搜索</option>
+                      <option value='explicit'>仅明确要求</option>
+                    </select>
+                  </label>
+                  <label className='flex items-center gap-2 rounded-xl bg-default-50 p-3 text-sm'>
+                    <input
+                      type='checkbox'
+                      checked={agentConfig.recovery.repair.requireApproval}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          recovery: {
+                            ...agentConfig.recovery,
+                            repair: {
+                              ...agentConfig.recovery.repair,
+                              requireApproval: event.target.checked,
+                            },
+                          },
+                        })}
+                    />
+                    应用源码修复前必须由管理员审批
+                  </label>
+                </div>
+
+                <div className='grid gap-3 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
+                  <h3 className='md:col-span-2 font-semibold'>运行限制</h3>
+                  {(Object.keys(agentConfig.limits) as Array<keyof AgentConfig['limits']>).map(
+                    key => (
+                      <label key={key} className='text-xs text-default-500'>
+                        {key}
+                        <input
+                          type='number'
+                          value={agentConfig.limits[key]}
+                          onChange={event =>
+                            setAgentConfig({
+                              ...agentConfig,
+                              limits: { ...agentConfig.limits, [key]: Number(event.target.value) },
+                            })}
+                          className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                        />
+                      </label>
+                    )
+                  )}
+                </div>
+
+                <div className='grid gap-3 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
+                  <div className='flex items-start justify-between gap-3 md:col-span-2'>
+                    <div>
+                      <h3 className='font-semibold'>Python Script Runtime</h3>
+                      <p className='mt-1 text-xs text-default-500'>
+                        仅运行管理员审查后的纯计算 Script Tools，不支持依赖安装和系统命令。
+                      </p>
+                    </div>
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-xs ${
+                        status?.scriptRuntime.available
+                          ? 'bg-success-50 text-success-700'
+                          : 'bg-danger-50 text-danger-700'
+                      }`}
+                    >
+                      {status?.scriptRuntime.available ? '可用' : '不可用'}
+                    </span>
+                  </div>
+                  <label className='text-xs text-default-500 md:col-span-2'>
+                    Python 解释器绝对路径（留空自动发现）
+                    <input
+                      value={agentConfig.scriptRuntime.pythonExecutable}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          scriptRuntime: {
+                            ...agentConfig.scriptRuntime,
+                            pythonExecutable: event.target.value,
+                          },
+                        })}
+                      placeholder='C:/Python312/python.exe'
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 font-mono text-sm'
+                    />
+                  </label>
+                  {([
+                    ['defaultTimeoutMs', '默认超时（ms）'],
+                    ['maxTimeoutMs', '最大超时（ms）'],
+                    ['defaultMaxOutputBytes', '默认输出上限（bytes）'],
+                    ['maxOutputBytes', '最大输出上限（bytes）'],
+                  ] as const).map(([key, label]) => (
+                    <label key={key} className='text-xs text-default-500'>
+                      {label}
+                      <input
+                        type='number'
+                        value={agentConfig.scriptRuntime[key]}
+                        onChange={event =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            scriptRuntime: {
+                              ...agentConfig.scriptRuntime,
+                              [key]: Number(event.target.value),
+                            },
+                          })}
+                        className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                      />
+                    </label>
+                  ))}
+                  <div className='rounded-xl bg-default-50 p-3 text-xs text-default-500 md:col-span-2'>
+                    {status?.scriptRuntime.available
+                      ? `${status.scriptRuntime.version || 'Python'} · ${
+                        status.scriptRuntime.executable || '自动发现'
+                      }`
+                      : status?.scriptRuntime.reason || '尚未检测 Python Runtime'}
+                  </div>
                 </div>
 
                 <div className='grid gap-3 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
                   <h3 className='md:col-span-2 font-semibold'>默认风险策略</h3>
-                  {(Object.keys(agentConfig.policy.defaults) as Array<
-                    keyof AgentConfig['policy']['defaults']
-                  >).map(risk => (
+                  {(
+                    Object.keys(agentConfig.policy.defaults) as Array<
+                      keyof AgentConfig['policy']['defaults']
+                    >
+                  ).map(risk => (
                     <label key={risk} className='text-xs text-default-500'>
                       {risk}
                       <select
                         value={agentConfig.policy.defaults[risk]}
-                        onChange={event => setAgentConfig({
-                          ...agentConfig,
-                          policy: {
-                            ...agentConfig.policy,
-                            defaults: {
-                              ...agentConfig.policy.defaults,
-                              [risk]: event.target.value,
+                        onChange={event =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            policy: {
+                              ...agentConfig.policy,
+                              defaults: {
+                                ...agentConfig.policy.defaults,
+                                [risk]: event.target.value,
+                              },
                             },
-                          },
-                        })}
+                          })}
                         className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                       >
                         <option value='allow'>允许</option>
@@ -1662,13 +4880,17 @@ export default function AgentDashboard () {
                     硬拒绝 Tool（每行一个）
                     <textarea
                       value={agentConfig.policy.hardDeny.join('\n')}
-                      onChange={event => setAgentConfig({
-                        ...agentConfig,
-                        policy: {
-                          ...agentConfig.policy,
-                          hardDeny: event.target.value.split('\n').map(value => value.trim()).filter(Boolean),
-                        },
-                      })}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          policy: {
+                            ...agentConfig.policy,
+                            hardDeny: event.target.value
+                              .split('\n')
+                              .map(value => value.trim())
+                              .filter(Boolean),
+                          },
+                        })}
                       className='mt-1 min-h-24 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     />
                   </label>
@@ -1678,26 +4900,32 @@ export default function AgentDashboard () {
                       type='number'
                       min={1000}
                       value={agentConfig.policy.approvalTtlMs}
-                      onChange={event => setAgentConfig({
-                        ...agentConfig,
-                        policy: {
-                          ...agentConfig.policy,
-                          approvalTtlMs: Number(event.target.value),
-                        },
-                      })}
+                      onChange={event =>
+                        setAgentConfig({
+                          ...agentConfig,
+                          policy: {
+                            ...agentConfig.policy,
+                            approvalTtlMs: Number(event.target.value),
+                          },
+                        })}
                       className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     />
                   </label>
                   <div className='space-y-2 md:col-span-2'>
                     <div className='flex items-center justify-between'>
                       <span className='text-xs text-default-500'>Tool 精确/通配规则（按顺序）</span>
-                      <Action onClick={() => setAgentConfig({
-                        ...agentConfig,
-                        policy: {
-                          ...agentConfig.policy,
-                          rules: [...agentConfig.policy.rules, { pattern: '', decision: 'ask' }],
-                        },
-                      })}
+                      <Action
+                        onClick={() =>
+                          setAgentConfig({
+                            ...agentConfig,
+                            policy: {
+                              ...agentConfig.policy,
+                              rules: [
+                                ...agentConfig.policy.rules,
+                                { pattern: '', decision: 'ask' },
+                              ],
+                            },
+                          })}
                       >
                         新增规则
                       </Action>
@@ -1707,32 +4935,34 @@ export default function AgentDashboard () {
                         <input
                           value={rule.pattern}
                           placeholder='plugin.*'
-                          onChange={event => setAgentConfig({
-                            ...agentConfig,
-                            policy: {
-                              ...agentConfig.policy,
-                              rules: agentConfig.policy.rules.map((item, itemIndex) =>
-                                itemIndex === index
-                                  ? { ...item, pattern: event.target.value }
-                                  : item
-                              ),
-                            },
-                          })}
+                          onChange={event =>
+                            setAgentConfig({
+                              ...agentConfig,
+                              policy: {
+                                ...agentConfig.policy,
+                                rules: agentConfig.policy.rules.map((item, itemIndex) =>
+                                  itemIndex === index
+                                    ? { ...item, pattern: event.target.value }
+                                    : item
+                                ),
+                              },
+                            })}
                           className='rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                         />
                         <select
                           value={rule.decision}
-                          onChange={event => setAgentConfig({
-                            ...agentConfig,
-                            policy: {
-                              ...agentConfig.policy,
-                              rules: agentConfig.policy.rules.map((item, itemIndex) =>
-                                itemIndex === index
-                                  ? { ...item, decision: event.target.value }
-                                  : item
-                              ),
-                            },
-                          })}
+                          onChange={event =>
+                            setAgentConfig({
+                              ...agentConfig,
+                              policy: {
+                                ...agentConfig.policy,
+                                rules: agentConfig.policy.rules.map((item, itemIndex) =>
+                                  itemIndex === index
+                                    ? { ...item, decision: event.target.value }
+                                    : item
+                                ),
+                              },
+                            })}
                           className='rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                         >
                           <option value='allow'>允许</option>
@@ -1741,13 +4971,16 @@ export default function AgentDashboard () {
                         </select>
                         <Action
                           danger
-                          onClick={() => setAgentConfig({
-                            ...agentConfig,
-                            policy: {
-                              ...agentConfig.policy,
-                              rules: agentConfig.policy.rules.filter((_, itemIndex) => itemIndex !== index),
-                            },
-                          })}
+                          onClick={() =>
+                            setAgentConfig({
+                              ...agentConfig,
+                              policy: {
+                                ...agentConfig.policy,
+                                rules: agentConfig.policy.rules.filter(
+                                  (_, itemIndex) => itemIndex !== index
+                                ),
+                              },
+                            })}
                         >
                           删除
                         </Action>
@@ -1756,207 +4989,77 @@ export default function AgentDashboard () {
                   </div>
                 </div>
 
-                <div className='rounded-2xl border border-default-200 p-4'>
-                  <label className='flex items-center justify-between'>
-                    <span>
-                      <span className='block font-semibold'>启用 MCP Client</span>
-                      <span className='text-xs text-default-500'>stdio / Streamable HTTP</span>
-                    </span>
-                    <input
-                      type='checkbox'
-                      checked={agentConfig.mcp.enabled}
-                      onChange={event => setAgentConfig({
-                        ...agentConfig,
-                        mcp: { ...agentConfig.mcp, enabled: event.target.checked },
-                      })}
-                    />
-                  </label>
-                  <div className='mt-4 space-y-3'>
-                    {agentConfig.mcp.servers.map((server, index) => (
-                      <div key={`${server.name}:${index}`} className='grid gap-2 rounded-xl bg-default-50 p-3 md:grid-cols-2'>
-                        <input
-                          value={server.name}
-                          placeholder='Server 名称'
-                          onChange={event => setAgentConfig({
-                            ...agentConfig,
-                            mcp: {
-                              ...agentConfig.mcp,
-                              servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                itemIndex === index ? { ...item, name: event.target.value } : item
-                              ),
-                            },
-                          })}
-                          className='rounded-lg border border-default-200 p-2 text-sm'
-                        />
-                        <select
-                          value={server.transport}
-                          onChange={event => setAgentConfig({
-                            ...agentConfig,
-                            mcp: {
-                              ...agentConfig.mcp,
-                              servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                itemIndex === index
-                                  ? { ...item, transport: event.target.value as 'stdio' | 'http' }
-                                  : item
-                              ),
-                            },
-                          })}
-                          className='rounded-lg border border-default-200 p-2 text-sm'
-                        >
-                          <option value='stdio'>stdio</option>
-                          <option value='http'>Streamable HTTP</option>
-                        </select>
-                        <input
-                          value={server.transport === 'http' ? server.url || '' : server.command || ''}
-                          placeholder={server.transport === 'http' ? 'URL' : 'Command'}
-                          onChange={event => setAgentConfig({
-                            ...agentConfig,
-                            mcp: {
-                              ...agentConfig.mcp,
-                              servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                itemIndex === index
-                                  ? server.transport === 'http'
-                                    ? { ...item, url: event.target.value }
-                                    : { ...item, command: event.target.value }
-                                  : item
-                              ),
-                            },
-                          })}
-                          className='rounded-lg border border-default-200 p-2 text-sm'
-                        />
-                        <label className='flex items-center gap-2 rounded-lg border border-default-200 p-2 text-sm'>
-                          <input
-                            type='checkbox'
-                            checked={server.enabled}
-                            onChange={event => setAgentConfig({
-                              ...agentConfig,
-                              mcp: {
-                                ...agentConfig.mcp,
-                                servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                  itemIndex === index
-                                    ? { ...item, enabled: event.target.checked }
-                                    : item
-                                ),
-                              },
-                            })}
-                          />
-                          启用 Server
-                        </label>
-                        {server.transport === 'stdio' && (
-                          <>
-                            <input
-                              value={(server.args || []).join(', ')}
-                              placeholder='Arguments（逗号分隔）'
-                              onChange={event => setAgentConfig({
-                                ...agentConfig,
-                                mcp: {
-                                  ...agentConfig.mcp,
-                                  servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                    itemIndex === index
-                                      ? {
-                                        ...item,
-                                        args: event.target.value
-                                          .split(',')
-                                          .map(value => value.trim())
-                                          .filter(Boolean),
-                                      }
-                                      : item
-                                  ),
-                                },
-                              })}
-                              className='rounded-lg border border-default-200 p-2 text-sm'
-                            />
-                            <input
-                              value={server.cwd || ''}
-                              placeholder='Working directory'
-                              onChange={event => setAgentConfig({
-                                ...agentConfig,
-                                mcp: {
-                                  ...agentConfig.mcp,
-                                  servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                    itemIndex === index
-                                      ? { ...item, cwd: event.target.value }
-                                      : item
-                                  ),
-                                },
-                              })}
-                              className='rounded-lg border border-default-200 p-2 text-sm'
-                            />
-                          </>
-                        )}
-                        <label className='text-xs text-default-500'>
-                          HTTP Headers（KEY=VALUE；敏感值必须引用环境变量）
-                          <textarea
-                            value={recordLines(server.headers)}
-                            placeholder={mcpHeaderExample}
-                            onChange={event => setAgentConfig({
-                              ...agentConfig,
-                              mcp: {
-                                ...agentConfig.mcp,
-                                servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                  itemIndex === index
-                                    ? { ...item, headers: linesRecord(event.target.value) }
-                                    : item
-                                ),
-                              },
-                            })}
-                            className='mt-1 min-h-20 w-full rounded-lg border border-default-200 p-2 text-sm'
-                          />
-                        </label>
-                        <label className='text-xs text-default-500'>
-                          stdio 环境变量（KEY={environmentReference}）
-                          <textarea
-                            value={recordLines(server.env)}
-                            placeholder={mcpEnvExample}
-                            onChange={event => setAgentConfig({
-                              ...agentConfig,
-                              mcp: {
-                                ...agentConfig.mcp,
-                                servers: agentConfig.mcp.servers.map((item, itemIndex) =>
-                                  itemIndex === index
-                                    ? { ...item, env: linesRecord(event.target.value) }
-                                    : item
-                                ),
-                              },
-                            })}
-                            className='mt-1 min-h-20 w-full rounded-lg border border-default-200 p-2 text-sm'
-                          />
-                        </label>
-                        <Action
-                          danger
-                          onClick={() => setAgentConfig({
-                            ...agentConfig,
-                            mcp: {
-                              ...agentConfig.mcp,
-                              servers: agentConfig.mcp.servers.filter((_, itemIndex) => itemIndex !== index),
-                            },
-                          })}
-                        >
-                          删除 MCP
-                        </Action>
-                      </div>
-                    ))}
-                    <Action onClick={() => setAgentConfig({
-                      ...agentConfig,
-                      mcp: {
-                        ...agentConfig.mcp,
-                        servers: [
-                          ...agentConfig.mcp.servers,
-                          { name: `server-${agentConfig.mcp.servers.length + 1}`, enabled: true, transport: 'http', url: '' },
-                        ],
-                      },
-                    })}
-                    >
-                      新增 MCP Server
-                    </Action>
+                <div className='flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-default-200 p-4'>
+                  <div>
+                    <div className='flex items-center gap-2 font-semibold'>
+                      <Network size={16} />
+                      MCP 服务已移至独立工作区
+                    </div>
+                    <p className='mt-1 text-xs text-default-500'>
+                      在同一页面查看连接状态、编辑 stdio/HTTP 配置并检查远程 Tools。
+                    </p>
                   </div>
+                  <Link
+                    to='/agent/mcp'
+                    className='inline-flex items-center gap-2 rounded-xl bg-primary-50 px-3 py-2 text-sm font-medium text-primary-700 transition hover:bg-primary-100 dark:bg-primary-500/10 dark:text-primary-300'
+                  >
+                    打开 MCP 服务
+                    <ChevronRight size={15} />
+                  </Link>
                 </div>
 
                 <details className='rounded-2xl border border-default-200 p-4'>
-                  <summary className='cursor-pointer font-semibold'>只读 JSON 预览</summary>
-                  <pre className='mt-3 max-h-96 overflow-auto text-xs'>
-                    {JSON.stringify(agentConfig, null, 2)}
-                  </pre>
+                  <summary className='cursor-pointer font-semibold'>直接编辑 agent.json</summary>
+                  <div className='mt-3 flex flex-wrap items-center justify-between gap-3'>
+                    <p className='text-xs text-default-500'>
+                      保存的 API Key 不会回显；保留空值即可继续使用现有密钥。
+                    </p>
+                    <div className='flex gap-2'>
+                      <Action
+                        onClick={() => {
+                          try {
+                            const parsed = JSON.parse(agentConfigJson) as unknown
+                            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                              throw new Error('agent.json 顶层必须是 JSON 对象')
+                            }
+                            const next = parsed as AgentConfig
+                            setAgentConfig(next)
+                            setAgentConfigJson(JSON.stringify(next, null, 2))
+                            setAgentConfigJsonDirty(false)
+                            setAgentConfigJsonError('')
+                            toast.success('JSON 已应用到上方表单')
+                          } catch (error) {
+                            const message = error instanceof SyntaxError
+                              ? `JSON 语法错误：${error.message}`
+                              : (error as Error).message
+                            setAgentConfigJsonError(message)
+                            toast.error(message)
+                          }
+                        }}
+                      >
+                        格式化并应用
+                      </Action>
+                    </div>
+                  </div>
+                  <textarea
+                    value={agentConfigJson}
+                    onChange={event => {
+                      setAgentConfigJson(event.target.value)
+                      setAgentConfigJsonDirty(true)
+                      setAgentConfigJsonError('')
+                    }}
+                    spellCheck={false}
+                    aria-label='agent.json 编辑器'
+                    className='mt-3 min-h-[420px] w-full resize-y rounded-xl border border-default-200 bg-default-50 p-4 font-mono text-xs leading-5 outline-none focus:border-primary'
+                  />
+                  {agentConfigJsonError && (
+                    <p className='mt-2 text-xs text-danger'>{agentConfigJsonError}</p>
+                  )}
+                  {agentConfigJsonDirty && !agentConfigJsonError && (
+                    <p className='mt-2 text-xs text-warning'>
+                      JSON 有未保存修改；点击页面顶部“保存并重载”后写入 agent.json。
+                    </p>
+                  )}
                 </details>
               </div>
             )}
