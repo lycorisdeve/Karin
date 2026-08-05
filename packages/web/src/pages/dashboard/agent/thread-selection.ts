@@ -62,6 +62,7 @@ export const threadName = (thread: AgentThread) =>
 
 export const isRenderableChatMessage = (message: AgentMessage) =>
   message.role !== 'tool' &&
+  (message.role !== 'assistant' || message.final !== false) &&
   (Boolean(message.content.trim()) || Boolean(message.attachments?.length))
 
 export const restoredThreadRoot = (

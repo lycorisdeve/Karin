@@ -30,6 +30,7 @@ export interface AgentProviderProfile {
   modelsDiscoveredAt?: number
   visionModels?: string[]
   timeout: number
+  contextWindowTokens?: number
   clearApiKey?: boolean
   verification?: {
     testedAt: number
@@ -41,7 +42,7 @@ export interface AgentProviderProfile {
 }
 
 export interface AgentConfig {
-  version: 7
+  version: 9
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: { primary: string; fallback: string[] }
@@ -52,8 +53,25 @@ export interface AgentConfig {
     maxRecentMessages: number
     maxSubagents: number
   }
+  context: {
+    defaultWindowTokens: number
+    softLimitRatio: number
+    hardLimitRatio: number
+    protectedRecentMessages: number
+    summaryTargetTokens: number
+  }
+  journal: {
+    recoveryAttempts: number
+    eventRetentionDays: number
+  }
+  tasks: {
+    enabled: boolean
+    maxItems: number
+    completionGuardRetries: number
+  }
   policy: {
     approvalTtlMs: number
+    autoApproveTrustedReversible: boolean
     hardDeny: string[]
     rules: Array<{ pattern: string; decision: string }>
     defaults: Record<'read' | 'write' | 'external' | 'destructive', string>
@@ -119,6 +137,26 @@ export interface AgentConfig {
   }
 }
 
+export interface AgentTaskItem {
+  id: string
+  content: string
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled'
+  order: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AgentTaskList {
+  id: string
+  threadId: string
+  sourceTurnId: string
+  goal: string
+  state: 'active' | 'completed' | 'cancelled'
+  items: AgentTaskItem[]
+  createdAt: number
+  updatedAt: number
+}
+
 export interface AgentProviderProbe {
   provider: string
   model: string
@@ -170,6 +208,7 @@ export interface AgentMessage {
   content: string
   name?: string
   toolCallId?: string
+  final?: boolean
   attachments?: Array<{
     id: string
     messageId: string
@@ -240,6 +279,28 @@ export interface AgentActivityView {
   startedAt: number
   completedAt?: number
   durationMs?: number
+}
+
+export interface AgentDeliveryOperation {
+  id: string
+  threadId: string
+  turnId: string
+  finalMessageId: string
+  channel: string
+  state:
+    | 'pending'
+    | 'dispatching'
+    | 'sent'
+    | 'not_sent'
+    | 'unknown_after_send'
+    | 'failed'
+    | 'cancelled'
+  adapterMessageId: string | null
+  attempts: number
+  errorCode: string | null
+  error: string | null
+  createdAt: number
+  updatedAt: number
 }
 
 export interface AgentMemory {
@@ -353,6 +414,20 @@ export interface AgentEvolutionCandidate {
   updatedAt: number
 }
 
+export interface AgentEvolutionLogEntry {
+  id: string
+  candidateId: string
+  action: 'improved' | 'rolled_back' | 'failed'
+  target: AgentEvolutionCandidate['target']
+  summary: string
+  change: string
+  candidateVersion: string
+  sourceTurnIds: string[]
+  actorId: string
+  detail: Record<string, unknown>
+  createdAt: number
+}
+
 const base = '/api/v1/agent'
 
 export const agentRequest = {
@@ -378,6 +453,16 @@ export const agentRequest = {
       {}
     ),
   tools: () => request.serverGet<Array<Record<string, unknown>>>(`${base}/tools`),
+  generatedTools: () =>
+    request.serverGet<Array<Record<string, unknown>>>(`${base}/generated-tools`),
+  generatedToolVersions: (id: string) =>
+    request.serverGet<Array<Record<string, unknown>>>(
+      `${base}/generated-tools/${encodeURIComponent(id)}/versions`
+    ),
+  generatedToolValidation: (id: string) =>
+    request.serverGet<Record<string, unknown>>(
+      `${base}/generated-tools/${encodeURIComponent(id)}/validation`
+    ),
   threads: (options: {
     state?: 'active' | 'archived' | 'all'
     query?: string
@@ -408,6 +493,10 @@ export const agentRequest = {
     request.serverGet<AgentMessage[]>(
       `${base}/threads/${threadId}/messages${before ? `?before=${before}` : ''}`
     ),
+  tasksForThread: (threadId: string, history = false) =>
+    request.serverGet<AgentTaskList | AgentTaskList[] | null>(
+      `${base}/threads/${threadId}/tasks${history ? '?history=true' : ''}`
+    ),
   updateThread: (threadId: string, input: { title?: string; archived?: boolean }) =>
     request.patch(`${base}/threads/${threadId}`, input).then(response => response.data.data as AgentThread),
   threadModel: (threadId: string) =>
@@ -427,11 +516,29 @@ export const agentRequest = {
     request.serverGet<AgentToolCallView[]>(`${base}/threads/${threadId}/tool-calls`),
   activity: (threadId: string) =>
     request.serverGet<AgentActivityView[]>(`${base}/threads/${threadId}/activity`),
-  startTurn: (threadId: string, content: string) =>
+  deliveries: (threadId: string) =>
+    request.serverGet<AgentDeliveryOperation[]>(`${base}/threads/${threadId}/deliveries`),
+  toolArtifact: (id: string) =>
+    request.serverGet<Record<string, unknown>>(`${base}/tool-artifacts/${id}`),
+  startTurn: (threadId: string, content: string, idempotencyKey = crypto.randomUUID()) =>
     request.serverPost<
-      { accepted: boolean; requestId: string; threadId: string },
-      { content: string }
-    >(`${base}/threads/${threadId}/turns`, { content }),
+      {
+        accepted: boolean
+        requestId: string
+        runId: string
+        threadId: string
+        mode: 'started' | 'supplemented'
+        interrupted?: {
+          threadId: string
+          turnId: string
+          elapsedMs: number
+          round: number
+          maxRounds: number
+          operation: string
+        }
+      },
+      { content: string; idempotencyKey: string }
+    >(`${base}/threads/${threadId}/turns`, { content, idempotencyKey }),
   chat: (threadKey: string, content: string) =>
     request.serverPost<
       { threadId: string; turnId: string; state: string; content: string },
@@ -523,6 +630,18 @@ export const agentRequest = {
     ),
   audit: () => request.serverGet<Array<Record<string, unknown>>>(`${base}/audit`),
   usage: () => request.serverGet<Array<Record<string, unknown>>>(`${base}/usage`),
+  evolutionLogs: (limit = 200) =>
+    request.serverGet<AgentEvolutionLogEntry[]>(`${base}/evolution/logs?limit=${limit}`),
+  deleteEvolutionLog: (id: string) =>
+    request.serverPost<{ deleted: boolean }, { confirm: true }>(
+      `${base}/evolution/logs/${encodeURIComponent(id)}/delete`,
+      { confirm: true }
+    ),
+  clearEvolutionLogs: () =>
+    request.serverPost<{ deleted: number }, { confirm: true }>(
+      `${base}/evolution/logs/clear`,
+      { confirm: true }
+    ),
   evolutionOverview: () =>
     request.serverGet<{
       candidates: Record<string, number>

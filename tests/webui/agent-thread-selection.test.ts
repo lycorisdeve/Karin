@@ -94,5 +94,14 @@ describe('Agent channel and thread selection', () => {
       name: 'image.png',
       url: '/api/v1/agent/media/attachment',
     }]))).toBe(true)
+
+    expect(isRenderableChatMessage({
+      ...message('工具调用前的中间说明'),
+      final: false,
+    })).toBe(false)
+    expect(isRenderableChatMessage({
+      ...message('唯一最终答案'),
+      final: true,
+    })).toBe(true)
   })
 })

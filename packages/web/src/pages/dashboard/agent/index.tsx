@@ -39,6 +39,7 @@ import {
   type AgentApproval,
   type AgentActivityView,
   type AgentConfig,
+  type AgentDeliveryOperation,
   type AgentJob,
   type AgentMemory,
   type AgentMessage,
@@ -50,7 +51,8 @@ import {
   type AgentThreadChannel,
   type AgentToolCallView,
   type AgentProviderKind,
-  type AgentEvolutionCandidate,
+  type AgentEvolutionLogEntry,
+  type AgentTaskList,
 } from '@/request/agent'
 import {
   channelName,
@@ -117,6 +119,11 @@ const linesRecord = (value: string) =>
 const mcpHeaderExample = ['Authorization=Bearer $', '{MCP_TOKEN}'].join('')
 const mcpEnvExample = ['API_KEY=$', '{MCP_API_KEY}'].join('')
 const environmentReference = ['$', '{ENV_NAME}'].join('')
+const artifactIdFrom = (output: unknown) => {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return ''
+  const artifactId = (output as Record<string, unknown>).artifactId
+  return typeof artifactId === 'string' ? artifactId : ''
+}
 const memoryScopeLabels: Record<string, string> = {
   all: '全部',
   user: '用户',
@@ -419,13 +426,28 @@ const ToolCallCard = ({
       <div>
         <div className='mb-1 flex items-center justify-between text-xs font-semibold'>
           结果
-          <button
-            type='button'
-            onClick={() => navigator.clipboard.writeText(JSON.stringify(call.output, null, 2))}
-            className='text-primary'
-          >
-            复制
-          </button>
+          <div className='flex gap-2'>
+            {artifactIdFrom(call.output) && (
+              <button
+                type='button'
+                onClick={async () => {
+                  const artifact = await agentRequest.toolArtifact(artifactIdFrom(call.output))
+                  await navigator.clipboard.writeText(JSON.stringify(artifact.content, null, 2))
+                  toast.success('完整 Artifact 已复制')
+                }}
+                className='text-primary'
+              >
+                完整 Artifact
+              </button>
+            )}
+            <button
+              type='button'
+              onClick={() => navigator.clipboard.writeText(JSON.stringify(call.output, null, 2))}
+              className='text-primary'
+            >
+              复制
+            </button>
+          </div>
         </div>
         <pre className='max-h-64 overflow-auto rounded-xl bg-content1 p-3 text-xs'>
           {call.error || JSON.stringify(call.output ?? null, null, 2)}
@@ -461,6 +483,31 @@ const ActivityCard = ({ activity, now }: { activity: AgentActivityView; now: num
   )
 }
 
+const deliveryStateLabel: Record<AgentDeliveryOperation['state'], string> = {
+  pending: '等待投递',
+  dispatching: '投递中',
+  sent: '平台已接受',
+  not_sent: '未进入发送路径',
+  unknown_after_send: '发送结果未知',
+  failed: '投递失败',
+  cancelled: '已取消',
+}
+
+const DeliveryCard = ({ delivery }: { delivery: AgentDeliveryOperation }) => (
+  <div className='signal-rail flex items-center gap-2 rounded-xl py-1.5 text-xs text-default-500'>
+    {delivery.state === 'dispatching' || delivery.state === 'pending'
+      ? <LoaderCircle className='shrink-0 animate-spin text-primary' size={15} />
+      : delivery.state === 'sent'
+        ? <Check className='shrink-0 text-success' size={15} />
+        : <MessageSquareWarning className='shrink-0 text-warning' size={15} />}
+    <span className='min-w-0 truncate'>
+      {delivery.channel} · {deliveryStateLabel[delivery.state]}
+    </span>
+    <span className='shrink-0 text-default-400'>尝试 {delivery.attempts} 次</span>
+    {delivery.error && <span className='truncate text-danger'>{delivery.error}</span>}
+  </div>
+)
+
 export default function AgentDashboard () {
   const location = useLocation()
   const routePage = location.pathname.split('/').filter(Boolean)[1] as Page | undefined
@@ -477,6 +524,8 @@ export default function AgentDashboard () {
   const [messages, setMessages] = useState<AgentMessage[]>([])
   const [toolCalls, setToolCalls] = useState<AgentToolCallView[]>([])
   const [activities, setActivities] = useState<AgentActivityView[]>([])
+  const [deliveries, setDeliveries] = useState<AgentDeliveryOperation[]>([])
+  const [taskList, setTaskList] = useState<AgentTaskList | null>(null)
   const [notices, setNotices] = useState<
     Array<{
       id: string
@@ -500,17 +549,10 @@ export default function AgentDashboard () {
   const [jobRuns, setJobRuns] = useState<Array<Record<string, unknown>>>([])
   const [mcp, setMcp] = useState<Array<Record<string, unknown>>>([])
   const [tools, setTools] = useState<Array<Record<string, unknown>>>([])
+  const [generatedTools, setGeneratedTools] = useState<Array<Record<string, unknown>>>([])
   const [audit, setAudit] = useState<Array<Record<string, unknown>>>([])
   const [usage, setUsage] = useState<Array<Record<string, unknown>>>([])
-  const [evolutionOverview, setEvolutionOverview] = useState<{
-    candidates: Record<string, number>
-    outcomes: Record<string, number>
-    feedback: { total: number; corrected: number }
-    retrieval: { total: number; selected: number }
-  } | null>(null)
-  const [evolutionCandidates, setEvolutionCandidates] = useState<AgentEvolutionCandidate[]>([])
-  const [selectedEvolutionId, setSelectedEvolutionId] = useState('')
-  const [repairArtifact, setRepairArtifact] = useState('')
+  const [evolutionLogs, setEvolutionLogs] = useState<AgentEvolutionLogEntry[]>([])
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null)
   const [agentConfigJson, setAgentConfigJson] = useState('')
   const [agentConfigJsonDirty, setAgentConfigJsonDirty] = useState(false)
@@ -585,8 +627,7 @@ export default function AgentDashboard () {
       nextTools,
       nextAudit,
       nextUsage,
-      nextEvolutionOverview,
-      nextEvolutionCandidates,
+      nextEvolutionLogs,
       nextConfig,
     ] = await Promise.all([
       agentRequest.status(),
@@ -605,8 +646,7 @@ export default function AgentDashboard () {
       agentRequest.tools(),
       agentRequest.audit(),
       agentRequest.usage(),
-      agentRequest.evolutionOverview(),
-      agentRequest.evolutionCandidates(),
+      agentRequest.evolutionLogs(),
       agentRequest.config(),
     ])
     setStatus(nextStatus)
@@ -621,8 +661,7 @@ export default function AgentDashboard () {
     setTools(nextTools)
     setAudit(nextAudit)
     setUsage(nextUsage)
-    setEvolutionOverview(nextEvolutionOverview)
-    setEvolutionCandidates(nextEvolutionCandidates)
+    setEvolutionLogs(nextEvolutionLogs)
     setAgentConfig(nextConfig.config)
     setProviderModels(
       Object.fromEntries(
@@ -638,6 +677,13 @@ export default function AgentDashboard () {
   useEffect(() => {
     refresh().catch(error => toast.error(error.message))
   }, [refresh])
+
+  useEffect(() => {
+    if (tab !== 'tools') return
+    agentRequest.generatedTools()
+      .then(setGeneratedTools)
+      .catch(error => toast.error((error as Error).message))
+  }, [tab])
 
   useEffect(() => {
     if (!agentConfig || agentConfigJsonDirty) return
@@ -736,6 +782,8 @@ export default function AgentDashboard () {
       setMessages([])
       setToolCalls([])
       setActivities([])
+      setDeliveries([])
+      setTaskList(null)
       return
     }
     followOutputRef.current = true
@@ -744,13 +792,24 @@ export default function AgentDashboard () {
       agentRequest.messages(current.id),
       agentRequest.toolCalls(current.id),
       agentRequest.activity(current.id),
+      agentRequest.deliveries(current.id),
       agentRequest.approvals(),
+      agentRequest.tasksForThread(current.id),
     ])
-      .then(([nextMessages, nextToolCalls, nextActivities, nextApprovals]) => {
+      .then(([
+        nextMessages,
+        nextToolCalls,
+        nextActivities,
+        nextDeliveries,
+        nextApprovals,
+        nextTasks,
+      ]) => {
         setMessages(nextMessages)
         setToolCalls(nextToolCalls)
         setActivities(nextActivities)
+        setDeliveries(nextDeliveries)
         setApprovals(nextApprovals)
+        setTaskList(Array.isArray(nextTasks) ? nextTasks[0] || null : nextTasks)
       })
       .catch(error => setChatError(error.message))
     const source = agentRequest.events(current.id, lastEventId.current[current.id] || 0)
@@ -773,6 +832,7 @@ export default function AgentDashboard () {
     const refreshActivity = () => {
       agentRequest.activity(current.id).then(setActivities)
       agentRequest.toolCalls(current.id).then(setToolCalls)
+      agentRequest.deliveries(current.id).then(setDeliveries)
       agentRequest.approvals().then(setApprovals)
     }
     const refreshConversation = () => {
@@ -810,6 +870,25 @@ export default function AgentDashboard () {
       setStreamStartedAt(0)
       refreshActivity()
     })
+    listen('turn.interrupting', payload => {
+      const elapsedMs = Number(payload.data.elapsedMs || 0)
+      const round = Number(payload.data.round || 0)
+      const maxRounds = Number(payload.data.maxRounds || 0)
+      const operation = String(payload.data.operation || '模型思考')
+      addNotice(
+        `⚡ 正在中断并合并当前任务（已运行 ${
+          elapsedMs < 60000
+            ? `${Math.floor(elapsedMs / 1000)} 秒`
+            : `${Math.floor(elapsedMs / 60000)} 分 ${
+              Math.floor((elapsedMs % 60000) / 1000)
+            } 秒`
+        }，第 ${round}/${maxRounds} 轮，正在执行：${operation}）。`
+      )
+    })
+    listen('turn.resumed', () => {
+      setRecoveryStatus('已合并用户补充，正在继续执行')
+      refreshActivity()
+    })
     listen('text.delta', payload => {
       setStreamStartedAt(value => value || payload.createdAt || Date.now())
       appendStreaming(String(payload.data.delta || ''))
@@ -841,6 +920,11 @@ export default function AgentDashboard () {
     })
     listen('tool.started', refreshActivity)
     listen('tool.completed', refreshActivity)
+    listen('task.updated', () => {
+      agentRequest.tasksForThread(current.id).then(value => {
+        setTaskList(Array.isArray(value) ? value[0] || null : value)
+      })
+    })
     listen('subagent.started', refreshActivity)
     listen('subagent.completed', refreshActivity)
     listen('plan.created', payload => {
@@ -866,14 +950,12 @@ export default function AgentDashboard () {
       )
       refreshActivity()
     })
-    listen('repair.candidate', () => {
-      setRecoveryStatus('已生成待管理员审查的修复候选')
-      agentRequest.evolutionCandidates().then(setEvolutionCandidates)
-    })
     listen('delivery.completed', () => {
+      agentRequest.deliveries(current.id).then(setDeliveries)
       if (current.channel !== 'web') toast.success(`回复已发送到 ${channelName(current.channel)}`)
     })
     listen('delivery.failed', payload => {
+      agentRequest.deliveries(current.id).then(setDeliveries)
       setChatError(
         `回复已保存在会话中，但发送到 ${channelName(current.channel)} 失败：${
           String(payload.data.error || '适配器未返回成功结果')
@@ -1152,7 +1234,6 @@ export default function AgentDashboard () {
       setPrompt('')
       return
     }
-    if (sending) return
     setSending(true)
     setChatError('')
     setPrompt('')
@@ -1167,7 +1248,10 @@ export default function AgentDashboard () {
           createdAt: Date.now(),
         },
       ])
-      await agentRequest.startTurn(thread.id, content)
+      const accepted = await agentRequest.startTurn(thread.id, content)
+      if (accepted.mode === 'supplemented') {
+        setRecoveryStatus('正在中断旧回合并合并补充内容')
+      }
     } catch (error) {
       setChatError((error as Error).message)
       setSending(false)
@@ -1599,65 +1683,6 @@ export default function AgentDashboard () {
     setSelectedMcpName(name)
   }
 
-  const runEvolutionAction = async (
-    candidate: AgentEvolutionCandidate,
-    action: 'evaluate' | 'promote' | 'reject' | 'rollback'
-  ) => {
-    try {
-      await agentRequest.evolutionAction(candidate.id, action)
-      const [overview, candidates] = await Promise.all([
-        agentRequest.evolutionOverview(),
-        agentRequest.evolutionCandidates(),
-      ])
-      setEvolutionOverview(overview)
-      setEvolutionCandidates(candidates)
-      toast.success(
-        {
-          evaluate: '候选评测已完成',
-          promote: '候选已晋升',
-          reject: '候选已拒绝',
-          rollback: '候选已回滚',
-        }[action]
-      )
-    } catch (error) {
-      toast.error((error as Error).message)
-    }
-  }
-
-  const reviewRepairArtifact = async (candidate: AgentEvolutionCandidate) => {
-    try {
-      const artifact = await agentRequest.evolutionArtifact(candidate.id)
-      setRepairArtifact(artifact.patch)
-    } catch (error) {
-      setRepairArtifact('')
-      toast.error((error as Error).message)
-    }
-  }
-
-  const applyRepairCandidate = async (candidate: AgentEvolutionCandidate) => {
-    if (!window.confirm('将应用该 Diff、执行固定验证，并在成功后重启 Core。确认继续？')) return
-    try {
-      await agentRequest.applyRepair(candidate.id, true)
-      toast.success('修复已验证并应用，Core 正在重启')
-      const candidates = await agentRequest.evolutionCandidates()
-      setEvolutionCandidates(candidates)
-    } catch (error) {
-      toast.error((error as Error).message)
-    }
-  }
-
-  const rollbackRepairCandidate = async (candidate: AgentEvolutionCandidate) => {
-    if (!window.confirm('将恢复该候选应用前的文件快照并重启 Core。确认回滚？')) return
-    try {
-      await agentRequest.rollbackRepair(candidate.id, true)
-      toast.success('源码快照已恢复，Core 正在重启')
-      const candidates = await agentRequest.evolutionCandidates()
-      setEvolutionCandidates(candidates)
-    } catch (error) {
-      toast.error((error as Error).message)
-    }
-  }
-
   const submitFeedback = async (message: AgentMessage, rating: -1 | 1, correction?: string) => {
     if (!current) return
     try {
@@ -1666,12 +1691,6 @@ export default function AgentDashboard () {
         rating,
         correction,
       })
-      const [overview, candidates] = await Promise.all([
-        agentRequest.evolutionOverview(),
-        agentRequest.evolutionCandidates(),
-      ])
-      setEvolutionOverview(overview)
-      setEvolutionCandidates(candidates)
       toast.success(correction ? '纠正已进入进化评测队列' : '反馈已记录')
     } catch (error) {
       toast.error((error as Error).message)
@@ -1694,6 +1713,11 @@ export default function AgentDashboard () {
         createdAt: activity.startedAt,
         activity,
       })),
+    ...deliveries.map(delivery => ({
+      kind: 'delivery' as const,
+      createdAt: delivery.createdAt,
+      delivery,
+    })),
     ...notices.map(notice => ({
       kind: 'notice' as const,
       createdAt: notice.createdAt,
@@ -1718,8 +1742,6 @@ export default function AgentDashboard () {
   }
   if (recoveryStatus) activeLabel = recoveryStatus
   if (waitingActivity) activeLabel = `等待确认 · ${waitingActivity.label}`
-  const selectedEvolution =
-    evolutionCandidates.find(item => item.id === selectedEvolutionId) || evolutionCandidates[0]
   const filteredJobs = jobs.filter(item =>
     `${item.name} ${item.prompt} ${item.target}`.toLowerCase().includes(taskQuery.toLowerCase())
   )
@@ -2043,6 +2065,41 @@ export default function AgentDashboard () {
                 {chatError}
               </div>
             )}
+            {Boolean(taskList?.items.length) && taskList && (
+              <details
+                open={taskList.state === 'active'}
+                className='shrink-0 border-b border-default-200 bg-content1 px-4 py-2'
+              >
+                <summary className='cursor-pointer text-xs font-semibold text-default-700'>
+                  当前任务 · {taskList.items.filter(
+                  item => item.status === 'completed' || item.status === 'cancelled'
+                ).length}
+                  /{taskList.items.length}
+                  <span className='ml-2 font-normal text-default-400'>
+                    {taskList.goal}
+                  </span>
+                </summary>
+                <div className='mt-2 grid gap-1 sm:grid-cols-2'>
+                  {taskList.items.map(item => (
+                    <div
+                      key={item.id}
+                      className={`rounded-lg px-2.5 py-1.5 text-xs ${
+                        item.status === 'in_progress'
+                          ? 'bg-primary-50 text-primary'
+                          : item.status === 'completed'
+                            ? 'bg-success-50 text-success-700'
+                            : item.status === 'cancelled'
+                              ? 'bg-default-100 text-default-400 line-through'
+                              : 'bg-default-50 text-default-600'
+                      }`}
+                    >
+                      <span className='mr-1.5 font-mono'>{item.id}</span>
+                      {item.content}
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
             <div
               ref={messageViewportRef}
               onScroll={handleMessageScroll}
@@ -2087,6 +2144,9 @@ export default function AgentDashboard () {
                     }
                   }
                   return <ActivityCard key={activity.id} activity={activity} now={now} />
+                }
+                if (item.kind === 'delivery') {
+                  return <DeliveryCard key={item.delivery.id} delivery={item.delivery} />
                 }
                 const message = item.message
                 return (
@@ -3792,316 +3852,105 @@ export default function AgentDashboard () {
       )}
 
       {tab === 'evolution' && (
-        <div className='grid gap-5'>
-          <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
-            {[
-              {
-                label: '累计经验',
-                value: Object.values(evolutionOverview?.outcomes || {}).reduce(
-                  (total, count) => total + count,
-                  0
-                ),
-                note: `${evolutionOverview?.outcomes.completed || 0} 次完成`,
-              },
-              {
-                label: '等待验证',
-                value:
-                  (evolutionOverview?.candidates.draft || 0) +
-                  (evolutionOverview?.candidates.ready || 0),
-                note: '候选不会直接污染运行时',
-              },
-              {
-                label: '用户纠正',
-                value: evolutionOverview?.feedback.corrected || 0,
-                note: `共 ${evolutionOverview?.feedback.total || 0} 条反馈`,
-              },
-              {
-                label: '已生效改进',
-                value: evolutionOverview?.candidates.active || 0,
-                note: `${evolutionOverview?.candidates.rolled_back || 0} 次回滚`,
-              },
-            ].map(item => (
-              <Panel key={item.label} className='relative overflow-hidden p-4'>
-                <div className='absolute inset-y-4 left-0 w-0.5 rounded-full bg-primary' />
-                <div className='text-xs font-medium text-default-400'>{item.label}</div>
-                <div className='mt-2 font-mono text-3xl font-semibold tracking-tight'>
-                  {item.value}
-                </div>
-                <div className='mt-1 text-xs text-default-500'>{item.note}</div>
-              </Panel>
-            ))}
+        <Panel className='overflow-hidden'>
+          <div className='flex flex-wrap items-start justify-between gap-3 border-b border-default-200 p-5'>
+            <div>
+              <h2 className='text-lg font-semibold'>自我进化日志</h2>
+              <p className='mt-1 text-sm text-default-500'>
+                只记录已经生效、回滚或应用失败的改进，不提供候选操作和源码管理功能。
+              </p>
+            </div>
+            <div className='flex flex-wrap gap-2'>
+              <Action
+                onClick={async () => setEvolutionLogs(await agentRequest.evolutionLogs())}
+              >
+                <RefreshCw size={15} />
+                刷新日志
+              </Action>
+              <Action
+                danger
+                disabled={!evolutionLogs.length}
+                onClick={async () => {
+                  if (!window.confirm('清空全部自我进化日志？此操作不可恢复。')) return
+                  const result = await agentRequest.clearEvolutionLogs()
+                  setEvolutionLogs([])
+                  toast.success(`已清空 ${result.deleted} 条自我进化日志`)
+                }}
+              >
+                <Trash2 size={15} />
+                清空日志
+              </Action>
+            </div>
           </div>
-
-          <div className='grid min-h-[620px] gap-4 xl:grid-cols-[360px_minmax(0,1fr)]'>
-            <Panel className='flex min-h-0 flex-col overflow-hidden'>
-              <div className='border-b border-default-200 p-4'>
-                <div className='flex items-center justify-between gap-3'>
-                  <div>
-                    <h2 className='font-semibold'>进化候选</h2>
-                    <p className='mt-1 text-xs text-default-500'>
-                      真实轨迹产生，评测后按风险分级晋升。
-                    </p>
+          <div className='karin-scrollbar max-h-[720px] overflow-y-auto'>
+            {evolutionLogs.map((entry, index) => (
+              <div
+                key={entry.id}
+                className={`grid gap-2 px-5 py-4 md:grid-cols-[180px_110px_minmax(0,1fr)_auto] ${
+                  index ? 'border-t border-default-100' : ''
+                }`}
+              >
+                <time className='font-mono text-xs text-default-400'>
+                  {date(entry.createdAt)}
+                </time>
+                <div>
+                  <span
+                    className={`rounded-full px-2 py-1 text-xs font-medium ${
+                      entry.action === 'improved'
+                        ? 'bg-success-50 text-success-700'
+                        : entry.action === 'rolled_back'
+                          ? 'bg-warning-50 text-warning-700'
+                          : 'bg-danger-50 text-danger'
+                    }`}
+                  >
+                    {entry.action === 'improved'
+                      ? '已改进'
+                      : entry.action === 'rolled_back'
+                        ? '已回滚'
+                        : '应用失败'}
+                  </span>
+                </div>
+                <div className='min-w-0'>
+                  <div className='font-medium'>{entry.summary}</div>
+                  <div className='mt-1 text-sm text-default-600'>{entry.change}</div>
+                  <div className='mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[11px] text-default-400'>
+                    <span>{entry.target}</span>
+                    <span>版本 {entry.candidateVersion}</span>
+                    <span>来源 Turn {entry.sourceTurnIds.length} 个</span>
                   </div>
-                  <Action onClick={refresh}>
-                    <RefreshCw size={15} />
+                  {typeof entry.detail.error === 'string' && entry.detail.error && (
+                    <div className='mt-2 rounded-lg bg-danger-50 px-3 py-2 text-xs text-danger'>
+                      {entry.detail.error}
+                    </div>
+                  )}
+                </div>
+                <div className='md:self-start'>
+                  <Action
+                    danger
+                    onClick={async () => {
+                      if (!window.confirm('删除此条自我进化日志？此操作不可恢复。')) return
+                      const result = await agentRequest.deleteEvolutionLog(entry.id)
+                      if (!result.deleted) {
+                        toast.error('日志不存在或已被删除')
+                        return
+                      }
+                      setEvolutionLogs(current => current.filter(item => item.id !== entry.id))
+                      toast.success('自我进化日志已删除')
+                    }}
+                  >
+                    <Trash2 size={14} />
+                    删除
                   </Action>
                 </div>
               </div>
-              <div className='karin-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3'>
-                {evolutionCandidates.map(candidate => (
-                  <button
-                    key={candidate.id}
-                    type='button'
-                    onClick={() => {
-                      setSelectedEvolutionId(candidate.id)
-                      setRepairArtifact('')
-                    }}
-                    className={`w-full rounded-xl border p-3 text-left transition-colors ${
-                      selectedEvolution?.id === candidate.id
-                        ? 'border-primary bg-primary-50 dark:bg-primary-500/10'
-                        : 'border-transparent bg-default-50 hover:border-default-200'
-                    }`}
-                  >
-                    <div className='flex items-center justify-between gap-2'>
-                      <span className='truncate text-sm font-semibold'>{candidate.summary}</span>
-                      <span
-                        className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${
-                          candidate.state === 'active'
-                            ? 'bg-success-100 text-success-700'
-                            : candidate.state === 'rejected' || candidate.state === 'rolled_back'
-                              ? 'bg-danger-50 text-danger'
-                              : 'bg-warning-50 text-warning-700'
-                        }`}
-                      >
-                        {candidate.state}
-                      </span>
-                    </div>
-                    <div className='mt-2 flex items-center gap-2 font-mono text-[10px] text-default-400'>
-                      <span>{candidate.target}</span>
-                      <span>·</span>
-                      <span>{candidate.kind}</span>
-                      <span>·</span>
-                      <span>{candidate.sourceTurnIds.length} evidence</span>
-                    </div>
-                  </button>
-                ))}
-                {!evolutionCandidates.length && (
-                  <div className='rounded-xl border border-dashed border-default-200 p-6 text-center text-sm text-default-400'>
-                    完成任务或提交纠正后，候选会显示在这里。
-                  </div>
-                )}
+            ))}
+            {!evolutionLogs.length && (
+              <div className='p-12 text-center text-sm text-default-400'>
+                暂无已生效的自我进化记录。
               </div>
-            </Panel>
-
-            <Panel className='min-w-0 overflow-hidden'>
-              {selectedEvolution
-                ? (
-                  <div className='flex h-full min-h-0 flex-col'>
-                    <div className='flex flex-wrap items-start justify-between gap-3 border-b border-default-200 p-5'>
-                      <div className='min-w-0'>
-                        <div className='mb-2 flex flex-wrap items-center gap-2'>
-                          <span className='rounded-full bg-primary-50 px-2 py-1 text-xs font-medium text-primary'>
-                            {selectedEvolution.target}
-                          </span>
-                          <span className='rounded-full bg-default-100 px-2 py-1 font-mono text-xs'>
-                            {selectedEvolution.candidateVersion}
-                          </span>
-                        </div>
-                        <h2 className='text-lg font-semibold'>{selectedEvolution.summary}</h2>
-                        <p className='mt-1 text-xs text-default-400'>
-                          创建于 {date(selectedEvolution.createdAt)} · 最近更新{' '}
-                          {date(selectedEvolution.updatedAt)}
-                        </p>
-                      </div>
-                      <div className='flex flex-wrap gap-2'>
-                        {selectedEvolution.kind === 'declarative' &&
-                        ['draft', 'rejected'].includes(selectedEvolution.state) && (
-                          <Action onClick={() => runEvolutionAction(selectedEvolution, 'evaluate')}>
-                            重新评测
-                          </Action>
-                        )}
-                        {selectedEvolution.kind === 'declarative' &&
-                        selectedEvolution.state === 'ready' && (
-                          <>
-                            <Action onClick={() => runEvolutionAction(selectedEvolution, 'promote')}>
-                              晋升
-                            </Action>
-                            <Action
-                              danger
-                              onClick={() => runEvolutionAction(selectedEvolution, 'reject')}
-                            >
-                              拒绝
-                            </Action>
-                          </>
-                        )}
-                        {selectedEvolution.kind === 'executable' &&
-                        !['rejected', 'rolled_back'].includes(selectedEvolution.state) && (
-                          <>
-                            {selectedEvolution.payload.patchHash && (
-                              <Action onClick={() => reviewRepairArtifact(selectedEvolution)}>
-                                查看 Diff
-                              </Action>
-                            )}
-                            {selectedEvolution.state === 'ready' &&
-                            selectedEvolution.payload.patchHash && (
-                              <Action onClick={() => applyRepairCandidate(selectedEvolution)}>
-                                批准并应用
-                              </Action>
-                            )}
-                            {selectedEvolution.state === 'active' &&
-                            selectedEvolution.payload.patchHash && (
-                              <Action
-                                danger
-                                onClick={() => rollbackRepairCandidate(selectedEvolution)}
-                              >
-                                回滚修复
-                              </Action>
-                            )}
-                            {selectedEvolution.state !== 'active' && (
-                              <Action
-                                danger
-                                onClick={() => runEvolutionAction(selectedEvolution, 'reject')}
-                              >
-                                拒绝候选
-                              </Action>
-                            )}
-                          </>
-                        )}
-                        {selectedEvolution.state === 'active' && (
-                          <Action
-                            danger
-                            onClick={() => runEvolutionAction(selectedEvolution, 'rollback')}
-                          >
-                            回滚
-                          </Action>
-                        )}
-                      </div>
-                    </div>
-                    <div className='karin-scrollbar grid min-h-0 flex-1 gap-4 overflow-y-auto p-5 lg:grid-cols-2'>
-                      {['tool', 'repair'].includes(selectedEvolution.target) && (
-                        <div className='grid gap-3 rounded-2xl border border-warning-200 bg-warning-50/60 p-4 lg:col-span-2 dark:bg-warning-500/5'>
-                          <div className='flex flex-wrap items-center justify-between gap-2'>
-                            <div>
-                              <h3 className='text-sm font-semibold'>可验证恢复候选</h3>
-                              <p className='mt-1 text-xs text-default-500'>
-                                可执行候选不会自动晋升；补丁、隔离验证和管理员审批全部通过后才能应用。
-                              </p>
-                            </div>
-                            <span className='rounded-full bg-warning-100 px-2.5 py-1 font-mono text-xs text-warning-700'>
-                              {String(selectedEvolution.payload.fingerprint || '').slice(0, 12) ||
-                                'no fingerprint'}
-                            </span>
-                          </div>
-                          <div className='grid gap-3 md:grid-cols-3'>
-                            {[
-                              ['问题', selectedEvolution.payload.problem],
-                              ['根因', selectedEvolution.payload.rootCause],
-                              ['停止条件', selectedEvolution.payload.stopCondition],
-                            ].map(([label, value]) => (
-                              <div
-                                key={String(label)}
-                                className='rounded-xl border border-default-200 bg-background/80 p-3'
-                              >
-                                <div className='text-[11px] font-medium text-default-400'>
-                                  {String(label)}
-                                </div>
-                                <div className='mt-1 text-sm leading-6'>
-                                  {String(value || '尚未生成')}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                          <div className='grid gap-3 md:grid-cols-2'>
-                            <div className='rounded-xl border border-default-200 bg-background/80 p-3'>
-                              <div className='text-[11px] font-medium text-default-400'>诊断证据</div>
-                              <div className='mt-2 space-y-1 font-mono text-xs'>
-                                {(Array.isArray(selectedEvolution.payload.evidence)
-                                  ? selectedEvolution.payload.evidence
-                                  : []
-                                ).map((evidence, index) => (
-                                  <div key={`${String(evidence)}-${index}`}>
-                                    {String(evidence)}
-                                  </div>
-                                ))}
-                                {!Array.isArray(selectedEvolution.payload.evidence) && '暂无证据'}
-                              </div>
-                            </div>
-                            <div className='rounded-xl border border-default-200 bg-background/80 p-3'>
-                              <div className='text-[11px] font-medium text-default-400'>补丁与验证</div>
-                              <div className='mt-2 text-xs leading-6 text-default-500'>
-                                {selectedEvolution.payload.patchHash
-                                  ? `补丁 ${String(selectedEvolution.payload.patchHash).slice(0, 16)}`
-                                  : '尚未生成可应用补丁'}
-                                <br />
-                                出现次数：{Number(selectedEvolution.payload.occurrences || 1)}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      <div className='space-y-4'>
-                        <div>
-                          <h3 className='mb-2 text-sm font-semibold'>证据与质量门槛</h3>
-                          <div className='grid grid-cols-2 gap-2'>
-                            {[
-                              [
-                                '证据数',
-                                selectedEvolution.metrics?.evidence ??
-                                selectedEvolution.sourceTurnIds.length,
-                              ],
-                              [
-                                '成功率',
-                              `${Math.round((selectedEvolution.metrics?.successRate || 0) * 100)}%`,
-                              ],
-                              [
-                                '回归率',
-                              `${Math.round((selectedEvolution.metrics?.regressionRate || 0) * 100)}%`,
-                              ],
-                              [
-                                '纠正权重',
-                              `${Math.round((selectedEvolution.metrics?.correctionRate || 0) * 100)}%`,
-                              ],
-                            ].map(([label, value]) => (
-                              <div key={String(label)} className='rounded-xl bg-default-50 p-3'>
-                                <div className='text-xs text-default-400'>{label}</div>
-                                <div className='mt-1 font-mono text-lg font-semibold'>{value}</div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                        <div>
-                          <h3 className='mb-2 text-sm font-semibold'>来源 Turn</h3>
-                          <div className='space-y-2'>
-                            {selectedEvolution.sourceTurnIds.map(turnId => (
-                              <div
-                                key={turnId}
-                                className='rounded-lg border border-default-200 bg-default-50 px-3 py-2 font-mono text-xs'
-                              >
-                                {turnId}
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                      <div>
-                        <h3 className='mb-2 text-sm font-semibold'>
-                          {repairArtifact ? '受管 Diff' : '候选内容'}
-                        </h3>
-                        <pre className='karin-scrollbar max-h-[520px] overflow-auto rounded-xl bg-[#091419] p-4 font-mono text-xs leading-5 text-[#F3F7F6]'>
-                          {repairArtifact || JSON.stringify(selectedEvolution.payload, null, 2)}
-                        </pre>
-                      </div>
-                    </div>
-                  </div>
-                )
-                : (
-                  <div className='grid h-full min-h-[420px] place-items-center text-sm text-default-400'>
-                    选择一个候选查看评测结果
-                  </div>
-                )}
-            </Panel>
+            )}
           </div>
-        </div>
+        </Panel>
       )}
 
       {tab === 'tools' && (
@@ -4129,6 +3978,42 @@ export default function AgentDashboard () {
               })}
             </div>
           </div>
+          {generatedTools.length > 0 && (
+            <div className='border-b border-default-200 bg-primary-50/40 p-5'>
+              <h3 className='text-sm font-semibold'>Generated Tool Library</h3>
+              <p className='mt-1 text-xs text-default-500'>
+                仅包含通过静态校验与隔离沙箱验证的纯计算 Tool；版本不可变并可回滚。
+              </p>
+              <div className='mt-3 grid gap-2 lg:grid-cols-2'>
+                {generatedTools.map((item, index) => (
+                  <div
+                    key={String(item.id || index)}
+                    className='rounded-xl border border-primary-100 bg-content1 p-3'
+                  >
+                    <div className='flex flex-wrap items-center gap-2'>
+                      <span className='font-mono text-xs font-semibold'>
+                        {String(item.name || '')}
+                      </span>
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] ${
+                        item.enabled
+                          ? 'bg-success-50 text-success-700'
+                          : 'bg-default-100 text-default-500'
+                      }`}
+                      >
+                        {item.enabled ? '已启用' : '已禁用'}
+                      </span>
+                    </div>
+                    <p className='mt-1 text-xs text-default-500'>
+                      {String(item.description || '')}
+                    </p>
+                    <p className='mt-2 font-mono text-[11px] text-default-400'>
+                      active {String(item.activeVersionId || 'none')}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <div className='grid gap-3 p-5 lg:grid-cols-2'>
             {tools.map((item, index) => (
               <details
@@ -4696,7 +4581,7 @@ export default function AgentDashboard () {
                   {(
                     [
                       ['maxCycles', '最多恢复周期', 0, 5],
-                      ['maxDiagnosticCalls', '诊断 Tool 上限', 1, 32],
+                      ['maxDiagnosticCalls', '诊断 Tool 最终熔断上限', 1, 99],
                       ['maxDurationMs', '恢复总时限（毫秒）', 10000, 600000],
                     ] as const
                   ).map(([key, label, min, max]) => (
@@ -4767,6 +4652,8 @@ export default function AgentDashboard () {
                         {key}
                         <input
                           type='number'
+                          min={1}
+                          max={key === 'maxToolRounds' ? 99 : undefined}
                           value={agentConfig.limits[key]}
                           onChange={event =>
                             setAgentConfig({
