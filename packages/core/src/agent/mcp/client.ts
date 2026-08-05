@@ -135,7 +135,8 @@ export class AgentMcpClientManager {
             })
           },
         },
-        true
+        true,
+        'mcp'
       )
       registered.push(name)
     }

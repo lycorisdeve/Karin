@@ -141,6 +141,17 @@ describe('Provider Registry', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
+  it('normalizes timeout errors after retry and fallback are exhausted', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const registry = new AgentProviderRegistry(config)
+
+    await expect(registry.complete(request)).rejects.toThrow('模型请求超时（1000ms）')
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+  })
+
   it('tries the thread model first and falls back to global routing when it is invalid', async () => {
     const calls: Array<{ url: string; model: string }> = []
     vi.stubGlobal('fetch', vi.fn(async (

@@ -52,8 +52,16 @@ const oneBotEvent = () => ({
       standard: 'onebot11',
       platform: 'qq',
     },
+    sendApi: vi.fn(async () => ({})),
+    recallMsg: vi.fn(async () => undefined),
   },
-  reply: vi.fn(async () => undefined),
+  reply: vi.fn(async () => ({
+    messageId: 'message-1',
+    message_id: 'message-1',
+    time: 0,
+    messageTime: 0,
+    rawData: {},
+  })),
 })
 
 const config = {
@@ -74,38 +82,52 @@ afterEach(() => {
 })
 
 describe('OneBot Agent interaction', () => {
-  it('only sends the final answer and hides execution progress', async () => {
+  it('sends a recalled thinking prompt and hides tool execution progress', async () => {
+    const result = {
+      threadId: 'thread',
+      turnId: 'turn',
+      state: 'completed' as const,
+      content: '任务已经创建。',
+    }
     const runtime = {
       currentSession: vi.fn(async () => ({ threadKey: 'onebot-thread' })),
-      runTurn: vi.fn(async (_input: AgentTurnInput) => {
-        return {
-          threadId: 'thread',
-          turnId: 'turn',
-          state: 'completed' as const,
-          content: '任务已经创建。',
-        }
-      }),
+      submitInteractiveTurn: vi.fn((_input: AgentTurnInput) => ({
+        requestId: 'request-1',
+        mode: 'started',
+        result: Promise.resolve(result),
+        isLatest: () => true,
+        release: vi.fn(),
+      })),
     } as unknown as AgentRuntime
     registerAgentIngress(runtime, () => config as never)
     const event = oneBotEvent()
 
     await fixtures.handler?.(event, vi.fn())
 
-    expect(event.reply).toHaveBeenCalledTimes(1)
+    expect(event.reply).toHaveBeenCalledTimes(2)
+    expect(event.reply).toHaveBeenNthCalledWith(1, 'Karin Agent 正在思考中，请稍后！')
     expect(event.reply).toHaveBeenCalledWith([
       { type: 'text', text: '任务已经创建。' },
     ])
+    expect(event.bot.recallMsg).toHaveBeenCalledWith(event.contact, 'message-1')
   })
 
   it('renders the same three approval commands for button and text adapters', async () => {
+    const result = {
+      threadId: 'thread',
+      turnId: 'turn',
+      state: 'waiting_approval' as const,
+      content: '需要确认外部调用。',
+      approvalId: '11111111-1111-1111-1111-111111111111',
+    }
     const runtime = {
       currentSession: vi.fn(async () => ({ threadKey: 'onebot-thread' })),
-      runTurn: vi.fn(async () => ({
-        threadId: 'thread',
-        turnId: 'turn',
-        state: 'waiting_approval' as const,
-        content: '需要确认外部调用。',
-        approvalId: '11111111-1111-1111-1111-111111111111',
+      submitInteractiveTurn: vi.fn(() => ({
+        requestId: 'request-1',
+        mode: 'started',
+        result: Promise.resolve(result),
+        isLatest: () => true,
+        release: vi.fn(),
       })),
     } as unknown as AgentRuntime
     registerAgentIngress(runtime, () => config as never)
@@ -130,5 +152,103 @@ describe('OneBot Agent interaction', () => {
         '/拒绝',
       ].join('\n'),
     }])
+  })
+
+  it('uses native OneBot input status for the lifetime of a turn', async () => {
+    let finish!: (value: {
+      threadId: string
+      turnId: string
+      state: 'completed'
+      content: string
+    }) => void
+    const result = new Promise<{
+      threadId: string
+      turnId: string
+      state: 'completed'
+      content: string
+    }>(resolve => {
+      finish = resolve
+    })
+    const runtime = {
+      currentSession: vi.fn(async () => ({ threadKey: 'onebot-thread' })),
+      submitInteractiveTurn: vi.fn(() => ({
+        requestId: 'request-1',
+        mode: 'started',
+        result,
+        isLatest: () => true,
+        release: vi.fn(),
+      })),
+    } as unknown as AgentRuntime
+    registerAgentIngress(runtime, () => config as never)
+    const event = oneBotEvent()
+
+    const handling = fixtures.handler?.(event, vi.fn())
+    await vi.waitFor(() => {
+      expect(event.bot.sendApi).toHaveBeenCalledWith(
+        'set_input_status',
+        { user_id: 20000, typing: true }
+      )
+    })
+    expect(event.reply).toHaveBeenCalledWith('Karin Agent 正在思考中，请稍后！')
+    finish({
+      threadId: 'thread',
+      turnId: 'turn',
+      state: 'completed',
+      content: '完成',
+    })
+    await handling
+
+    expect(event.bot.sendApi).toHaveBeenLastCalledWith(
+      'set_input_status',
+      { user_id: 20000, typing: false },
+      500
+    )
+  })
+
+  it('falls back to a recalled thinking message when native status is unavailable', async () => {
+    let finish!: (value: {
+      threadId: string
+      turnId: string
+      state: 'completed'
+      content: string
+    }) => void
+    const result = new Promise<{
+      threadId: string
+      turnId: string
+      state: 'completed'
+      content: string
+    }>(resolve => {
+      finish = resolve
+    })
+    const runtime = {
+      currentSession: vi.fn(async () => ({ threadKey: 'onebot-thread' })),
+      submitInteractiveTurn: vi.fn(() => ({
+        requestId: 'request-1',
+        mode: 'started',
+        result,
+        isLatest: () => true,
+        release: vi.fn(),
+      })),
+    } as unknown as AgentRuntime
+    registerAgentIngress(runtime, () => config as never)
+    const event = oneBotEvent()
+    event.bot.sendApi.mockRejectedValue(new Error('unsupported'))
+
+    const handling = fixtures.handler?.(event, vi.fn())
+    await vi.waitFor(() => {
+      expect(event.reply).toHaveBeenCalledWith('Karin Agent 正在思考中，请稍后！')
+    })
+    finish({
+      threadId: 'thread',
+      turnId: 'turn',
+      state: 'completed',
+      content: '完成',
+    })
+    await handling
+
+    expect(event.bot.recallMsg).toHaveBeenCalledWith(
+      event.contact,
+      'message-1'
+    )
   })
 })

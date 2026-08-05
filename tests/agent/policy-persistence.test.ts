@@ -232,7 +232,12 @@ describe('Agent policy and tool validation', () => {
     ).rejects.toThrow('工具参数校验失败')
 
     const output = await registry.execute('schema.echo', { value: 'ok' }, context(), 64)
-    expect(output).toEqual(expect.stringContaining('工具输出已截断'))
+    expect(output).toMatchObject({
+      truncated: true,
+      preview: expect.any(String),
+      bytes: expect.any(Number),
+    })
+    expect(() => JSON.stringify(output)).not.toThrow()
 
     registry.unregister('schema.echo')
   })

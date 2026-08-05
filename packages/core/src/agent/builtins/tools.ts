@@ -25,6 +25,10 @@ import type {
   AgentRepairProposal,
 } from '../repair/manager'
 import type { AgentToolRegistry } from '../tools/registry'
+import type { AgentTaskLedger } from '../tasks/ledger'
+import type { AgentCapabilityCatalog } from '../capabilities/catalog'
+import type { AgentGeneratedToolLibrary } from '../generated-tools/library'
+import type { AgentScriptToolDefinition } from '@/types/agent'
 
 const npmPackage = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[a-zA-Z0-9._-]+)?$/
 const browser = new AgentBrowserManager()
@@ -181,11 +185,101 @@ export const registerBuiltinTools = (
   runtime: AgentRuntime,
   scheduler: AgentScheduler,
   learning: AgentLearning,
+  taskLedger: AgentTaskLedger,
+  capabilities: AgentCapabilityCatalog,
+  generatedTools: AgentGeneratedToolLibrary,
   repair?: AgentRepairManager
 ) => {
   const register = (options: Parameters<typeof registry.register>[0]) => {
     registry.register(options, true)
   }
+
+  register({
+    name: 'karin.agent.todo',
+    description: [
+      '读取或更新当前 Thread 的持久化任务清单。',
+      '无 todos 参数时读取；merge=false 替换清单；merge=true 按 id 更新或追加。',
+      '多步骤任务必须先调用本工具，执行中及时维护状态；同一清单最多一个 in_progress。',
+    ].join(' '),
+    toolset: 'karin.agent',
+    tags: ['任务分解', '计划', 'Todo', '执行状态'],
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        goal: { type: 'string', minLength: 1, maxLength: 2000 },
+        merge: { type: 'boolean' },
+        todos: {
+          type: 'array',
+          maxItems: 64,
+          items: {
+            type: 'object',
+            required: ['id'],
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 100 },
+              content: { type: 'string', minLength: 1, maxLength: 2000 },
+              status: {
+                enum: ['pending', 'in_progress', 'completed', 'cancelled'],
+              },
+            },
+          },
+        },
+      },
+    },
+    risk: 'write',
+    reversible: true,
+    idempotent: true,
+    execute: (input, context) => taskLedger.write(
+      context.threadId,
+      context.turnId,
+      context.actor.id,
+      String(input.goal || ''),
+      {
+        goal: input.goal ? String(input.goal) : undefined,
+        merge: Boolean(input.merge),
+        todos: Array.isArray(input.todos)
+          ? input.todos.map(item => {
+            const todo = item as Record<string, unknown>
+            return {
+              id: String(todo.id),
+              content: todo.content === undefined ? undefined : String(todo.content),
+              status: todo.status as
+                | 'pending'
+                | 'in_progress'
+                | 'completed'
+                | 'cancelled'
+                | undefined,
+            }
+          })
+          : undefined,
+      }
+    ),
+  })
+
+  register({
+    name: 'karin.tool.search',
+    description: '统一检索当前 Thread 可用的 Tool、Skill、来源、版本、风险、可逆性和运行要求',
+    toolset: 'karin.agent',
+    tags: ['能力发现', 'Tool 搜索', 'Skill 搜索'],
+    inputSchema: {
+      type: 'object',
+      required: ['query'],
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: 500 },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+    risk: 'read',
+    idempotent: true,
+    execute: (input, context) => capabilities.search(
+      context.threadId,
+      String(input.query),
+      context.allowedTools,
+      Number(input.limit || 24)
+    ),
+  })
 
   register({
     name: 'karin.host.inspect',
@@ -678,11 +772,26 @@ export const registerBuiltinTools = (
 
   register({
     name: 'karin.skill.list',
-    description: '列出 Agent 声明式技能和当前活动版本',
-    inputSchema: { type: 'object', additionalProperties: false },
+    description: '列出或搜索当前 Thread 已固定版本的 Skill 紧凑索引；不会预加载正文',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', maxLength: 500 },
+      },
+    },
     risk: 'read',
     idempotent: true,
-    execute: () => database.listSkills(),
+    execute: async (input, context) => {
+      const query = String(input.query || '').trim().toLowerCase()
+      const skills = await database.getThreadSkillIndex(context.threadId)
+      if (!query) return skills
+      return skills.filter(skill =>
+        `${skill.name} ${skill.description} ${skill.tools.join(' ')}`
+          .toLowerCase()
+          .includes(query)
+      )
+    },
   })
 
   register({
@@ -700,6 +809,8 @@ export const registerBuiltinTools = (
       },
     },
     risk: 'write',
+    riskResolver: input => input.scope === 'global' ? 'external' : 'write',
+    reversible: true,
     execute: async (input, context) => {
       const content = String(input.content).trim()
       if (/api[_ -]?key|token|password|cookie|private key/i.test(content)) {
@@ -735,6 +846,7 @@ export const registerBuiltinTools = (
       },
     },
     risk: 'write',
+    reversible: true,
     permission: 'admin',
     execute: input => database.setMemoryEnabled(String(input.id), Boolean(input.enabled)),
   })
@@ -756,17 +868,188 @@ export const registerBuiltinTools = (
 
   register({
     name: 'karin.skill.view',
-    description: '查看指定声明式 Skill 的所有版本',
+    description: [
+      '按当前 Thread 固定版本读取 Skill 文件并记录加载轨迹。',
+      '省略 filePath 或传 SKILL.md 读取主说明；支持文件路径必须来自返回的 files manifest。',
+    ].join(' '),
     toolset: 'karin.skill',
     inputSchema: {
       type: 'object',
       required: ['id'],
       additionalProperties: false,
-      properties: { id: { type: 'string', minLength: 1 } },
+      properties: {
+        id: { type: 'string', minLength: 1 },
+        filePath: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 500,
+        },
+      },
     },
     risk: 'read',
     idempotent: true,
-    execute: input => database.getSkillVersions(String(input.id)),
+    execute: async (input, context) => {
+      const skill = await database.getThreadSkillVersion(
+        context.threadId,
+        String(input.id)
+      )
+      if (!skill) throw new Error('当前 Thread 未固定该 Skill')
+      const filePath = String(input.filePath || 'SKILL.md')
+      const content = filePath === 'SKILL.md'
+        ? skill.content
+        : await learning.readSkillFile(
+          skill.id,
+          skill.versionId,
+          filePath,
+          skill.filesManifest
+        )
+      await database.recordSkillLoad({
+        threadId: context.threadId,
+        turnId: context.turnId,
+        skillId: skill.id,
+        skillVersionId: skill.versionId,
+        filePath,
+      })
+      return {
+        id: skill.id,
+        name: skill.name,
+        description: skill.description,
+        versionId: skill.versionId,
+        version: skill.version,
+        tools: skill.tools,
+        filePath,
+        content,
+        files: Object.keys(skill.filesManifest),
+      }
+    },
+  })
+
+  register({
+    name: 'karin.skill.manage',
+    description: [
+      '创建或更新版本化声明式 Skill。',
+      '支持 create、patch、edit、write_file、remove_file、delete；优先用 patch。',
+      '每次变更创建不可变版本，新版本只进入新 Thread；删除和移除文件必须审批。',
+    ].join(' '),
+    toolset: 'karin.skill',
+    tags: ['Skill 创建', 'Skill patch', '支持文件', '版本化 Skill'],
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      additionalProperties: false,
+      properties: {
+        action: {
+          enum: ['create', 'patch', 'edit', 'write_file', 'remove_file', 'delete'],
+        },
+        id: { type: 'string', minLength: 1 },
+        name: { type: 'string', pattern: '^[a-z][a-z0-9-]{2,63}$' },
+        description: { type: 'string', minLength: 1, maxLength: 500 },
+        instructions: { type: 'string', minLength: 1, maxLength: 8192 },
+        tools: {
+          type: 'array',
+          uniqueItems: true,
+          maxItems: 50,
+          items: { type: 'string' },
+        },
+        filePath: { type: 'string', minLength: 1, maxLength: 500 },
+        content: { type: 'string', maxLength: 65536 },
+        search: { type: 'string', minLength: 1, maxLength: 8192 },
+        replace: { type: 'string', maxLength: 8192 },
+      },
+    },
+    risk: 'write',
+    riskResolver: input =>
+      ['remove_file', 'delete'].includes(String(input.action))
+        ? 'destructive'
+        : 'write',
+    reversible: true,
+    permission: 'admin',
+    execute: (input, context) => learning.manageSkill({
+      action: input.action as
+        | 'create'
+        | 'patch'
+        | 'edit'
+        | 'write_file'
+        | 'remove_file'
+        | 'delete',
+      id: input.id === undefined ? undefined : String(input.id),
+      name: input.name === undefined ? undefined : String(input.name),
+      description: input.description === undefined
+        ? undefined
+        : String(input.description),
+      instructions: input.instructions === undefined
+        ? undefined
+        : String(input.instructions),
+      tools: Array.isArray(input.tools) ? input.tools.map(String) : undefined,
+      filePath: input.filePath === undefined ? undefined : String(input.filePath),
+      content: input.content === undefined ? undefined : String(input.content),
+      search: input.search === undefined ? undefined : String(input.search),
+      replace: input.replace === undefined ? undefined : String(input.replace),
+    }, context.threadId, context.turnId, context.actor),
+  })
+
+  register({
+    name: 'karin.tool.manage',
+    description: [
+      '管理独立的版本化 Generated Tool。',
+      'create 只接受无文件、网络、环境变量和子进程权限的纯计算 Python Tool，',
+      '通过 AST、JSON Schema 与隔离沙箱校验后可自动启用。',
+    ].join(' '),
+    toolset: 'karin.tool',
+    tags: ['创建 Tool', '纯计算', '验证 Tool', '回滚 Tool'],
+    inputSchema: {
+      type: 'object',
+      required: ['action'],
+      additionalProperties: false,
+      properties: {
+        action: {
+          enum: ['create', 'validate', 'activate', 'deactivate', 'rollback', 'delete'],
+        },
+        name: { type: 'string', minLength: 3, maxLength: 128 },
+        description: { type: 'string', minLength: 1, maxLength: 500 },
+        definition: scriptToolSchema,
+        versionId: { type: 'string', minLength: 1 },
+      },
+    },
+    risk: 'write',
+    riskResolver: input => input.action === 'delete' ? 'destructive' : 'write',
+    reversible: true,
+    permission: 'admin',
+    execute: async (input, context) => {
+      const action = String(input.action)
+      const name = String(input.name || '')
+      if (action === 'create') {
+        if (!input.definition || typeof input.definition !== 'object') {
+          throw new Error('create 需要 definition')
+        }
+        return generatedTools.create({
+          name,
+          description: String(input.description || ''),
+          definition: input.definition as AgentScriptToolDefinition,
+        }, context)
+      }
+      if (!name) throw new Error(`${action} 需要 name`)
+      if (action === 'validate') return generatedTools.validate(name, context.signal)
+      if (action === 'activate') {
+        return generatedTools.setEnabled(name, true, context.actor, context.threadId)
+      }
+      if (action === 'deactivate') {
+        return generatedTools.setEnabled(name, false, context.actor, context.threadId)
+      }
+      if (action === 'rollback') {
+        if (!input.versionId) throw new Error('rollback 需要 versionId')
+        return generatedTools.rollback(
+          name,
+          String(input.versionId),
+          context.actor,
+          context.threadId
+        )
+      }
+      if (action === 'delete') {
+        return generatedTools.delete(name, context.actor, context.threadId)
+      }
+      throw new Error(`不支持的 action: ${action}`)
+    },
   })
 
   register({
@@ -798,6 +1081,7 @@ export const registerBuiltinTools = (
       },
     },
     risk: 'write',
+    reversible: true,
     permission: 'admin',
     execute: async (input, context) => {
       const skill = {
@@ -870,6 +1154,7 @@ export const registerBuiltinTools = (
       },
     },
     risk: 'write',
+    reversible: true,
     permission: 'admin',
     execute: (input, context) =>
       learning.setSkillEnabled(
@@ -893,6 +1178,7 @@ export const registerBuiltinTools = (
       },
     },
     risk: 'write',
+    reversible: true,
     permission: 'admin',
     execute: (input, context) =>
       learning.rollbackSkill(

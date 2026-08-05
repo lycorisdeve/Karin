@@ -29,6 +29,7 @@ interface LearningCandidate {
     instructions: string
     tools?: string[]
     scriptTools?: Array<Partial<AgentScriptToolDefinition>>
+    files?: Record<string, string | null>
   } | null
 }
 
@@ -51,6 +52,11 @@ const forbidden = [
   /\b(?:npm|pnpm|yarn|pip)\s+install\b/i,
   /\b(?:exec|spawn|eval|Function|child_process|process\.binding)\s*\(/,
 ]
+
+const skillFilePath = /^(?:references|templates|scripts)\/[a-zA-Z0-9._/-]+$/
+const maxSkillFiles = 64
+const maxSkillFileBytes = 64 * 1024
+const maxSkillFilesBytes = 512 * 1024
 
 const parseCandidate = (content: string): LearningCandidate | null => {
   const normalized = content
@@ -132,21 +138,13 @@ export class AgentLearning {
   ) {
     const [memories, skills] = await Promise.all([
       this.database.listMemories(this.memoryScopes(actor)),
-      this.database.getThreadSkillContents(threadId),
+      this.database.getThreadSkillIndex(threadId),
     ])
     const terms = termsFor(query)
     const rankedMemories = memories
       .map(item => ({ item, score: relevance(item.content, terms) }))
       .sort((left, right) => right.score - left.score || right.item.createdAt - left.item.createdAt)
       .slice(0, 12)
-    const rankedSkills = skills
-      .map(item => ({
-        item,
-        score: relevance(`${item.name}\n${item.content}`, terms),
-      }))
-      .sort((left, right) => right.score - left.score)
-      .slice(0, 8)
-
     await Promise.all([
       ...rankedMemories.map(({ item }, rank) =>
         this.database.recordRetrieval({
@@ -156,27 +154,19 @@ export class AgentLearning {
           itemId: item.id,
           rank,
         })),
-      ...rankedSkills.map(({ item }, rank) =>
-        this.database.recordRetrieval({
-          threadId,
-          turnId,
-          kind: 'skill',
-          itemId: item.id,
-          rank,
-        })),
     ])
 
     return {
       memories: rankedMemories.map(({ item }) => item.content),
-      skills: rankedSkills.map(({ item }) => item),
+      skills: skills.slice(0, 200),
     }
   }
 
   async learn (outcome: LearningOutcome) {
     const config = this.getConfig()
-    const [toolCalls, skills] = await Promise.all([
+    const [toolCalls, loadedSkillIds] = await Promise.all([
       this.database.listToolCalls(outcome.threadId, outcome.turnId),
-      this.database.getThreadSkillContents(outcome.threadId),
+      this.database.listTurnSkillLoads(outcome.threadId, outcome.turnId),
     ])
     await this.database.recordExperience({
       threadId: outcome.threadId,
@@ -185,13 +175,13 @@ export class AgentLearning {
       task: outcome.user,
       outcome: outcome.status,
       toolNames: [...new Set(toolCalls.map(item => item.name))],
-      skillIds: skills.map(item => item.id),
+      skillIds: loadedSkillIds,
       error: outcome.error,
     })
     await Promise.all(
-      skills.map(skill =>
+      loadedSkillIds.map(skillId =>
         this.database.touchSkillUsage(
-          skill.id,
+          skillId,
           outcome.status === 'completed' ? 'completed' : 'failed'
         )
       )
@@ -202,11 +192,32 @@ export class AgentLearning {
     if (!config.learning.reflection.enabled) return
     if (outcome.status === 'interrupted') return
     if (outcome.status === 'failed' && !config.learning.reflection.afterFailure) return
-    if (outcome.status === 'completed') {
+    const recoveredFromFailure =
+      outcome.status === 'completed' &&
+      toolCalls.some(item => item.status === 'failed') &&
+      toolCalls.some(item => item.status === 'completed')
+    const triggerReasons = [
+      toolCalls.length >= 5 ? 'five-or-more-tool-calls' : '',
+      recoveredFromFailure ? 'recovered-from-failure' : '',
+      outcome.status === 'failed' ? 'failed-outcome' : '',
+    ].filter(Boolean)
+    if (outcome.status === 'completed' && !triggerReasons.length) {
       const experiences = await this.database.listExperiences(1000, 'completed')
       if (experiences.length % config.learning.reflection.successInterval !== 0) return
+      triggerReasons.push('reusable-workflow-sampling')
     }
     if (!config.learning.memory && !config.learning.skills) return
+    await this.database.audit(
+      outcome.actor.id,
+      'evolution.reviewed',
+      outcome.turnId,
+      {
+        stage: 'reviewer.started',
+        reasons: triggerReasons,
+        toolCalls: toolCalls.length,
+      },
+      outcome.threadId
+    )
 
     const response = await this.provider.complete({
       model: '',
@@ -250,13 +261,40 @@ export class AgentLearning {
     })
 
     const candidate = parseCandidate(response.content)
-    if (!candidate) return
+    if (!candidate) {
+      await this.database.audit(
+        outcome.actor.id,
+        'evolution.reviewed',
+        outcome.turnId,
+        {
+          stage: 'reviewer.completed',
+          reasons: triggerReasons,
+          proposedMemories: 0,
+          proposedSkill: false,
+        },
+        outcome.threadId
+      )
+      return { reviewed: true, reasons: triggerReasons, proposed: false }
+    }
     for (const memory of candidate.memories?.slice(0, 5) || []) {
       await this.proposeMemory(memory, outcome)
     }
     if (candidate.skill && config.learning.skills) {
       await this.proposeSkill(candidate.skill, outcome)
     }
+    await this.database.audit(
+      outcome.actor.id,
+      'evolution.reviewed',
+      outcome.turnId,
+      {
+        stage: 'reviewer.completed',
+        reasons: triggerReasons,
+        proposedMemories: candidate.memories?.length || 0,
+        proposedSkill: Boolean(candidate.skill),
+      },
+      outcome.threadId
+    )
+    return { reviewed: true, reasons: triggerReasons, proposed: true }
   }
 
   async feedback (input: {
@@ -304,6 +342,19 @@ export class AgentLearning {
       { rating: input.rating, corrected: Boolean(correction) },
       input.threadId
     )
+    if (correction) {
+      await this.database.audit(
+        input.actor.id,
+        'evolution.reviewed',
+        input.turnId || id,
+        {
+          stage: 'reviewer.completed',
+          reasons: ['user-correction'],
+          candidateTarget: 'memory',
+        },
+        input.threadId
+      )
+    }
     return { id }
   }
 
@@ -365,7 +416,17 @@ export class AgentLearning {
       }
     }
 
-    const result = await this.createSkill(skill, threadId, turnId, actor)
+    const supportFiles = Object.fromEntries(
+      [...files.entries()]
+        .filter(([filename]) => skillFilePath.test(filename))
+        .map(([filename, content]) => [filename, content.toString('utf8')])
+    )
+    const result = await this.createSkill(
+      { ...skill, files: supportFiles },
+      threadId,
+      turnId,
+      actor
+    )
     const packageDirectory = path.resolve(
       this.skillsDirectory,
       result.skillId,
@@ -798,8 +859,37 @@ export class AgentLearning {
     if (tools.some(tool => !knownTools.has(tool))) {
       throw new Error('Skill 引用了未注册的 Tool')
     }
+    const files: Record<string, string | null> = {}
+    let totalBytes = 0
+    for (const [rawPath, rawContent] of Object.entries(skill.files || {})) {
+      const filePath = rawPath.replace(/\\/g, '/').replace(/^\.\/+/, '')
+      if (
+        !skillFilePath.test(filePath) ||
+        filePath.split('/').includes('..') ||
+        filePath.includes('//')
+      ) {
+        throw new Error(`Skill 支持文件路径非法: ${rawPath}`)
+      }
+      if (rawContent === null) {
+        files[filePath] = null
+        continue
+      }
+      const content = String(rawContent)
+      const size = Buffer.byteLength(content)
+      if (size > maxSkillFileBytes) {
+        throw new Error(`Skill 支持文件超过 ${maxSkillFileBytes} 字节: ${filePath}`)
+      }
+      if (forbidden.some(pattern => pattern.test(content))) {
+        throw new Error(`Skill 支持文件包含凭据、权限绕过或危险执行指令: ${filePath}`)
+      }
+      totalBytes += size
+      files[filePath] = content
+    }
+    if (Object.keys(files).length > maxSkillFiles || totalBytes > maxSkillFilesBytes) {
+      throw new Error('Skill 支持文件数量或总大小超过限制')
+    }
     const scriptTools = skill.scriptTools || []
-    return { name, description, instructions, tools, scriptTools }
+    return { name, description, instructions, tools, scriptTools, files }
   }
 
   async createSkill (
@@ -861,14 +951,56 @@ export class AgentLearning {
       normalized.instructions,
       '',
     ].join('\n')
+    const current = skillId
+      ? await this.database.getSkill(skillId)
+      : (await this.database.listSkills()).find(item => item.name === normalized.name)
+    const supportFiles = new Map<string, string>()
+    if (current?.activeVersionId) {
+      const active = (await this.database.getSkillVersions(current.id))
+        .find(row => String(row.id) === current.activeVersionId)
+      let manifest: Record<string, { size: number; hash: string }> = {}
+      try {
+        manifest = JSON.parse(String(active?.files_manifest_json || '{}'))
+      } catch {}
+      for (const filePath of Object.keys(manifest)) {
+        const filename = path.resolve(
+          this.skillsDirectory,
+          current.id,
+          current.activeVersionId,
+          filePath
+        )
+        const expected = `${path.resolve(
+          this.skillsDirectory,
+          current.id,
+          current.activeVersionId
+        )}${path.sep}`
+        if (`${filename}${path.sep}`.startsWith(expected)) {
+          const value = await fs.promises.readFile(filename, 'utf8').catch(() => null)
+          if (value !== null) supportFiles.set(filePath, value)
+        }
+      }
+    }
+    for (const [filePath, value] of Object.entries(normalized.files)) {
+      if (value === null) supportFiles.delete(filePath)
+      else supportFiles.set(filePath, value)
+    }
+    const filesManifest = Object.fromEntries(
+      [...supportFiles.entries()].sort(([left], [right]) => left.localeCompare(right))
+        .map(([filePath, value]) => [
+          filePath,
+          {
+            size: Buffer.byteLength(value),
+            hash: createHash('sha256').update(value).digest('hex'),
+          },
+        ])
+    )
     const contentHash = createHash('sha256')
       .update(content)
       .update('\0')
       .update(JSON.stringify(scriptTools))
+      .update('\0')
+      .update(JSON.stringify(filesManifest))
       .digest('hex')
-    const current = skillId
-      ? await this.database.getSkill(skillId)
-      : (await this.database.listSkills()).find(item => item.name === normalized.name)
     const result = await this.database.addSkillVersion({
       skillId,
       newSkillId: skillId ? undefined : targetSkillId,
@@ -879,7 +1011,31 @@ export class AgentLearning {
       sourceTurnId: turnId,
       contentHash,
       scriptTools,
+      filesManifest,
     })
+    for (const script of scriptTools) {
+      const name = scriptToolName(result.skillId, script.id)
+      const generated = await this.database.getGeneratedTool(name)
+      const duplicate = generated
+        ? (await this.database.getGeneratedToolVersions(generated.id))
+          .find(version => version.definition.sourceHash === script.sourceHash)
+        : undefined
+      if (duplicate) {
+        await this.database.rollbackGeneratedTool(generated!.id, duplicate.id)
+      } else {
+        await this.database.addGeneratedToolVersion({
+          toolId: generated?.id,
+          name,
+          description: script.description,
+          definition: script,
+          validationStatus: 'valid',
+          validationReport: '由旧 karin.skill.create 兼容 Adapter 复制并通过受限 Python 校验',
+          sourceTurnId: turnId,
+          activate: true,
+          legacyAlias: name,
+        })
+      }
+    }
 
     const skillDirectory = path.resolve(this.skillsDirectory, result.skillId)
     const expectedRoot = `${path.resolve(this.skillsDirectory)}${path.sep}`
@@ -889,12 +1045,29 @@ export class AgentLearning {
     await fs.promises.mkdir(skillDirectory, { recursive: true })
     const filename = path.join(skillDirectory, `${result.versionId}.md`)
     await fs.promises.writeFile(filename, content, { encoding: 'utf8', flag: 'wx' })
+    const versionDirectory = path.join(skillDirectory, result.versionId)
+    await fs.promises.mkdir(versionDirectory, { recursive: true })
+    await fs.promises.writeFile(
+      path.join(versionDirectory, 'SKILL.md'),
+      content,
+      { encoding: 'utf8', flag: 'wx' }
+    )
+    for (const [filePath, value] of supportFiles) {
+      const supportFilename = path.resolve(versionDirectory, filePath)
+      if (!`${supportFilename}${path.sep}`.startsWith(`${versionDirectory}${path.sep}`)) {
+        throw new Error(`Skill 支持文件路径越界: ${filePath}`)
+      }
+      await fs.promises.mkdir(path.dirname(supportFilename), { recursive: true })
+      await fs.promises.writeFile(
+        supportFilename,
+        value,
+        { encoding: 'utf8', flag: 'wx' }
+      )
+    }
     if (scriptTools.length) {
-      const scriptDirectory = path.join(skillDirectory, result.versionId)
-      await fs.promises.mkdir(scriptDirectory, { recursive: true })
       for (const script of scriptTools) {
         await fs.promises.writeFile(
-          path.join(scriptDirectory, `${script.id}.py`),
+          path.join(versionDirectory, `${script.id}.py`),
           script.source,
           { encoding: 'utf8', flag: 'wx' }
         )
@@ -911,6 +1084,9 @@ export class AgentLearning {
           id: script.id,
           sourceHash: script.sourceHash,
         })),
+        filesManifest,
+        autoApproved: true,
+        reason: 'trusted-versioned-declarative-skill',
       },
       threadId
     )
@@ -919,6 +1095,109 @@ export class AgentLearning {
       ...result,
       baselineVersion: current?.activeVersionId || undefined,
     }
+  }
+
+  async manageSkill (
+    input: {
+      action: 'create' | 'patch' | 'edit' | 'write_file' | 'remove_file' | 'delete'
+      id?: string
+      name?: string
+      description?: string
+      instructions?: string
+      tools?: string[]
+      filePath?: string
+      content?: string
+      search?: string
+      replace?: string
+    },
+    threadId: string,
+    turnId: string,
+    actor: AgentActor
+  ) {
+    if (input.action === 'create') {
+      return this.createSkill({
+        name: String(input.name || ''),
+        description: String(input.description || ''),
+        instructions: String(input.instructions || ''),
+        tools: input.tools || [],
+        files: {},
+      }, threadId, turnId, actor)
+    }
+    const reference = String(input.id || input.name || '')
+    const current = await this.database.getSkill(reference) ||
+      (await this.database.listSkills()).find(item => item.name === reference)
+    if (!current) throw new Error('Skill 不存在')
+    if (input.action === 'delete') return this.deleteSkill(current.id, actor)
+    const active = (await this.database.getSkillVersions(current.id))
+      .find(row => String(row.id) === current.activeVersionId)
+    if (!active) throw new Error('Skill 没有活动版本')
+    const document = parseSkillDocument(String(active.content))
+    const next = {
+      ...document,
+      name: input.name === undefined ? document.name : String(input.name),
+      description: input.description === undefined
+        ? document.description
+        : String(input.description),
+      instructions: input.instructions === undefined
+        ? document.instructions
+        : String(input.instructions),
+      tools: input.tools === undefined ? document.tools : input.tools.map(String),
+      files: {} as Record<string, string | null>,
+    }
+    if (input.action === 'patch') {
+      const search = String(input.search || '')
+      if (!search || !document.instructions.includes(search)) {
+        throw new Error('patch 的 search 不能为空且必须在当前 SKILL.md 正文中唯一命中')
+      }
+      if (document.instructions.split(search).length !== 2) {
+        throw new Error('patch 的 search 命中多处，请提供更精确上下文')
+      }
+      next.instructions = document.instructions.replace(search, String(input.replace || ''))
+    }
+    if (input.action === 'write_file') {
+      if (!input.filePath || input.content === undefined) {
+        throw new Error('write_file 需要 filePath 和 content')
+      }
+      next.files[String(input.filePath)] = String(input.content)
+    }
+    if (input.action === 'remove_file') {
+      if (!input.filePath) throw new Error('remove_file 需要 filePath')
+      next.files[String(input.filePath)] = null
+    }
+    return this.updateSkill(current.id, next, threadId, turnId, actor)
+  }
+
+  async readSkillFile (
+    skillId: string,
+    versionId: string,
+    filePath: string,
+    manifest: Record<string, { size: number; hash: string }>
+  ) {
+    const normalized = filePath.replace(/\\/g, '/').replace(/^\.\/+/, '')
+    if (!skillFilePath.test(normalized) || !manifest[normalized]) {
+      throw new Error('Skill 支持文件不存在或路径不在版本 manifest 中')
+    }
+    const versionRoot = path.resolve(this.skillsDirectory, skillId, versionId)
+    const filename = path.resolve(versionRoot, normalized)
+    if (!`${filename}${path.sep}`.startsWith(`${versionRoot}${path.sep}`)) {
+      throw new Error('Skill 支持文件路径越界')
+    }
+    const [realRoot, realFile] = await Promise.all([
+      fs.promises.realpath(versionRoot),
+      fs.promises.realpath(filename),
+    ])
+    if (!`${realFile}${path.sep}`.startsWith(`${realRoot}${path.sep}`)) {
+      throw new Error('Skill 支持文件通过符号链接越界')
+    }
+    const content = await fs.promises.readFile(realFile, 'utf8')
+    const hash = createHash('sha256').update(content).digest('hex')
+    if (
+      Buffer.byteLength(content) !== manifest[normalized].size ||
+      hash !== manifest[normalized].hash
+    ) {
+      throw new Error('Skill 支持文件与不可变版本 manifest 不一致')
+    }
+    return content
   }
 
   async deleteSkill (skillId: string, actor: AgentActor) {
@@ -1045,7 +1324,7 @@ export class AgentLearning {
               throw error
             }
           },
-        })
+        }, true, 'generated-sandbox')
       }
     }
   }

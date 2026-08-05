@@ -3,10 +3,13 @@ import type { Message } from '../event/event'
 
 export type AgentToolRisk = 'read' | 'write' | 'external' | 'destructive'
 export type AgentPolicyDecision = 'allow' | 'ask' | 'deny'
+export type AgentTaskItemStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled'
+export type AgentTaskListState = 'active' | 'completed' | 'cancelled'
 export type AgentThreadState =
   | 'idle'
   | 'stopping'
   | 'running'
+  | 'recovery_pending'
   | 'waiting_approval'
   | 'completed'
   | 'failed'
@@ -148,9 +151,72 @@ export interface AgentToolOptions<
   outputSchema?: Record<string, unknown>
   permission?: Permission
   risk?: AgentToolRisk
+  /** 可根据已校验输入把风险向上提升；不能把基础风险降级。 */
+  riskResolver?: (input: TInput) => AgentToolRisk
   timeout?: number
   idempotent?: boolean
+  /**
+   * 表示写入可通过版本或事务完整恢复。该声明只用于展示；是否自动审批还取决于
+   * Tool 来源，插件和 MCP Tool 不能仅凭此字段获得信任。
+   */
+  reversible?: boolean
+  /** Tool 当前是否可用；异常按不可用处理。 */
+  availability?: () => boolean
+  /** 用于管理界面解释 Tool 不可用原因的运行要求。 */
+  requirements?: string[]
+  /** 能力归属，仅用于策略解释和审计，不能自行提升信任。 */
+  owner?: string
+  /** Tool 输入输出可能包含的数据敏感级别。 */
+  sensitivity?: 'public' | 'private' | 'credential'
+  /** Core 重启后是否允许在幂等前提下自动重放。 */
+  restartSafe?: boolean
   execute: (input: TInput, context: AgentToolContext) => TOutput | Promise<TOutput>
+}
+
+export interface AgentTaskItem {
+  id: string
+  content: string
+  status: AgentTaskItemStatus
+  order: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AgentTaskList {
+  id: string
+  threadId: string
+  sourceTurnId: string
+  goal: string
+  state: AgentTaskListState
+  items: AgentTaskItem[]
+  createdAt: number
+  updatedAt: number
+}
+
+export type AgentCapabilityKind = 'tool' | 'skill'
+export type AgentCapabilitySource =
+  | 'core'
+  | 'generated-sandbox'
+  | 'plugin'
+  | 'mcp'
+  | 'skill-library'
+
+export interface AgentCapabilityDescriptor {
+  name: string
+  kind: AgentCapabilityKind
+  description: string
+  source: AgentCapabilitySource
+  toolset?: string
+  tags: string[]
+  version?: string
+  risk?: AgentToolRisk
+  reversible?: boolean
+  available: boolean
+  requirements: string[]
+  owner?: string
+  sensitivity?: 'public' | 'private' | 'credential'
+  restartSafe?: boolean
+  unavailableReason?: string
 }
 
 export interface AgentPolicyRule {
@@ -173,6 +239,8 @@ export interface AgentProviderProfile {
   visionModels?: string[]
   model: string
   timeout: number
+  /** 模型上下文窗口；未知时使用 Agent context.defaultWindowTokens。 */
+  contextWindowTokens?: number
   verification?: {
     testedAt: number
     chat: boolean
@@ -233,6 +301,20 @@ export interface AgentEvolutionCandidate {
   updatedAt: number
 }
 
+export interface AgentEvolutionLogEntry {
+  id: string
+  candidateId: string
+  action: 'improved' | 'rolled_back' | 'failed'
+  target: AgentEvolutionTarget
+  summary: string
+  change: string
+  candidateVersion: string
+  sourceTurnIds: string[]
+  actorId: string
+  detail: Record<string, unknown>
+  createdAt: number
+}
+
 export type AgentTurnPhase =
   | 'observe'
   | 'plan'
@@ -283,6 +365,8 @@ export interface AgentToolReceipt {
   startedAt: number
   completedAt: number
   idempotent: boolean
+  restartSafe?: boolean
+  artifactId?: string
   delivery?: {
     completed: boolean
     channel?: string
@@ -304,6 +388,7 @@ export interface AgentToolResultEnvelope<T = unknown> {
   errorCode?: string
   data?: T
   error?: string
+  inputHash?: string
   receipt: AgentToolReceipt
   evidence: string[]
 }
@@ -421,8 +506,30 @@ export interface AgentScriptToolDefinition {
   failure: AgentScriptFailurePolicy
 }
 
+export interface AgentGeneratedToolRecord {
+  id: string
+  name: string
+  description: string
+  enabled: boolean
+  activeVersionId: string | null
+  legacyAlias?: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AgentGeneratedToolVersion {
+  id: string
+  toolId: string
+  version: number
+  definition: AgentScriptToolDefinition
+  validationStatus: 'pending' | 'valid' | 'invalid'
+  validationReport: string
+  sourceTurnId: string
+  createdAt: number
+}
+
 export interface AgentConfig {
-  version: 7
+  version: 9
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: {
@@ -440,11 +547,28 @@ export interface AgentConfig {
     maxRecentMessages: number
     maxSubagents: number
   }
+  context: {
+    defaultWindowTokens: number
+    softLimitRatio: number
+    hardLimitRatio: number
+    protectedRecentMessages: number
+    summaryTargetTokens: number
+  }
+  journal: {
+    recoveryAttempts: number
+    eventRetentionDays: number
+  }
+  tasks: {
+    enabled: boolean
+    maxItems: number
+    completionGuardRetries: number
+  }
   policy: {
     approvalTtlMs: number
     hardDeny: string[]
     rules: AgentPolicyRule[]
     defaults: Record<AgentToolRisk, AgentPolicyDecision>
+    autoApproveTrustedReversible: boolean
   }
   learning: AgentLearningConfig
   recovery: AgentRecoveryConfig
@@ -480,6 +604,16 @@ export interface AgentTurnInput {
   onDelta?: (delta: string) => void | Promise<void>
   onEvent?: (event: AgentStreamEvent) => void | Promise<void>
   onResult?: (result: AgentTurnResult) => void | Promise<void>
+  interactiveRequestId?: string
+  /** 渠道消息 ID 或 Web 生成的幂等键。 */
+  idempotencyKey?: string
+  resume?: {
+    fromTurnId: string
+    rootContent: string
+    supplements: string[]
+    pendingMessages: string[]
+    toolResults: AgentToolResultEnvelope[]
+  }
 }
 
 export interface AgentActivityView {
@@ -513,7 +647,35 @@ export interface AgentTurnResult {
   turnId: string
   state: AgentThreadState
   content: string
+  finalMessageId?: string
   approvalId?: string
+}
+
+export type AgentDeliveryState =
+  | 'pending'
+  | 'dispatching'
+  | 'sent'
+  | 'not_sent'
+  | 'unknown_after_send'
+  | 'failed'
+  | 'cancelled'
+
+export interface AgentDeliveryReceipt {
+  operationId: string
+  state: AgentDeliveryState
+  channel: string
+  adapterMessageId?: string
+  retrySafe: boolean
+  errorCode?: string
+  error?: string
+}
+
+export interface AgentToolArtifact {
+  id: string
+  hash: string
+  bytes: number
+  preview: string
+  createdAt: number
 }
 
 export interface AgentDelegateBatchTask {
@@ -537,8 +699,14 @@ export interface AgentStreamEvent {
   turnId?: string
   type:
     | 'turn.started'
+    | 'turn.interrupting'
+    | 'turn.resumed'
     | 'plan.created'
+    | 'task.updated'
+    | 'skill.loaded'
+    | 'capability.missing'
     | 'verification.completed'
+    | 'execution.budget'
     | 'recovery.started'
     | 'recovery.completed'
     | 'repair.candidate'
@@ -553,6 +721,8 @@ export interface AgentStreamEvent {
     | 'turn.failed'
     | 'delivery.completed'
     | 'delivery.failed'
+    | 'delivery.updated'
+    | 'evolution.reviewed'
   data: unknown
   createdAt: number
 }

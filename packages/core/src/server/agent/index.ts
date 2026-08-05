@@ -27,6 +27,7 @@ import type {
   AgentActivityView,
   AgentActor,
   AgentConfig,
+  AgentStreamEvent,
   AgentThreadState,
 } from '@/types/agent'
 
@@ -128,6 +129,7 @@ const validateConfig = (value: unknown): value is AgentConfig => {
     (config.routing === undefined || typeof config.routing === 'object') &&
     Boolean(config.trigger) &&
     Boolean(config.limits) &&
+    Boolean(config.tasks) &&
     Boolean(config.policy) &&
     Boolean(config.learning) &&
     Boolean(config.tools) &&
@@ -219,6 +221,36 @@ agentRouter.get(
 )
 
 agentRouter.get(
+  '/generated-tools',
+  safe(async (_req, res) => {
+    const library = getAgentServices()?.generatedTools
+    if (!library) throw new Error('Generated Tool Library 不可用')
+    createSuccessResponse(res, await library.list())
+  })
+)
+
+agentRouter.get(
+  '/generated-tools/:id/versions',
+  safe(async (req, res) => {
+    const library = getAgentServices()?.generatedTools
+    if (!library) throw new Error('Generated Tool Library 不可用')
+    createSuccessResponse(res, await library.versions(String(req.params.id)))
+  })
+)
+
+agentRouter.get(
+  '/generated-tools/:id/validation',
+  safe(async (req, res) => {
+    const library = getAgentServices()?.generatedTools
+    if (!library) throw new Error('Generated Tool Library 不可用')
+    createSuccessResponse(
+      res,
+      await library.validate(String(req.params.id), AbortSignal.timeout(120_000))
+    )
+  })
+)
+
+agentRouter.get(
   '/threads',
   safe(async (req, res) => {
     const limit = Number(req.query.limit || 100)
@@ -250,6 +282,25 @@ agentRouter.post(
     const threadKey = String(req.body?.threadKey || `web:${actor.id}:${randomUUID()}`)
     const thread = await database().getOrCreateThread(threadKey, actor)
     createSuccessResponse(res, thread)
+  })
+)
+
+agentRouter.get(
+  '/threads/:id/tasks',
+  safe(async (req, res) => {
+    const threadId = String(req.params.id)
+    if (!await database().getThread(threadId)) {
+      createNotFoundResponse(res, 'Thread 不存在')
+      return
+    }
+    const history = String(req.query.history || '') === 'true'
+    const lists = await database().listTaskLists(threadId)
+    createSuccessResponse(
+      res,
+      history
+        ? lists
+        : await database().getActiveTaskList(threadId) || lists[0] || null
+    )
   })
 )
 
@@ -580,18 +631,74 @@ agentRouter.post(
         },
       }
       : webActor
-    const requestId = runtime().startTurn({
+    const submission = runtime().startTurn({
       threadKey: thread.threadKey,
       actor: turnActor,
       content,
+      idempotencyKey: req.body?.idempotencyKey
+        ? String(req.body.idempotencyKey).slice(0, 256)
+        : undefined,
       onResult: async result => {
         await runtime().deliverThreadResult(thread, result, webActor.id)
       },
     })
     res.status(202).json({
       code: 202,
-      data: { accepted: true, requestId, threadId: thread.id },
+      data: {
+        accepted: true,
+        requestId: submission.requestId,
+        runId: submission.requestId,
+        threadId: thread.id,
+        mode: submission.mode,
+        interrupted: submission.interrupted,
+      },
       message: '已接受',
+    })
+  })
+)
+
+agentRouter.get(
+  '/threads/:id/deliveries',
+  safe(async (req, res) => {
+    const thread = await database().getThread(String(req.params.id))
+    if (!thread) {
+      createNotFoundResponse(res, 'Thread 不存在')
+      return
+    }
+    createSuccessResponse(
+      res,
+      await database().listDeliveryOperations(
+        thread.id,
+        Number(req.query.limit || 100)
+      )
+    )
+  })
+)
+
+agentRouter.get(
+  '/threads/:id/turns/:turnId',
+  safe(async (req, res) => {
+    const turn = (await database().listTurns(String(req.params.id)))
+      .find(item => item.id === String(req.params.turnId))
+    if (!turn) {
+      createNotFoundResponse(res, 'Turn 不存在')
+      return
+    }
+    createSuccessResponse(res, turn)
+  })
+)
+
+agentRouter.get(
+  '/tool-artifacts/:id',
+  safe(async (req, res) => {
+    const artifact = await database().getToolArtifact(String(req.params.id))
+    if (!artifact) {
+      createNotFoundResponse(res, 'Tool Artifact 不存在')
+      return
+    }
+    createSuccessResponse(res, {
+      ...artifact,
+      content: JSON.parse(artifact.content),
     })
   })
 )
@@ -671,14 +778,14 @@ agentRouter.get(
     res.setHeader('Connection', 'keep-alive')
     res.flushHeaders()
 
-    const send = (event: ReturnType<typeof agent.events.publish>) => {
+    const send = (event: AgentStreamEvent) => {
       const safeEvent = redactValue(event)
       res.write(`id: ${event.id}\n`)
       res.write(`event: ${event.type}\n`)
       res.write(`data: ${JSON.stringify(safeEvent)}\n\n`)
     }
     const threadId = String(req.params.id)
-    for (const event of agent.events.replay(threadId, afterId)) send(event)
+    for (const event of await agent.events.replay(threadId, afterId)) send(event)
     const unsubscribe = agent.events.subscribe(threadId, send)
     const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000)
     req.once('close', () => {
@@ -951,6 +1058,42 @@ agentRouter.get(
   '/usage',
   safe(async (req, res) => {
     createSuccessResponse(res, await database().listUsage(Number(req.query.limit || 200)))
+  })
+)
+
+agentRouter.get(
+  '/evolution/logs',
+  safe(async (req, res) => {
+    createSuccessResponse(res, await database().listEvolutionLog(Number(req.query.limit || 200)))
+  })
+)
+
+agentRouter.post(
+  '/evolution/logs/:id/delete',
+  safe(async (req, res) => {
+    if (req.body?.confirm !== true) {
+      createBadRequestResponse(res, '删除自我进化日志需要明确确认')
+      return
+    }
+    const actor = actorFromRequest(req)
+    const logId = String(req.params.id)
+    const deleted = await database().deleteEvolutionLog(logId)
+    await database().audit(actor.id, 'evolution.log.delete', logId, { deleted })
+    createSuccessResponse(res, { deleted })
+  })
+)
+
+agentRouter.post(
+  '/evolution/logs/clear',
+  safe(async (req, res) => {
+    if (req.body?.confirm !== true) {
+      createBadRequestResponse(res, '清空自我进化日志需要明确确认')
+      return
+    }
+    const actor = actorFromRequest(req)
+    const deleted = await database().clearEvolutionLog()
+    await database().audit(actor.id, 'evolution.log.clear', 'all', { deleted })
+    createSuccessResponse(res, { deleted })
   })
 )
 

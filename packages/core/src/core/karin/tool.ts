@@ -32,6 +32,7 @@ export const createAgentTool = <
     ...options,
     permission: options.permission || 'all',
     risk: options.risk || 'read',
+    riskResolver: options.riskResolver as AgentTool['riskResolver'],
     timeout: options.timeout || 30_000,
     idempotent: options.idempotent ?? false,
     execute: options.execute as AgentTool['execute'],

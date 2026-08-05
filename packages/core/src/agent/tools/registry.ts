@@ -3,11 +3,13 @@ import { cache } from '@/plugin/system/cache'
 import { createAgentTool } from '@/core/karin/tool'
 
 import type {
+  AgentCapabilitySource,
   AgentToolContext,
   AgentToolOptions,
   AgentToolResultEnvelope,
 } from '@/types/agent'
 import type { AgentTool } from '@/types/plugin'
+import type { AgentDatabase } from '../persistence/database'
 
 interface CompiledTool {
   tool: AgentTool
@@ -16,6 +18,19 @@ interface CompiledTool {
 }
 
 const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
+const sensitiveKey = /authorization|cookie|token|password|api[-_]?key|secret/i
+
+const redactArtifactValue = (value: unknown, key = ''): unknown => {
+  if (sensitiveKey.test(key)) return '[REDACTED]'
+  if (Array.isArray(value)) return value.map(item => redactArtifactValue(item))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .map(([itemKey, item]) => [itemKey, redactArtifactValue(item, itemKey)])
+    )
+  }
+  return value
+}
 
 export class AgentToolRegistry {
   private readonly ajv = new Ajv({
@@ -25,8 +40,15 @@ export class AgentToolRegistry {
   })
 
   private readonly compiled = new Map<string, CompiledTool>()
+  private readonly sources = new Map<string, AgentCapabilitySource>()
 
-  register (options: AgentToolOptions, allowReserved = false) {
+  constructor (private readonly database?: AgentDatabase) {}
+
+  register (
+    options: AgentToolOptions,
+    allowReserved = false,
+    source: AgentCapabilitySource = allowReserved ? 'core' : 'plugin'
+  ) {
     const tool = createAgentTool(options, allowReserved)
     this.validateDefinition(tool)
     if (cache.tool.some(item => item.name === tool.name)) {
@@ -34,6 +56,7 @@ export class AgentToolRegistry {
     }
     cache.tool.push(tool)
     cache.count.tool++
+    this.sources.set(tool.name, source)
     return tool
   }
 
@@ -41,6 +64,7 @@ export class AgentToolRegistry {
     const previous = cache.tool.length
     cache.tool = cache.tool.filter(tool => tool.name !== name)
     this.compiled.delete(name)
+    this.sources.delete(name)
     if (cache.tool.length !== previous) {
       cache.count.tool = Math.max(0, cache.count.tool - 1)
       return true
@@ -80,6 +104,13 @@ export class AgentToolRegistry {
     return cache.tool
       .filter(tool => !allowed || allowed.has(tool.name))
       .map(tool => ({
+        available: (() => {
+          try {
+            return tool.availability ? Boolean(tool.availability()) : true
+          } catch {
+            return false
+          }
+        })(),
         name: tool.name,
         description: tool.description,
         source: tool.name.startsWith('karin.')
@@ -87,6 +118,15 @@ export class AgentToolRegistry {
           : tool.name.startsWith('mcp.')
             ? tool.name.split('.').slice(0, 2).join('.')
             : tool.pkg?.name || 'unknown',
+        sourceKind: this.sources.get(tool.name) || (
+          tool.name.startsWith('mcp.')
+            ? 'mcp'
+            : tool.name.startsWith('skill.')
+              ? 'generated-sandbox'
+              : tool.name.startsWith('karin.')
+                ? 'core'
+                : 'plugin'
+        ),
         toolset: tool.toolset || (
           tool.name.startsWith('karin.')
             ? `karin.${tool.name.split('.')[1] || 'core'}`
@@ -98,6 +138,25 @@ export class AgentToolRegistry {
         inputSchema: tool.inputSchema,
         risk: tool.risk || 'read',
         permission: tool.permission || 'all',
+        reversible: Boolean(tool.reversible),
+        requirements: tool.requirements || [],
+        owner: tool.owner || tool.pkg?.name || (
+          tool.name.startsWith('karin.') ? 'karin-core' : undefined
+        ),
+        sensitivity: tool.sensitivity || 'private',
+        restartSafe: Boolean(tool.restartSafe || (
+          tool.idempotent && (tool.risk || 'read') === 'read'
+        )),
+        unavailableReason: (() => {
+          try {
+            if (!tool.availability || tool.availability()) return undefined
+            return tool.requirements?.length
+              ? `缺少运行要求：${tool.requirements.join('、')}`
+              : '当前运行环境不可用'
+          } catch (error) {
+            return `可用性检查失败：${(error as Error).message}`
+          }
+        })(),
       }))
   }
 
@@ -171,7 +230,7 @@ export class AgentToolRegistry {
       if (delegateIntent && name === 'karin.agent.delegate_many') value += 36
       return value
     }
-    const tools = this.list(allowedTools)
+    const tools = this.list(allowedTools).filter(tool => tool.available)
     if (tools.length <= limit) return tools
     const selected = tools
       .map((tool, index) => ({ tool, index, score: score(tool) }))
@@ -201,8 +260,17 @@ export class AgentToolRegistry {
     }
 
     const timeout = Math.max(1, compiled.tool.timeout || 30_000)
-    const signal = AbortSignal.any([context.signal, AbortSignal.timeout(timeout)])
-    const output = await compiled.tool.execute(input, { ...context, signal })
+    const timeoutSignal = AbortSignal.timeout(timeout)
+    const signal = AbortSignal.any([context.signal, timeoutSignal])
+    let output: unknown
+    try {
+      output = await compiled.tool.execute(input, { ...context, signal })
+    } catch (error) {
+      if (timeoutSignal.aborted && !context.signal.aborted) {
+        throw new Error(`工具 ${name} 执行超时（${timeout}ms）`, { cause: error })
+      }
+      throw error
+    }
     if (compiled.output && !compiled.output(output)) {
       throw new Error(
         `工具输出校验失败: ${this.ajv.errorsText(compiled.output.errors, { separator: '; ' })}`
@@ -211,12 +279,28 @@ export class AgentToolRegistry {
 
     const serialized = JSON.stringify(output ?? null)
     if (byteLength(serialized) <= maxOutputBytes) return output
-
-    const suffix = `\n…[工具输出已截断，上限 ${maxOutputBytes} bytes]`
-    const truncated = Buffer.from(serialized)
-      .subarray(0, Math.max(0, maxOutputBytes - byteLength(suffix)))
-      .toString('utf8')
-    return `${truncated}${suffix}`
+    const redacted = JSON.stringify(redactArtifactValue(output ?? null))
+    if (byteLength(redacted) > 5 * 1024 * 1024) {
+      throw new Error('工具输出超过 Artifact 5 MiB 上限')
+    }
+    const preview = redacted.slice(0, Math.max(256, Math.min(maxOutputBytes / 2, 4096)))
+    if (!this.database) {
+      return { truncated: true, preview, bytes: byteLength(redacted) }
+    }
+    const artifact = await this.database.createToolArtifact({
+      threadId: context.threadId,
+      turnId: context.turnId,
+      toolName: name,
+      content: redacted,
+      preview,
+    })
+    return {
+      truncated: true,
+      artifactId: artifact.id,
+      preview: artifact.preview,
+      hash: artifact.hash,
+      bytes: artifact.bytes,
+    }
   }
 
   async executeWithReceipt (
@@ -268,6 +352,12 @@ export class AgentToolRegistry {
           startedAt,
           completedAt: Date.now(),
           idempotent,
+          restartSafe: Boolean(compiled?.tool.restartSafe || (
+            compiled?.tool.idempotent && (compiled?.tool.risk || 'read') === 'read'
+          )),
+          artifactId: typeof object.artifactId === 'string'
+            ? object.artifactId
+            : undefined,
           delivery,
           media,
         },

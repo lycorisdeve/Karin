@@ -1,4 +1,9 @@
-import type { AgentConfig, AgentPolicyDecision, AgentToolContext } from '@/types/agent'
+import type {
+  AgentConfig,
+  AgentPolicyDecision,
+  AgentToolContext,
+  AgentToolRisk,
+} from '@/types/agent'
 import type { AgentTool } from '@/types/plugin'
 import type { Permission } from '@/types/event'
 
@@ -20,7 +25,28 @@ const wildcard = (pattern: string, value: string) => {
 export class AgentPolicy {
   constructor (private readonly getConfig: () => AgentConfig) {}
 
-  decide (tool: AgentTool, context: AgentToolContext): AgentPolicyDecision {
+  risk (tool: AgentTool, input: Record<string, unknown> = {}): AgentToolRisk {
+    const order: Record<AgentToolRisk, number> = {
+      read: 0,
+      write: 1,
+      external: 2,
+      destructive: 3,
+    }
+    const base = tool.risk || 'read'
+    let resolved = base
+    try {
+      resolved = tool.riskResolver?.(input) || base
+    } catch {
+      resolved = 'destructive'
+    }
+    return order[resolved] > order[base] ? resolved : base
+  }
+
+  decide (
+    tool: AgentTool,
+    context: AgentToolContext,
+    input: Record<string, unknown> = {}
+  ): AgentPolicyDecision {
     const permission = tool.permission || 'all'
     if ((levels[context.actor.role] ?? 0) < (levels[permission] ?? Number.MAX_SAFE_INTEGER)) {
       return 'deny'
@@ -31,10 +57,20 @@ export class AgentPolicy {
 
     const exact = config.rules.find(rule => rule.pattern === tool.name)
     const matched = exact || config.rules.find(rule => wildcard(rule.pattern, tool.name))
-    let decision = matched?.decision || config.defaults[tool.risk || 'read']
+    const risk = this.risk(tool, input)
+    let decision = matched?.decision || config.defaults[risk]
+    if (
+      !matched &&
+      config.autoApproveTrustedReversible &&
+      risk === 'write' &&
+      tool.reversible &&
+      tool.name.startsWith('karin.')
+    ) {
+      decision = 'allow'
+    }
 
     if (context.automated) {
-      if (tool.risk === 'destructive') return 'deny'
+      if (risk === 'destructive') return 'deny'
       if (decision === 'ask') {
         decision = context.allowedTools?.includes(tool.name) ? 'allow' : 'deny'
       }

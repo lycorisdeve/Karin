@@ -15,7 +15,7 @@ type LegacyLearningConfig = {
 
 interface LegacyAgentConfig extends Omit<
   AgentConfig,
-  'version' | 'providers' | 'routing' | 'learning' | 'recovery'
+  'version' | 'providers' | 'routing' | 'learning' | 'recovery' | 'tasks' | 'context' | 'journal'
 > {
   learning?: LegacyLearningConfig
   provider?: {
@@ -46,7 +46,7 @@ const providerDefaults: Record<AgentProviderKind, Pick<AgentProviderProfile, 'na
 const legacyDefaultHardDeny = ['*.uninstall', '*.delete', '*.remove', '*.destroy']
 
 const normalizePolicy = (
-  value: AgentConfig['policy'],
+  value: Partial<AgentConfig['policy']> | undefined,
   sourceVersion: number
 ): AgentConfig['policy'] => {
   const hardDeny = [...new Set(value?.hardDeny || [])]
@@ -64,8 +64,68 @@ const normalizePolicy = (
       external: value?.defaults?.external || 'ask',
       destructive: sourceVersion < 5 ? 'ask' : value?.defaults?.destructive || 'ask',
     },
+    autoApproveTrustedReversible: value?.autoApproveTrustedReversible !== false,
   }
 }
+
+const normalizeTasks = (
+  value?: Partial<AgentConfig['tasks']>
+): AgentConfig['tasks'] => ({
+  enabled: value?.enabled !== false,
+  maxItems: Math.max(1, Math.min(Number(value?.maxItems) || 64, 256)),
+  completionGuardRetries: Math.max(
+    0,
+    Math.min(Number(value?.completionGuardRetries) || 2, 5)
+  ),
+})
+
+const normalizeContext = (
+  value?: Partial<AgentConfig['context']>
+): AgentConfig['context'] => {
+  const softLimitRatio = Math.max(0.1, Math.min(Number(value?.softLimitRatio) || 0.5, 0.8))
+  const hardLimitRatio = Math.max(
+    softLimitRatio + 0.05,
+    Math.min(Number(value?.hardLimitRatio) || 0.85, 0.95)
+  )
+  return {
+    defaultWindowTokens: Math.max(
+      8192,
+      Math.min(Number(value?.defaultWindowTokens) || 65536, 2_000_000)
+    ),
+    softLimitRatio,
+    hardLimitRatio,
+    protectedRecentMessages: Math.max(
+      2,
+      Math.min(Number(value?.protectedRecentMessages) || 12, 100)
+    ),
+    summaryTargetTokens: Math.max(
+      512,
+      Math.min(Number(value?.summaryTargetTokens) || 4096, 32768)
+    ),
+  }
+}
+
+const normalizeJournal = (
+  value?: Partial<AgentConfig['journal']>
+): AgentConfig['journal'] => ({
+  recoveryAttempts: Math.max(0, Math.min(Number(value?.recoveryAttempts) || 2, 10)),
+  eventRetentionDays: Math.max(1, Math.min(Number(value?.eventRetentionDays) || 7, 365)),
+})
+
+const normalizeLimits = (
+  value?: Partial<AgentConfig['limits']>
+): AgentConfig['limits'] => ({
+  maxToolRounds: Math.max(1, Math.min(Number(value?.maxToolRounds) || 99, 99)),
+  maxToolOutputBytes: Math.max(
+    1024,
+    Math.min(Number(value?.maxToolOutputBytes) || 65536, 5 * 1024 * 1024)
+  ),
+  maxRecentMessages: Math.max(
+    4,
+    Math.min(Number(value?.maxRecentMessages) || 40, 1000)
+  ),
+  maxSubagents: Math.max(1, Math.min(Number(value?.maxSubagents) || 3, 32)),
+})
 
 const normalizeScriptRuntime = (
   value?: Partial<AgentConfig['scriptRuntime']>
@@ -137,7 +197,7 @@ const normalizeRecovery = (
     maxCycles: Math.max(0, Math.min(Number(value?.maxCycles) || 2, 5)),
     maxDiagnosticCalls: Math.max(
       1,
-      Math.min(Number(value?.maxDiagnosticCalls) || 8, 32)
+      Math.min(Number(value?.maxDiagnosticCalls) || 99, 99)
     ),
     maxDurationMs: Math.max(
       10_000,
@@ -217,6 +277,9 @@ const normalizeProfile = (
       ? Math.max(0, Number(value.modelsDiscoveredAt))
       : undefined,
     timeout: Math.max(1000, Math.min(Number(value.timeout) || 30000, 300000)),
+    contextWindowTokens: value.contextWindowTokens
+      ? Math.max(8192, Math.min(Number(value.contextWindowTokens), 2_000_000))
+      : undefined,
   }
   if (
     value.verification &&
@@ -244,7 +307,7 @@ export const migrateAgentConfig = (
       : unique[0]?.id || ''
     return {
       ...(value as AgentConfig),
-      version: 7,
+      version: 9,
       providers: unique,
       routing: {
         primary,
@@ -259,6 +322,10 @@ export const migrateAgentConfig = (
           ...new Set((value as AgentConfig).tools?.disabledToolsets || []),
         ],
       },
+      limits: normalizeLimits(current.limits),
+      tasks: normalizeTasks(current.tasks),
+      context: normalizeContext(current.context),
+      journal: normalizeJournal(current.journal),
       policy: normalizePolicy(current.policy, sourceVersion),
       scriptRuntime: normalizeScriptRuntime(current.scriptRuntime),
       learning: normalizeLearning((value as AgentConfig).learning),
@@ -283,9 +350,13 @@ export const migrateAgentConfig = (
   const { provider: _provider, ...rest } = legacy
   return {
     ...(rest as Omit<AgentConfig, 'version' | 'providers' | 'routing' | 'learning'>),
-    version: 7,
+    version: 9,
     providers: [profile],
     routing: { primary: profile.id, fallback: [] },
+    limits: normalizeLimits(legacy.limits),
+    tasks: normalizeTasks(),
+    context: normalizeContext(),
+    journal: normalizeJournal(),
     policy: normalizePolicy(legacy.policy, 0),
     scriptRuntime: normalizeScriptRuntime(legacy.scriptRuntime),
     learning: normalizeLearning(legacy.learning),
@@ -299,7 +370,7 @@ const initAgent = (dir: string) => {
   configFile = path.join(dir, name)
   const stored = requireFileSync<AgentConfig | LegacyAgentConfig>(configFile, { type: 'json' })
   cache = migrateAgentConfig(stored)
-  if (Number((stored as Partial<AgentConfig>).version) !== 7 || !('recovery' in stored)) {
+  if (Number((stored as Partial<AgentConfig>).version) !== 9 || !('journal' in stored)) {
     const temporary = `${configFile}.migration.tmp`
     fs.writeFileSync(temporary, JSON.stringify(cache, null, 2), 'utf8')
     fs.renameSync(temporary, configFile)
@@ -368,7 +439,7 @@ export const mergeAgentConfig = (
   return migrateAgentConfig({
     ...current,
     ...update,
-    version: 7,
+    version: 9,
     providers,
     routing: update.routing || current.routing,
   } as AgentConfig)

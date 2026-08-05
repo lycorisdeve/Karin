@@ -21,6 +21,10 @@ import { registerAgentCommands } from './ingress/commands'
 import { AgentMcpClientManager } from './mcp/client'
 import { AgentScheduler } from './automation/scheduler'
 import { AgentRepairManager } from './repair/manager'
+import { AgentTaskLedger } from './tasks/ledger'
+import { AgentCapabilityCatalog } from './capabilities/catalog'
+import { AgentGeneratedToolLibrary } from './generated-tools/library'
+import type { AgentEvolutionPipeline } from './evolution'
 import { restartDirect } from '@/utils/system/restart'
 
 export interface AgentServices {
@@ -32,6 +36,9 @@ export interface AgentServices {
   mcp: AgentMcpClientManager | null
   scheduler: AgentScheduler | null
   repair: AgentRepairManager | null
+  generatedTools: AgentGeneratedToolLibrary | null
+  capabilities: AgentCapabilityCatalog | null
+  evolution: AgentEvolutionPipeline | null
 }
 
 let services: AgentServices | null = null
@@ -65,6 +72,7 @@ export const closeAgent = async () => {
   removeBuiltinCommands()
   services?.scheduler?.stop()
   await services?.mcp?.close()
+  services?.generatedTools?.close()
   services?.registry.unregisterPrefix('karin.')
   services?.registry.unregisterPrefix('mcp.')
   await services?.database.close()
@@ -76,7 +84,7 @@ export const initAgent = async () => {
   if (services) await closeAgent()
 
   const database = new AgentDatabase(root.karinPathAgentDb)
-  const registry = new AgentToolRegistry()
+  const registry = new AgentToolRegistry(database)
   services = {
     database,
     registry,
@@ -86,6 +94,9 @@ export const initAgent = async () => {
     mcp: null,
     scheduler: null,
     repair: null,
+    generatedTools: null,
+    capabilities: null,
+    evolution: null,
   }
 
   try {
@@ -101,6 +112,7 @@ export const initAgent = async () => {
     }
 
     const config = agentConfig()
+    await database.pruneTurnEvents(config.journal?.eventRetentionDays ?? 7)
     const provider = new AgentProviderRegistry(agentConfig)
     services.providers = provider
     if (!config.enabled) {
@@ -146,6 +158,7 @@ export const initAgent = async () => {
     services.learning = learning
     const runtime = new AgentRuntime(database, registry, policy, provider, learning, agentConfig)
     services.runtime = runtime
+    services.evolution = runtime.evolution
 
     const scheduler = new AgentScheduler(database, runtime)
     services.scheduler = scheduler
@@ -154,18 +167,42 @@ export const initAgent = async () => {
       () => restartDirect({ reloadDeps: false, isPm2: false })
     )
     services.repair = repair
-    registerBuiltinTools(registry, database, runtime, scheduler, learning, repair)
+    const taskLedger = new AgentTaskLedger(database, agentConfig)
+    const capabilities = new AgentCapabilityCatalog(database, registry)
+    const generatedTools = new AgentGeneratedToolLibrary(
+      database,
+      registry,
+      learning.scriptRuntime
+    )
+    services.capabilities = capabilities
+    services.generatedTools = generatedTools
+    registerBuiltinTools(
+      registry,
+      database,
+      runtime,
+      scheduler,
+      learning,
+      taskLedger,
+      capabilities,
+      generatedTools,
+      repair
+    )
 
     const mcp = new AgentMcpClientManager(registry, agentConfig)
     services.mcp = mcp
     await mcp.init()
-    await learning.refreshScriptTools()
+    await generatedTools.refresh()
 
     await scheduler.init()
 
     registerAgentCommands(runtime)
     ingressHookId = registerAgentIngress(runtime, agentConfig)
     status = { state: 'ready' }
+    runtime.recoverPendingTurns().then(count => {
+      if (count) logger.info(`[agent] 已接管 ${count} 个重启前未完成 Turn`)
+    }).catch(error => {
+      logger.error(new Error('[agent] 重启恢复失败', { cause: error }))
+    })
     logger.info('[agent] Karin Agent 已启用')
     return services
   } catch (error) {

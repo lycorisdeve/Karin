@@ -125,6 +125,255 @@ const learning = {
 } as unknown as AgentLearning
 
 describe('Agent runtime', () => {
+  it('interrupts an active interactive turn and resumes with the user supplement', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    let calls = 0
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete (request) {
+        calls++
+        if (calls === 1) {
+          return new Promise((resolve, reject) => {
+            request.signal?.addEventListener(
+              'abort',
+              () => reject(request.signal?.reason || new Error('aborted')),
+              { once: true }
+            )
+          })
+        }
+        expect(request.messages.some(message =>
+          message.role === 'system' &&
+          message.content.includes('原始目标：检查运行日志') &&
+          message.content.includes('用户补充：') &&
+          message.content.includes('#日志')
+        )).toBe(true)
+        return {
+          content: '日志已经检索完成；当前没有本地截图能力。',
+          toolCalls: [],
+        }
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(config),
+      provider,
+      learning,
+      config
+    )
+    const events: string[] = []
+    const first = runtime.submitInteractiveTurn({
+      threadKey: 'interactive-supplement',
+      actor,
+      content: '检查运行日志',
+      onEvent: event => events.push(event.type),
+    })
+    await vi.waitFor(() => expect(calls).toBe(1))
+
+    const second = runtime.submitInteractiveTurn({
+      threadKey: 'interactive-supplement',
+      actor,
+      content: '#日志',
+      onEvent: event => events.push(event.type),
+    })
+    expect(second.mode).toBe('supplemented')
+    expect(second.interrupted).toMatchObject({
+      round: 1,
+      operation: '模型思考',
+    })
+
+    const [interrupted, completed] = await Promise.all([
+      first.result,
+      second.result,
+    ])
+    expect(interrupted.state).toBe('interrupted')
+    expect(first.isLatest()).toBe(false)
+    expect(completed).toMatchObject({
+      state: 'completed',
+      content: '日志已经检索完成；当前没有本地截图能力。',
+    })
+    expect(second.isLatest()).toBe(true)
+
+    const turns = await db.listTurns(completed.threadId)
+    expect(turns).toHaveLength(2)
+    expect(turns[0]).toMatchObject({
+      state: 'interrupted',
+      finalMessageId: null,
+    })
+    expect(turns[1]).toMatchObject({
+      state: 'completed',
+      resumedFromTurnId: turns[0].id,
+    })
+    expect((await db.listMessages(completed.threadId))
+      .filter(message => message.role === 'assistant' && message.final)
+    ).toEqual([
+      expect.objectContaining({
+        content: '日志已经检索完成；当前没有本地截图能力。',
+      }),
+    ])
+    expect(events).toContain('turn.resumed')
+    first.release()
+    second.release()
+    await db.close()
+  })
+
+  it('keeps rapid supplements in arrival order while the interrupted turn exits', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    let calls = 0
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete (request) {
+        calls++
+        if (calls === 1) {
+          return new Promise((resolve, reject) => {
+            request.signal?.addEventListener(
+              'abort',
+              () => reject(request.signal?.reason || new Error('aborted')),
+              { once: true }
+            )
+          })
+        }
+        const resume = request.messages.find(message =>
+          message.role === 'system' &&
+          message.content.includes('用户补充：')
+        )?.content || ''
+        expect(resume.indexOf('- 第一条补充')).toBeLessThan(
+          resume.indexOf('- 第二条补充')
+        )
+        return { content: '已合并处理两条补充。', toolCalls: [] }
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(config),
+      provider,
+      learning,
+      config
+    )
+    const first = runtime.submitInteractiveTurn({
+      threadKey: 'rapid-supplements',
+      actor,
+      content: '原始任务',
+    })
+    await vi.waitFor(() => expect(calls).toBe(1))
+    const second = runtime.submitInteractiveTurn({
+      threadKey: 'rapid-supplements',
+      actor,
+      content: '第一条补充',
+    })
+    const third = runtime.submitInteractiveTurn({
+      threadKey: 'rapid-supplements',
+      actor,
+      content: '第二条补充',
+    })
+
+    const [firstResult, secondResult, thirdResult] = await Promise.all([
+      first.result,
+      second.result,
+      third.result,
+    ])
+    expect(firstResult.state).toBe('interrupted')
+    expect(secondResult.state).toBe('interrupted')
+    expect(thirdResult.state).toBe('completed')
+    expect(second.isLatest()).toBe(false)
+    expect(third.isLatest()).toBe(true)
+    expect((await db.listMessages(thirdResult.threadId))
+      .filter(message => message.role === 'user')
+      .map(message => message.content)
+    ).toEqual(['原始任务', '第一条补充', '第二条补充'])
+    first.release()
+    second.release()
+    third.release()
+    await db.close()
+  })
+
+  it('reuses an inherited non-idempotent receipt instead of repeating the side effect', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const execute = vi.fn(async () => ({ sent: true }))
+    registry.register({
+      name: 'test.external',
+      description: 'external side effect',
+      inputSchema: {
+        type: 'object',
+        required: ['value'],
+        additionalProperties: false,
+        properties: { value: { type: 'string' } },
+      },
+      risk: 'external',
+      idempotent: false,
+      execute,
+    })
+    let calls = 0
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete (request) {
+        calls++
+        if (calls === 1 || calls === 3) {
+          return {
+            content: '',
+            toolCalls: [{
+              id: calls === 1 ? 'external-first' : 'external-repeated',
+              name: 'test.external',
+              arguments: { value: 'same' },
+            }],
+          }
+        }
+        if (calls === 2) {
+          return new Promise((resolve, reject) => {
+            request.signal?.addEventListener(
+              'abort',
+              () => reject(request.signal?.reason || new Error('aborted')),
+              { once: true }
+            )
+          })
+        }
+        return { content: '补充任务已经处理。', toolCalls: [] }
+      },
+    }
+    const permissive = () => {
+      const value = config()
+      value.policy.defaults.external = 'allow'
+      return value
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(permissive),
+      provider,
+      learning,
+      permissive
+    )
+    const first = runtime.submitInteractiveTurn({
+      threadKey: 'receipt-reuse',
+      actor,
+      content: '执行外部操作',
+    })
+    await vi.waitFor(() => {
+      expect(execute).toHaveBeenCalledTimes(1)
+      expect(calls).toBe(2)
+    })
+    const second = runtime.submitInteractiveTurn({
+      threadKey: 'receipt-reuse',
+      actor,
+      content: '补充相同操作',
+    })
+    await Promise.all([first.result, second.result])
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    const audit = await db.listAudit()
+    expect(audit).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: 'tool.receipt.reused' }),
+    ]))
+    first.release()
+    second.release()
+    registry.unregister('test.external')
+    await db.close()
+  })
+
   it('executes structured tools and returns the final answer', async () => {
     const db = await database()
     const registry = new AgentToolRegistry()
@@ -282,6 +531,115 @@ describe('Agent runtime', () => {
     expect(events.filter(type => type === 'verification.completed')).toHaveLength(2)
     registry.unregister('karin.browser.download')
     registry.unregister('karin.bot.send_message')
+    await db.close()
+  })
+
+  it('reports expected safety restrictions as missing capability without a repair candidate', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    registry.register({
+      name: 'karin.browser.open',
+      description: 'open a public page',
+      inputSchema: {
+        type: 'object',
+        required: ['url'],
+        additionalProperties: false,
+        properties: { url: { type: 'string' } },
+      },
+      risk: 'read',
+      idempotent: true,
+      execute: () => {
+        throw new Error('TOOL_UNSAFE_URL: 浏览器只允许 HTTP 或 HTTPS URL')
+      },
+    }, true)
+    let call = 0
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete () {
+        call++
+        if (call === 1) {
+          return {
+            content: '',
+            toolCalls: [{
+              id: 'unsafe-open',
+              name: 'karin.browser.open',
+              arguments: { url: 'data:text/html,test' },
+            }],
+          }
+        }
+        return { content: '截图已经完成。', toolCalls: [] }
+      },
+    }
+    const noRecovery = () => ({
+      ...config(),
+      recovery: {
+        ...config().recovery,
+        maxCycles: 0,
+      },
+    })
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(noRecovery),
+      provider,
+      learning,
+      noRecovery
+    )
+    const events: string[] = []
+    const result = await runtime.runTurn({
+      threadKey: 'expected-capability-restriction',
+      actor,
+      content: '把运行日志截图发给我',
+      onEvent: event => events.push(event.type),
+    })
+
+    expect(result.state).toBe('failed')
+    expect(result.content).toContain('任务未能完成')
+    expect(result.content).not.toContain('修复候选')
+    expect(events).toContain('capability.missing')
+    expect(events).not.toContain('repair.candidate')
+    expect(await db.listEvolutionCandidates()).toEqual([])
+    registry.unregister('karin.browser.open')
+    await db.close()
+  })
+
+  it('does not create a repair candidate when an action lacks execution evidence', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const noRecovery = () => ({
+      ...config(),
+      recovery: {
+        ...config().recovery,
+        maxCycles: 0,
+      },
+    })
+    const model: AgentModelProvider = {
+      name: 'fake',
+      async complete () {
+        return { content: '当前没有可用图片。', toolCalls: [] }
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(noRecovery),
+      model,
+      learning,
+      noRecovery
+    )
+    const events: string[] = []
+    const result = await runtime.runTurn({
+      threadKey: 'missing-image-evidence',
+      actor,
+      content: '发一张猫的照片给我',
+      onEvent: event => events.push(event.type),
+    })
+
+    expect(result.state).toBe('failed')
+    expect(result.content).not.toContain('修复候选')
+    expect(events).toContain('capability.missing')
+    expect(events).not.toContain('repair.candidate')
+    expect(await db.listEvolutionCandidates()).toEqual([])
     await db.close()
   })
 
@@ -749,6 +1107,95 @@ describe('Agent runtime', () => {
       expect.objectContaining({ id: 'queued-2', state: 'failed', error: '取消第二批' }),
     ])
     expect(await db.getThreadTreeIds(secondParent.id)).toEqual([secondParent.id])
+    await db.close()
+  })
+  it('stops a repeated diagnostic loop by evidence progress before the 99-round breaker', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const execute = vi.fn(async () => ({ status: 'unchanged' }))
+    registry.register({
+      name: 'karin.diagnostics.repeat',
+      description: 'return an unchanged diagnostic result',
+      inputSchema: { type: 'object', additionalProperties: false },
+      risk: 'read',
+      idempotent: true,
+      execute,
+    }, true)
+    const repeatedConfig = () => ({
+      ...config(),
+      limits: { ...config().limits, maxToolRounds: 99 },
+      recovery: { ...config().recovery, maxDiagnosticCalls: 99 },
+    })
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete () {
+        return {
+          content: '',
+          toolCalls: [{
+            id: `diagnostic-${execute.mock.calls.length}`,
+            name: 'karin.diagnostics.repeat',
+            arguments: {},
+          }],
+        }
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(repeatedConfig),
+      provider,
+      learning,
+      repeatedConfig
+    )
+
+    const result = await runtime.runTurn({
+      threadKey: 'progress-aware-budget',
+      actor,
+      content: '持续诊断直到找到新证据',
+    })
+
+    expect(result.state).toBe('failed')
+    expect(result.content).toContain('连续 3 轮未获得新的任务状态')
+    expect(result.content).not.toContain('诊断 Tool 已达到上限')
+    expect(execute).toHaveBeenCalledTimes(4)
+    registry.unregister('karin.diagnostics.repeat')
+    await db.close()
+  })
+
+  it('converts a Provider timeout into an actionable user-facing failure', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const noRecovery = () => ({
+      ...config(),
+      recovery: { ...config().recovery, maxCycles: 0 },
+    })
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete () {
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(noRecovery),
+      provider,
+      learning,
+      noRecovery
+    )
+
+    const result = await runtime.runTurn({
+      threadKey: 'provider-timeout-message',
+      actor,
+      content: '检查状态',
+    })
+
+    expect(result).toMatchObject({
+      state: 'failed',
+      content: expect.stringContaining('模型响应超时'),
+    })
+    expect(result.content).not.toContain('The operation was aborted due to timeout')
+    expect(await db.listEvolutionCandidates()).toEqual([])
     await db.close()
   })
 })

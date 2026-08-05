@@ -160,6 +160,28 @@ describe('Agent verifiable recovery', () => {
     ])
   })
 
+  it('treats a quoted image verification failure as a diagnostic question', async () => {
+    const recovery = new AgentTurnRecovery(provider('unused'), () => config(false))
+    const result = await recovery.createPlan(
+      {
+        ...input,
+        content: [
+          '你的进化中心是什么意思？而且每次都会报：',
+          '任务未通过实际结果验证：未通过：取得至少一张经过校验的图片；',
+          '向当前会话成功投递至少一张图片',
+        ].join('\n'),
+      },
+      tools,
+      'fake',
+      'fake',
+      new AbortController().signal
+    )
+
+    expect(result.plan.goals[0].postconditions.map(item => item.kind)).toEqual([
+      'information',
+    ])
+  })
+
   it('presents downloaded images in a Web thread without requiring channel delivery', async () => {
     const model = provider('unused')
     const recovery = new AgentTurnRecovery(model, () => config(false))
@@ -280,7 +302,75 @@ describe('Agent verifiable recovery', () => {
       .toContain('投递回执验证')
   })
 
-  it('retries invalid structured plans once and falls back without failing the turn', async () => {
+  it('accepts an informational answer that honestly reports a scoped capability limit', () => {
+    const recovery = new AgentTurnRecovery(provider(''), () => config())
+    const plan: AgentTaskPlan = {
+      version: 1,
+      summary: 'read logs',
+      research: 'local-first',
+      allowedSideEffects: ['read'],
+      stopCondition: 'answer ready',
+      createdBy: 'fallback',
+      goals: [{
+        id: 'logs',
+        description: 'read logs',
+        capabilities: ['karin.diagnostics.logs'],
+        postconditions: [{
+          id: 'answer',
+          kind: 'information',
+          description: 'return the inspected logs',
+          toolNames: [],
+          required: true,
+        }],
+      }],
+    }
+
+    expect(recovery.verify(
+      plan,
+      [],
+      '日志内容已经检索完成；当前没有本地截图能力，但下面的日志文本可用。'
+    )).toMatchObject({
+      completed: true,
+      missing: [],
+    })
+  })
+
+  it('creates an evidence-only user failure without leaking internal candidates', () => {
+    const recovery = new AgentTurnRecovery(provider(''), () => config())
+    const verification = {
+      completed: false,
+      missing: [{
+        id: 'media',
+        kind: 'media' as const,
+        description: '取得至少一张经过校验的图片',
+        toolNames: ['karin.browser.open'],
+        required: true,
+      }],
+      classification: 'postcondition_failed' as const,
+      message: '未通过：取得至少一张经过校验的图片',
+    }
+    const content = recovery.failureContent(verification, [{
+      status: 'failed',
+      errorCode: 'TOOL_UNSAFE_URL',
+      error: 'TOOL_UNSAFE_URL: 浏览器只允许 HTTP 或 HTTPS URL',
+      receipt: {
+        toolName: 'karin.browser.open',
+        status: 'failed',
+        startedAt: 1,
+        completedAt: 2,
+        idempotent: true,
+      },
+      evidence: [],
+    }])
+
+    expect(content).toContain('任务未能完成')
+    expect(content).toContain('取得至少一张经过校验的图片')
+    expect(content).toContain('karin.browser.open')
+    expect(content).not.toContain('修复候选')
+    expect(content).not.toContain('已完成')
+  })
+
+  it('uses a deterministic visible verification contract without a planner model call', async () => {
     const model = provider('not json')
     const recovery = new AgentTurnRecovery(model, () => config(true))
     const result = await recovery.createPlan(
@@ -291,8 +381,8 @@ describe('Agent verifiable recovery', () => {
       new AbortController().signal
     )
 
-    expect(model.complete).toHaveBeenCalledTimes(2)
+    expect(model.complete).not.toHaveBeenCalled()
     expect(result.plan.createdBy).toBe('fallback')
-    expect(result.errors).toHaveLength(2)
+    expect(result.errors).toHaveLength(0)
   })
 })

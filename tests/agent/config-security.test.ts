@@ -169,6 +169,20 @@ const adapters = (): Adapters => ({
 })
 
 describe('versioned configuration and write-only secrets', () => {
+  it('normalizes the execution iteration limit to the configurable 1-99 range', () => {
+    const missing = migrateAgentConfig({
+      ...agentConfig(),
+      limits: { ...agentConfig().limits, maxToolRounds: undefined },
+    } as never)
+    const excessive = migrateAgentConfig({
+      ...agentConfig(),
+      limits: { ...agentConfig().limits, maxToolRounds: 1000 },
+    } as never)
+
+    expect(missing.limits.maxToolRounds).toBe(99)
+    expect(excessive.limits.maxToolRounds).toBe(99)
+  })
+
   it('migrates the legacy single provider without dropping its values', () => {
     const migrated = migrateAgentConfig({
       ...agentConfig(),
@@ -183,7 +197,12 @@ describe('versioned configuration and write-only secrets', () => {
       },
     } as never)
 
-    expect(migrated.version).toBe(7)
+    expect(migrated.version).toBe(9)
+    expect(migrated.context).toMatchObject({
+      defaultWindowTokens: 65536,
+      softLimitRatio: 0.5,
+      hardLimitRatio: 0.85,
+    })
     expect(migrated.scriptRuntime).toMatchObject({
       pythonExecutable: '',
       defaultTimeoutMs: 30000,
@@ -213,7 +232,7 @@ describe('versioned configuration and write-only secrets', () => {
       },
     }
     const migrated = migrateAgentConfig(legacy as never)
-    expect(migrated.version).toBe(7)
+    expect(migrated.version).toBe(9)
     expect(migrated.policy.hardDeny).toEqual([])
     expect(migrated.policy.defaults.destructive).toBe('ask')
 

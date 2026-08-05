@@ -22,5 +22,5 @@ export const agentResultMessage = async (result: AgentTurnResult) => {
 
 export const replyAgentResult = async (event: Message, result: AgentTurnResult) => {
   if (!result.content) return
-  await event.reply(await agentResultMessage(result))
+  return event.reply(await agentResultMessage(result))
 }

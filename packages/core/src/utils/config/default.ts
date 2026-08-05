@@ -66,7 +66,7 @@ export const defaultConfig: {
     email: [],
   },
   agent: {
-    version: 7,
+    version: 9,
     enabled: false,
     providers: [
       {
@@ -90,10 +90,26 @@ export const defaultConfig: {
       wakeWords: [],
     },
     limits: {
-      maxToolRounds: 8,
+      maxToolRounds: 99,
       maxToolOutputBytes: 65536,
       maxRecentMessages: 40,
       maxSubagents: 3,
+    },
+    context: {
+      defaultWindowTokens: 65536,
+      softLimitRatio: 0.5,
+      hardLimitRatio: 0.85,
+      protectedRecentMessages: 12,
+      summaryTargetTokens: 4096,
+    },
+    journal: {
+      recoveryAttempts: 2,
+      eventRetentionDays: 7,
+    },
+    tasks: {
+      enabled: true,
+      maxItems: 64,
+      completionGuardRetries: 2,
     },
     policy: {
       approvalTtlMs: 300000,
@@ -105,6 +121,7 @@ export const defaultConfig: {
         external: 'ask',
         destructive: 'ask',
       },
+      autoApproveTrustedReversible: true,
     },
     learning: {
       memory: true,
@@ -135,7 +152,7 @@ export const defaultConfig: {
     recovery: {
       enabled: true,
       maxCycles: 2,
-      maxDiagnosticCalls: 8,
+      maxDiagnosticCalls: 99,
       maxDurationMs: 120000,
       researchPolicy: 'evidence-driven',
       repair: {

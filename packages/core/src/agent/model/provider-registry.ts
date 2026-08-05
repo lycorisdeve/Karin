@@ -40,6 +40,21 @@ const isTransient = (error: unknown) => {
   return error instanceof TypeError
 }
 
+const normalizeProviderError = (error: unknown, timeout: number) => {
+  const message = error instanceof Error ? error.message : String(error)
+  if (
+    (error instanceof DOMException && error.name === 'TimeoutError') ||
+    /aborted due to timeout|TimeoutError/i.test(message)
+  ) {
+    return new AgentProviderError(
+      `[agent][model] 模型请求超时（${timeout}ms）`,
+      408,
+      true
+    )
+  }
+  return error
+}
+
 export class AgentProviderRegistry implements AgentModelProvider {
   readonly name = 'karin-provider-registry'
 
@@ -112,15 +127,16 @@ export class AgentProviderRegistry implements AgentModelProvider {
             latencyMs: Date.now() - started,
           }
         } catch (error) {
-          lastError = error
+          const normalized = normalizeProviderError(error, profile.timeout)
+          lastError = normalized
           // A streamed response cannot be replayed safely without duplicating text
           // already delivered to the caller.
-          if (request.signal?.aborted || emittedDelta) throw error
-          const reason = error instanceof AgentProviderError && error.status
-            ? `${profile.id}:HTTP ${error.status}`
-            : `${profile.id}:${error instanceof Error ? error.name : 'network'}`
-          if (!isTransient(error)) {
-            if (!sessionOverride) throw error
+          if (request.signal?.aborted || emittedDelta) throw normalized
+          const reason = normalized instanceof AgentProviderError && normalized.status
+            ? `${profile.id}:HTTP ${normalized.status}`
+            : `${profile.id}:${normalized instanceof Error ? normalized.name : 'network'}`
+          if (!isTransient(normalized)) {
+            if (!sessionOverride) throw normalized
             retryReasons.push(`${reason}:session-fallback`)
             break
           }

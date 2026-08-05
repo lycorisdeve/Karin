@@ -1,12 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import sqlite3, { type Database } from 'sqlite3'
 import { inferAgentOrigin } from '../ingress/origin'
 
 import type {
   AgentActor,
   AgentEvolutionCandidate,
+  AgentEvolutionLogEntry,
   AgentEvolutionMetrics,
   AgentEvolutionState,
   AgentEvolutionTarget,
@@ -17,7 +18,43 @@ import type {
   AgentToolCall,
   AgentMessageAttachmentInput,
   AgentScriptToolDefinition,
+  AgentTaskItemStatus,
+  AgentTaskList,
+  AgentGeneratedToolRecord,
+  AgentGeneratedToolVersion,
+  AgentDeliveryState,
+  AgentStreamEvent,
+  AgentToolArtifact,
 } from '@/types/agent'
+
+export interface AgentContextSummaryRecord {
+  id: string
+  threadId: string
+  parentId: string | null
+  content: string
+  estimatedTokens: number
+  sourceMessageIds: string[]
+  createdAt: number
+}
+
+export interface AgentDeliveryOperationRecord {
+  id: string
+  threadId: string
+  turnId: string
+  finalMessageId: string
+  idempotencyKey: string
+  channel: string
+  accountId: string
+  contactKey: string
+  payloadHash: string
+  state: AgentDeliveryState
+  adapterMessageId: string | null
+  attempts: number
+  errorCode: string | null
+  error: string | null
+  createdAt: number
+  updatedAt: number
+}
 
 export interface AgentThreadRecord {
   id: string
@@ -509,6 +546,187 @@ const migrations = [
       ON message_attachments(thread_id);
     `,
   },
+  {
+    version: 11,
+    sql: `
+      CREATE TABLE IF NOT EXISTS agent_task_lists (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        source_turn_id TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_task_items (
+        id TEXT PRIMARY KEY,
+        list_id TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(list_id) REFERENCES agent_task_lists(id) ON DELETE CASCADE,
+        UNIQUE(list_id, item_key)
+      );
+
+      CREATE TABLE IF NOT EXISTS generated_tools (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        active_version_id TEXT,
+        legacy_alias TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS generated_tool_versions (
+        id TEXT PRIMARY KEY,
+        tool_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        definition_json TEXT NOT NULL,
+        validation_status TEXT NOT NULL,
+        validation_report TEXT NOT NULL DEFAULT '',
+        source_turn_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(tool_id) REFERENCES generated_tools(id) ON DELETE CASCADE,
+        UNIQUE(tool_id, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS thread_skill_loads (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        skill_id TEXT NOT NULL,
+        skill_version_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+      );
+
+      ALTER TABLE skill_versions
+      ADD COLUMN files_manifest_json TEXT NOT NULL DEFAULT '{}';
+
+      CREATE INDEX IF NOT EXISTS idx_agent_task_lists_thread_state
+      ON agent_task_lists(thread_id, state, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_agent_task_items_list_order
+      ON agent_task_items(list_id, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_generated_tool_versions_tool
+      ON generated_tool_versions(tool_id, version);
+      CREATE INDEX IF NOT EXISTS idx_thread_skill_loads_turn
+      ON thread_skill_loads(thread_id, turn_id, created_at);
+    `,
+  },
+  {
+    version: 12,
+    sql: `
+      ALTER TABLE turns ADD COLUMN final_message_id TEXT;
+      ALTER TABLE turns ADD COLUMN resumed_from_turn_id TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_turns_resumed_from
+      ON turns(resumed_from_turn_id);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      ALTER TABLE turns ADD COLUMN request_key TEXT;
+      ALTER TABLE turns ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE turns ADD COLUMN lease_token TEXT;
+      ALTER TABLE turns ADD COLUMN lease_expires_at INTEGER;
+      ALTER TABLE turns ADD COLUMN checkpoint_json TEXT NOT NULL DEFAULT '{}';
+      ALTER TABLE messages ADD COLUMN source_key TEXT;
+      ALTER TABLE tool_calls ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE tool_calls ADD COLUMN restart_safe INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE skills ADD COLUMN provenance TEXT NOT NULL DEFAULT 'user';
+      ALTER TABLE skills ADD COLUMN adopted_at INTEGER;
+      ALTER TABLE skills ADD COLUMN disabled_at INTEGER;
+      ALTER TABLE skills ADD COLUMN archived_at INTEGER;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_request_key
+      ON turns(thread_id, request_key) WHERE request_key IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_key
+      ON messages(thread_id, source_key) WHERE source_key IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS agent_turn_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT,
+        type TEXT NOT NULL,
+        data_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_turn_events_thread
+      ON agent_turn_events(thread_id, id);
+
+      CREATE TABLE IF NOT EXISTS agent_context_summaries (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        parent_id TEXT,
+        content TEXT NOT NULL,
+        estimated_tokens INTEGER NOT NULL,
+        source_message_ids_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_context_summaries_thread
+      ON agent_context_summaries(thread_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS agent_delivery_operations (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        final_message_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        channel TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        contact_key TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        state TEXT NOT NULL,
+        adapter_message_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_delivery_thread
+      ON agent_delivery_operations(thread_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS agent_tool_artifacts (
+        id TEXT PRIMARY KEY,
+        hash TEXT NOT NULL UNIQUE,
+        content_json TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS skill_activity (
+        id TEXT PRIMARY KEY,
+        skill_id TEXT NOT NULL,
+        skill_version_id TEXT,
+        thread_id TEXT,
+        turn_id TEXT,
+        action TEXT NOT NULL,
+        detail_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(skill_id) REFERENCES skills(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_skill_activity_skill
+      ON skill_activity(skill_id, created_at);
+    `,
+  },
 ]
 
 const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
@@ -537,6 +755,7 @@ export class AgentDatabase {
   readonly filename: string
   private db: Database | null = null
   private ftsAvailable = false
+  private transactionQueue: Promise<unknown> = Promise.resolve()
 
   constructor (directory: string) {
     this.filename = path.join(directory, 'agent.db')
@@ -597,6 +816,7 @@ export class AgentDatabase {
         ]
       )
     }
+    await this.migrateLegacyScriptTools()
 
     const legacyThreads = await this.all<Record<string, unknown>>(
       `SELECT id, thread_key, parent_thread_id, actor_id, scene,
@@ -688,26 +908,83 @@ export class AgentDatabase {
     }
 
     const now = Date.now()
-    await this.run('UPDATE turns SET state = ?, error = ?, updated_at = ? WHERE state IN (?, ?, ?)', [
-      'interrupted',
-      'Karin 重启，运行中的回合已中断',
+    await this.run('UPDATE turns SET state = ?, error = ?, updated_at = ? WHERE state IN (?, ?)', [
+      'recovery_pending',
+      'Karin 重启，等待安全恢复',
       now,
       'running',
-      'waiting_approval',
       'stopping',
     ])
-    await this.run('UPDATE threads SET state = ?, updated_at = ? WHERE state IN (?, ?, ?)', [
-      'interrupted',
+    await this.run('UPDATE threads SET state = ?, updated_at = ? WHERE state IN (?, ?)', [
+      'recovery_pending',
       now,
       'running',
-      'waiting_approval',
       'stopping',
     ])
-    await this.run('UPDATE approvals SET status = ?, resolved_at = ? WHERE status = ?', [
-      'expired',
-      now,
-      'pending',
-    ])
+    await this.run(
+      'UPDATE approvals SET status = ?, resolved_at = ? WHERE status = ? AND expires_at <= ?',
+      [
+        'expired',
+        now,
+        'pending',
+        now,
+      ]
+    )
+  }
+
+  private async migrateLegacyScriptTools () {
+    const rows = await this.all<{
+      skill_id: string
+      id: string
+      active_version_id: string | null
+      script_tools_json: string
+      source_turn_id: string
+    }>(
+      `SELECT
+         sv.skill_id,
+         sv.id,
+         s.active_version_id,
+         sv.script_tools_json,
+         sv.source_turn_id
+       FROM skill_versions sv
+       JOIN skills s ON s.id = sv.skill_id
+       WHERE sv.script_tools_json <> '[]'
+       ORDER BY sv.skill_id ASC, sv.version ASC`
+    )
+    for (const row of rows) {
+      const definitions = parseJson<AgentScriptToolDefinition[]>(
+        row.script_tools_json,
+        []
+      )
+      for (const definition of definitions) {
+        const legacyAlias =
+          `skill.skill_${row.skill_id.replace(/[^a-z0-9_-]/gi, '_').toLowerCase()}.${definition.id}`
+        const current = await this.getGeneratedTool(legacyAlias)
+        const versions = current
+          ? await this.getGeneratedToolVersions(current.id)
+          : []
+        const duplicateVersion = versions.find(version =>
+          version.definition.sourceHash === definition.sourceHash
+        )
+        if (duplicateVersion) {
+          if (row.active_version_id === row.id) {
+            await this.rollbackGeneratedTool(current!.id, duplicateVersion.id)
+          }
+          continue
+        }
+        await this.addGeneratedToolVersion({
+          toolId: current?.id,
+          name: legacyAlias,
+          description: definition.description,
+          definition,
+          validationStatus: 'valid',
+          validationReport: '从旧 Skill Script Tool 无损迁移',
+          sourceTurnId: row.source_turn_id,
+          activate: row.active_version_id === row.id,
+          legacyAlias,
+        })
+      }
+    }
   }
 
   isFtsAvailable () {
@@ -732,6 +1009,24 @@ export class AgentDatabase {
     return new Promise<void>((resolve, reject) => {
       this.database().exec(sql, error => (error ? reject(error) : resolve()))
     })
+  }
+
+  private transaction<T> (operation: () => Promise<T>): Promise<T> {
+    const current = this.transactionQueue
+      .catch(() => undefined)
+      .then(async () => {
+        await this.exec('BEGIN IMMEDIATE')
+        try {
+          const result = await operation()
+          await this.exec('COMMIT')
+          return result
+        } catch (error) {
+          await this.exec('ROLLBACK')
+          throw error
+        }
+      })
+    this.transactionQueue = current.then(() => undefined, () => undefined)
+    return current
   }
 
   private run (sql: string, params: unknown[] = []) {
@@ -908,7 +1203,7 @@ export class AgentDatabase {
         await this.run(
           `INSERT INTO thread_skill_snapshots(thread_id, skill_id, skill_version_id)
            SELECT ?, id, active_version_id FROM skills
-           WHERE enabled = 1 AND active_version_id IS NOT NULL`,
+           WHERE enabled = 1 AND archived_at IS NULL AND active_version_id IS NOT NULL`,
           [id]
         )
       }
@@ -1115,6 +1410,75 @@ export class AgentDatabase {
     return this.getThread(id)
   }
 
+  async updateThreadSummary (id: string, summary: string) {
+    const value = summary.trim().slice(-12_000)
+    await this.run(
+      'UPDATE threads SET summary = ?, updated_at = ? WHERE id = ?',
+      [value, Date.now(), id]
+    )
+    return value
+  }
+
+  async createContextSummary (input: {
+    threadId: string
+    parentId?: string | null
+    content: string
+    estimatedTokens: number
+    sourceMessageIds: string[]
+  }): Promise<AgentContextSummaryRecord> {
+    return this.transaction(async () => {
+      const id = randomUUID()
+      const now = Date.now()
+      const content = input.content.trim().slice(-64_000)
+      await this.run(
+        `INSERT INTO agent_context_summaries(
+          id, thread_id, parent_id, content, estimated_tokens,
+          source_message_ids_json, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          input.threadId,
+          input.parentId || null,
+          content,
+          Math.max(0, input.estimatedTokens),
+          JSON.stringify(input.sourceMessageIds),
+          now,
+        ]
+      )
+      await this.run(
+        'UPDATE threads SET summary = ?, updated_at = ? WHERE id = ?',
+        [content.slice(-12_000), now, input.threadId]
+      )
+      return {
+        id,
+        threadId: input.threadId,
+        parentId: input.parentId || null,
+        content,
+        estimatedTokens: Math.max(0, input.estimatedTokens),
+        sourceMessageIds: input.sourceMessageIds,
+        createdAt: now,
+      }
+    })
+  }
+
+  async latestContextSummary (threadId: string): Promise<AgentContextSummaryRecord | null> {
+    const row = await this.get<Record<string, unknown>>(
+      `SELECT * FROM agent_context_summaries
+       WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [threadId]
+    )
+    if (!row) return null
+    return {
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      parentId: row.parent_id ? String(row.parent_id) : null,
+      content: String(row.content),
+      estimatedTokens: Number(row.estimated_tokens),
+      sourceMessageIds: parseJson<string[]>(row.source_message_ids_json as string, []),
+      createdAt: Number(row.created_at),
+    }
+  }
+
   async setThreadModel (
     id: string,
     providerId: string | null,
@@ -1148,13 +1512,38 @@ export class AgentDatabase {
     ])
   }
 
-  async createTurn (threadId: string, actorId: string, automated = false) {
+  async createTurn (
+    threadId: string,
+    actorId: string,
+    automated = false,
+    resumedFromTurnId?: string,
+    requestKey?: string
+  ) {
+    if (requestKey) {
+      const existing = await this.get<{ id: string }>(
+        'SELECT id FROM turns WHERE thread_id = ? AND request_key = ?',
+        [threadId, requestKey]
+      )
+      if (existing) return String(existing.id)
+    }
     const id = randomUUID()
     const now = Date.now()
     await this.run(
-      `INSERT INTO turns(id, thread_id, actor_id, state, automated, created_at, updated_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?)`,
-      [id, threadId, actorId, 'running', automated ? 1 : 0, now, now]
+      `INSERT INTO turns(
+        id, thread_id, actor_id, state, automated, resumed_from_turn_id, request_key,
+        created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        threadId,
+        actorId,
+        'running',
+        automated ? 1 : 0,
+        resumedFromTurnId || null,
+        requestKey || null,
+        now,
+        now,
+      ]
     )
     await this.updateThreadState(threadId, 'running')
     return id
@@ -1172,20 +1561,78 @@ export class AgentDatabase {
       state: row.state as AgentThreadState,
       automated: Boolean(row.automated),
       error: row.error ? String(row.error) : undefined,
+      finalMessageId: row.final_message_id ? String(row.final_message_id) : null,
+      resumedFromTurnId: row.resumed_from_turn_id
+        ? String(row.resumed_from_turn_id)
+        : null,
+      requestKey: row.request_key ? String(row.request_key) : null,
+      recoveryAttempts: Number(row.recovery_attempts || 0),
+      checkpoint: parseJson<Record<string, unknown>>(row.checkpoint_json as string, {}),
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
     }))
   }
 
-  async updateTurn (turnId: string, threadId: string, state: AgentThreadState, error?: string) {
+  async updateTurn (
+    turnId: string,
+    threadId: string,
+    state: AgentThreadState,
+    error?: string,
+    finalMessageId?: string | null
+  ) {
     const now = Date.now()
-    await this.run('UPDATE turns SET state = ?, error = ?, updated_at = ? WHERE id = ?', [
-      state,
-      error || null,
-      now,
-      turnId,
-    ])
+    await this.run(
+      `UPDATE turns
+       SET state = ?, error = ?, final_message_id = COALESCE(?, final_message_id), updated_at = ?
+       WHERE id = ?`,
+      [state, error || null, finalMessageId || null, now, turnId]
+    )
     await this.updateThreadState(threadId, state)
+  }
+
+  async getTurnResultByRequestKey (threadId: string, requestKey: string) {
+    const row = await this.get<Record<string, unknown>>(
+      `SELECT turns.*, messages.content AS final_content
+       FROM turns
+       LEFT JOIN messages ON messages.id = turns.final_message_id
+       WHERE turns.thread_id = ? AND turns.request_key = ?`,
+      [threadId, requestKey]
+    )
+    if (!row) return null
+    return {
+      threadId,
+      turnId: String(row.id),
+      state: row.state as AgentThreadState,
+      content: String(row.final_content || ''),
+    }
+  }
+
+  async checkpointTurn (
+    turnId: string,
+    checkpoint: Record<string, unknown>,
+    leaseToken?: string,
+    leaseExpiresAt?: number
+  ) {
+    await this.run(
+      `UPDATE turns SET checkpoint_json = ?, lease_token = COALESCE(?, lease_token),
+       lease_expires_at = COALESCE(?, lease_expires_at), updated_at = ? WHERE id = ?`,
+      [JSON.stringify(checkpoint), leaseToken || null, leaseExpiresAt || null, Date.now(), turnId]
+    )
+  }
+
+  async ensureFinalMessage (
+    threadId: string,
+    turnId: string,
+    content: string
+  ) {
+    const current = await this.get<Record<string, unknown>>(
+      `SELECT id, content FROM messages
+       WHERE turn_id = ? AND role = 'assistant'
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [turnId]
+    )
+    if (current && String(current.content) === content) return String(current.id)
+    return this.addMessage(threadId, turnId, 'assistant', content)
   }
 
   async addMessage (
@@ -1198,14 +1645,23 @@ export class AgentDatabase {
       toolCallId?: string
       toolCalls?: AgentToolCall[]
       attachments?: AgentMessageAttachmentInput[]
+      sourceKey?: string
     } = {}
   ) {
+    if (options.sourceKey) {
+      const existing = await this.get<{ id: string }>(
+        'SELECT id FROM messages WHERE thread_id = ? AND source_key = ?',
+        [threadId, options.sourceKey]
+      )
+      if (existing) return String(existing.id)
+    }
     const id = randomUUID()
     const now = Date.now()
     await this.run(
       `INSERT INTO messages(
-        id, thread_id, turn_id, role, content, name, tool_call_id, tool_calls_json, created_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, thread_id, turn_id, role, content, name, tool_call_id, tool_calls_json,
+        source_key, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         threadId,
@@ -1215,6 +1671,7 @@ export class AgentDatabase {
         options.name || null,
         options.toolCallId || null,
         options.toolCalls ? JSON.stringify(options.toolCalls) : null,
+        options.sourceKey || null,
         now,
       ]
     )
@@ -1261,6 +1718,30 @@ export class AgentDatabase {
       params
     )
     const messageIds = rows.map(row => String(row.id))
+    const turnIds = [...new Set(
+      rows.map(row => row.turn_id ? String(row.turn_id) : '').filter(Boolean)
+    )]
+    const turns = turnIds.length
+      ? await this.all<Record<string, unknown>>(
+        `SELECT id, state, final_message_id FROM turns
+         WHERE id IN (${turnIds.map(() => '?').join(', ')})`,
+        turnIds
+      )
+      : []
+    const turnById = new Map(turns.map(turn => [String(turn.id), turn]))
+    const legacyFinals = new Map<string, string>()
+    for (const row of rows) {
+      if (row.role !== 'assistant' || !row.turn_id) continue
+      const turnId = String(row.turn_id)
+      const turn = turnById.get(turnId)
+      if (
+        turn &&
+        !turn.final_message_id &&
+        String(turn.state) === 'completed'
+      ) {
+        legacyFinals.set(turnId, String(row.id))
+      }
+    }
     const attachments = messageIds.length
       ? await this.all<Record<string, unknown>>(
         `SELECT * FROM message_attachments
@@ -1278,6 +1759,13 @@ export class AgentDatabase {
       name: row.name ? String(row.name) : undefined,
       toolCallId: row.tool_call_id ? String(row.tool_call_id) : undefined,
       toolCalls: parseJson<AgentToolCall[]>(row.tool_calls_json as string, []),
+      final: row.role === 'assistant' && Boolean(
+        row.turn_id &&
+        (
+          String(turnById.get(String(row.turn_id))?.final_message_id || '') === String(row.id) ||
+          legacyFinals.get(String(row.turn_id)) === String(row.id)
+        )
+      ),
       attachments: attachments
         .filter(item => String(item.message_id) === String(row.id))
         .map(item => ({
@@ -1332,13 +1820,15 @@ export class AgentDatabase {
     call: AgentToolCall,
     risk: string,
     decision: AgentPolicyDecision,
-    status: string
+    status: string,
+    semantics: { idempotent?: boolean; restartSafe?: boolean } = {}
   ) {
     const now = Date.now()
     await this.run(
       `INSERT OR REPLACE INTO tool_calls(
-        id, thread_id, turn_id, tool_name, input_json, risk, decision, status, created_at, updated_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id, thread_id, turn_id, tool_name, input_json, risk, decision, status,
+        idempotent, restart_safe, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         call.id,
         threadId,
@@ -1348,6 +1838,8 @@ export class AgentDatabase {
         risk,
         decision,
         status,
+        semantics.idempotent ? 1 : 0,
+        semantics.restartSafe ? 1 : 0,
         now,
         now,
       ]
@@ -1393,11 +1885,238 @@ export class AgentDatabase {
       risk: String(row.risk),
       decision: String(row.decision),
       status: String(row.status),
+      idempotent: Boolean(row.idempotent),
+      restartSafe: Boolean(row.restart_safe),
       error: row.error ? String(row.error) : undefined,
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
       completedAt: row.completed_at ? Number(row.completed_at) : undefined,
     }))
+  }
+
+  private async mapTaskList (
+    row: Record<string, unknown>
+  ): Promise<AgentTaskList> {
+    const items = await this.all<Record<string, unknown>>(
+      `SELECT * FROM agent_task_items
+       WHERE list_id = ?
+       ORDER BY ordinal ASC, created_at ASC`,
+      [String(row.id)]
+    )
+    return {
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      sourceTurnId: String(row.source_turn_id),
+      goal: String(row.goal),
+      state: row.state as AgentTaskList['state'],
+      items: items.map(item => ({
+        id: String(item.item_key),
+        content: String(item.content),
+        status: item.status as AgentTaskItemStatus,
+        order: Number(item.ordinal),
+        createdAt: Number(item.created_at),
+        updatedAt: Number(item.updated_at),
+      })),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
+  async getActiveTaskList (threadId: string) {
+    const row = await this.get<Record<string, unknown>>(
+      `SELECT * FROM agent_task_lists
+       WHERE thread_id = ? AND state = 'active'
+       ORDER BY updated_at DESC LIMIT 1`,
+      [threadId]
+    )
+    return row ? this.mapTaskList(row) : null
+  }
+
+  async listTaskLists (threadId: string, limit = 50) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT * FROM agent_task_lists
+       WHERE thread_id = ?
+       ORDER BY updated_at DESC LIMIT ?`,
+      [threadId, Math.max(1, Math.min(limit, 200))]
+    )
+    return Promise.all(rows.map(row => this.mapTaskList(row)))
+  }
+
+  async writeTaskList (input: {
+    threadId: string
+    sourceTurnId: string
+    goal: string
+    merge: boolean
+    maxItems: number
+    items: Array<{
+      id: string
+      content?: string
+      status?: AgentTaskItemStatus
+    }>
+  }) {
+    const allowed = new Set<AgentTaskItemStatus>([
+      'pending',
+      'in_progress',
+      'completed',
+      'cancelled',
+    ])
+    const last = new Map<string, {
+      id: string
+      content?: string
+      status?: AgentTaskItemStatus
+      index: number
+    }>()
+    for (const [index, value] of input.items.entries()) {
+      const id = String(value.id || '').trim().slice(0, 128)
+      if (!id) throw new Error('任务 ID 不能为空')
+      const status = value.status
+      if (status && !allowed.has(status)) throw new Error(`非法任务状态: ${status}`)
+      const content = value.content === undefined
+        ? undefined
+        : String(value.content).trim().slice(0, 4000)
+      last.set(id, { id, content, status, index })
+    }
+    const items = [...last.values()]
+      .sort((left, right) => left.index - right.index)
+      .slice(0, Math.max(1, Math.min(input.maxItems, 256)))
+    if (items.filter(item => item.status === 'in_progress').length > 1) {
+      throw new Error('同一任务清单最多只能有一个进行中的任务')
+    }
+
+    await this.exec('BEGIN IMMEDIATE')
+    try {
+      const now = Date.now()
+      let active = await this.get<Record<string, unknown>>(
+        `SELECT * FROM agent_task_lists
+         WHERE thread_id = ? AND state = 'active'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [input.threadId]
+      )
+      if (!input.merge || !active) {
+        if (active) {
+          await this.run(
+            `UPDATE agent_task_lists
+             SET state = 'cancelled', updated_at = ?
+             WHERE id = ?`,
+            [now, String(active.id)]
+          )
+        }
+        const listId = randomUUID()
+        await this.run(
+          `INSERT INTO agent_task_lists(
+            id, thread_id, source_turn_id, goal, state, created_at, updated_at
+          ) VALUES(?, ?, ?, ?, 'active', ?, ?)`,
+          [
+            listId,
+            input.threadId,
+            input.sourceTurnId,
+            input.goal.slice(0, 20000),
+            now,
+            now,
+          ]
+        )
+        active = {
+          id: listId,
+          thread_id: input.threadId,
+          source_turn_id: input.sourceTurnId,
+          goal: input.goal.slice(0, 20000),
+          state: 'active',
+          created_at: now,
+          updated_at: now,
+        }
+      }
+
+      const listId = String(active.id)
+      if (!input.merge) {
+        await this.run('DELETE FROM agent_task_items WHERE list_id = ?', [listId])
+        for (const [index, item] of items.entries()) {
+          if (!item.content) throw new Error(`任务 ${item.id} 缺少内容`)
+          await this.run(
+            `INSERT INTO agent_task_items(
+              id, list_id, item_key, ordinal, content, status, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              randomUUID(),
+              listId,
+              item.id,
+              index,
+              item.content,
+              item.status || 'pending',
+              now,
+              now,
+            ]
+          )
+        }
+      } else {
+        const existing = await this.all<Record<string, unknown>>(
+          `SELECT * FROM agent_task_items
+           WHERE list_id = ? ORDER BY ordinal ASC`,
+          [listId]
+        )
+        let ordinal = existing.length
+        for (const item of items) {
+          const current = existing.find(row => String(row.item_key) === item.id)
+          if (current) {
+            await this.run(
+              `UPDATE agent_task_items
+               SET content = ?, status = ?, updated_at = ?
+               WHERE id = ?`,
+              [
+                item.content || String(current.content),
+                item.status || String(current.status),
+                now,
+                String(current.id),
+              ]
+            )
+          } else {
+            if (!item.content) throw new Error(`新增任务 ${item.id} 缺少内容`)
+            await this.run(
+              `INSERT INTO agent_task_items(
+                id, list_id, item_key, ordinal, content, status, created_at, updated_at
+              ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                randomUUID(),
+                listId,
+                item.id,
+                ordinal++,
+                item.content,
+                item.status || 'pending',
+                now,
+                now,
+              ]
+            )
+          }
+        }
+      }
+
+      const stored = await this.all<{ status: AgentTaskItemStatus }>(
+        'SELECT status FROM agent_task_items WHERE list_id = ?',
+        [listId]
+      )
+      if (stored.filter(item => item.status === 'in_progress').length > 1) {
+        throw new Error('同一任务清单最多只能有一个进行中的任务')
+      }
+      const state: AgentTaskList['state'] = stored.some(item =>
+        item.status === 'pending' || item.status === 'in_progress'
+      )
+        ? 'active'
+        : 'completed'
+      await this.run(
+        `UPDATE agent_task_lists
+         SET goal = ?, state = ?, updated_at = ?
+         WHERE id = ?`,
+        [input.goal.slice(0, 20000) || String(active.goal), state, now, listId]
+      )
+      await this.exec('COMMIT')
+      const row = await this.get<Record<string, unknown>>(
+        'SELECT * FROM agent_task_lists WHERE id = ?',
+        [listId]
+      )
+      return this.mapTaskList(row!)
+    } catch (error) {
+      await this.exec('ROLLBACK')
+      throw error
+    }
   }
 
   async getThreadTreeIds (rootId: string) {
@@ -1430,6 +2149,11 @@ export class AgentDatabase {
       }
       for (const table of [
         'message_attachments',
+        'agent_turn_events',
+        'agent_context_summaries',
+        'agent_delivery_operations',
+        'agent_tool_artifacts',
+        'skill_activity',
         'thread_skill_snapshots',
         'thread_tool_grants',
         'approvals',
@@ -1660,6 +2384,7 @@ export class AgentDatabase {
     sourceTurnId: string
     contentHash: string
     scriptTools?: AgentScriptToolDefinition[]
+    filesManifest?: Record<string, { size: number; hash: string }>
   }) {
     const now = Date.now()
     const existing = input.skillId
@@ -1674,9 +2399,17 @@ export class AgentDatabase {
     const skillId = existing ? String(existing.id) : input.newSkillId || randomUUID()
     if (!existing) {
       await this.run(
-        `INSERT INTO skills(id, name, description, enabled, created_at, updated_at)
-         VALUES(?, ?, ?, 1, ?, ?)`,
-        [skillId, input.name, input.description, now, now]
+        `INSERT INTO skills(
+          id, name, description, enabled, provenance, created_at, updated_at
+        ) VALUES(?, ?, ?, 1, ?, ?, ?)`,
+        [
+          skillId,
+          input.name,
+          input.description,
+          input.sourceTurnId && input.sourceTurnId !== 'legacy' ? 'agent' : 'user',
+          now,
+          now,
+        ]
       )
     }
     const row = await this.get<{ version: number }>(
@@ -1687,8 +2420,9 @@ export class AgentDatabase {
     await this.run(
       `INSERT INTO skill_versions(
         id, skill_id, version, content, tools_json, source_turn_id,
-        content_hash, validation_status, created_at, name, description, script_tools_json
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?)`,
+        content_hash, validation_status, created_at, name, description, script_tools_json,
+        files_manifest_json
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?)`,
       [
         versionId,
         skillId,
@@ -1701,6 +2435,7 @@ export class AgentDatabase {
         input.name,
         input.description,
         JSON.stringify(input.scriptTools || []),
+        JSON.stringify(input.filesManifest || {}),
       ]
     )
     await this.run(
@@ -1844,11 +2579,15 @@ export class AgentDatabase {
   }
 
   async setSkillEnabled (skillId: string, enabled: boolean) {
-    const result = await this.run('UPDATE skills SET enabled = ?, updated_at = ? WHERE id = ?', [
-      enabled ? 1 : 0,
-      Date.now(),
-      skillId,
-    ])
+    const now = Date.now()
+    const result = await this.run(
+      'UPDATE skills SET enabled = ?, disabled_at = ?, updated_at = ? WHERE id = ?', [
+        enabled ? 1 : 0,
+        enabled ? null : now,
+        now,
+        skillId,
+      ]
+    )
     return result.changes > 0
   }
 
@@ -1858,10 +2597,300 @@ export class AgentDatabase {
        FROM thread_skill_snapshots snapshot
        JOIN skills s ON s.id = snapshot.skill_id
        JOIN skill_versions sv ON sv.id = snapshot.skill_version_id
-       WHERE snapshot.thread_id = ?`,
+       WHERE snapshot.thread_id = ? AND s.enabled = 1`,
       [threadId]
     )
     return rows
+  }
+
+  async getThreadSkillIndex (threadId: string) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT
+         s.id,
+         COALESCE(NULLIF(sv.name, ''), s.name) AS name,
+         COALESCE(NULLIF(sv.description, ''), s.description) AS description,
+         sv.id AS version_id,
+         sv.version,
+         sv.tools_json
+       FROM thread_skill_snapshots snapshot
+       JOIN skills s ON s.id = snapshot.skill_id
+       JOIN skill_versions sv ON sv.id = snapshot.skill_version_id
+       WHERE snapshot.thread_id = ? AND s.enabled = 1
+       ORDER BY name ASC`,
+      [threadId]
+    )
+    return rows.map(row => ({
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description),
+      versionId: String(row.version_id),
+      version: Number(row.version),
+      tools: parseJson<string[]>(row.tools_json as string, []),
+    }))
+  }
+
+  async getThreadSkillVersion (threadId: string, reference: string) {
+    const row = await this.get<Record<string, unknown>>(
+      `SELECT
+         s.id,
+         COALESCE(NULLIF(sv.name, ''), s.name) AS name,
+         COALESCE(NULLIF(sv.description, ''), s.description) AS description,
+         sv.id AS version_id,
+         sv.version,
+         sv.content,
+         sv.tools_json,
+         sv.files_manifest_json
+       FROM thread_skill_snapshots snapshot
+       JOIN skills s ON s.id = snapshot.skill_id
+       JOIN skill_versions sv ON sv.id = snapshot.skill_version_id
+       WHERE snapshot.thread_id = ? AND s.enabled = 1 AND (s.id = ? OR s.name = ?)
+       LIMIT 1`,
+      [threadId, reference, reference]
+    )
+    if (!row) return null
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description),
+      versionId: String(row.version_id),
+      version: Number(row.version),
+      content: String(row.content),
+      tools: parseJson<string[]>(row.tools_json as string, []),
+      filesManifest: parseJson<Record<string, {
+        size: number
+        hash: string
+      }>>(row.files_manifest_json as string, {}),
+    }
+  }
+
+  async recordSkillLoad (input: {
+    threadId: string
+    turnId: string
+    skillId: string
+    skillVersionId: string
+    filePath: string
+  }) {
+    const id = randomUUID()
+    await this.run(
+      `INSERT INTO thread_skill_loads(
+        id, thread_id, turn_id, skill_id, skill_version_id, file_path, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        input.threadId,
+        input.turnId,
+        input.skillId,
+        input.skillVersionId,
+        input.filePath,
+        Date.now(),
+      ]
+    )
+    await this.recordSkillActivity({
+      skillId: input.skillId,
+      skillVersionId: input.skillVersionId,
+      threadId: input.threadId,
+      turnId: input.turnId,
+      action: input.filePath === 'SKILL.md' ? 'view' : 'use',
+      detail: { filePath: input.filePath },
+    })
+    return id
+  }
+
+  async listTurnSkillLoads (threadId: string, turnId: string) {
+    const rows = await this.all<{ skill_id: string }>(
+      `SELECT DISTINCT skill_id FROM thread_skill_loads
+       WHERE thread_id = ? AND turn_id = ?`,
+      [threadId, turnId]
+    )
+    return rows.map(row => String(row.skill_id))
+  }
+
+  private mapGeneratedTool (row: Record<string, unknown>): AgentGeneratedToolRecord {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description),
+      enabled: Boolean(row.enabled),
+      activeVersionId: row.active_version_id ? String(row.active_version_id) : null,
+      legacyAlias: row.legacy_alias ? String(row.legacy_alias) : undefined,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
+  private mapGeneratedToolVersion (
+    row: Record<string, unknown>
+  ): AgentGeneratedToolVersion {
+    return {
+      id: String(row.id),
+      toolId: String(row.tool_id),
+      version: Number(row.version),
+      definition: parseJson<AgentScriptToolDefinition>(
+        row.definition_json as string,
+        {} as AgentScriptToolDefinition
+      ),
+      validationStatus: row.validation_status as AgentGeneratedToolVersion['validationStatus'],
+      validationReport: String(row.validation_report || ''),
+      sourceTurnId: String(row.source_turn_id),
+      createdAt: Number(row.created_at),
+    }
+  }
+
+  async listGeneratedTools () {
+    const rows = await this.all<Record<string, unknown>>(
+      'SELECT * FROM generated_tools ORDER BY updated_at DESC'
+    )
+    return rows.map(row => this.mapGeneratedTool(row))
+  }
+
+  async getGeneratedTool (reference: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM generated_tools WHERE id = ? OR name = ? LIMIT 1',
+      [reference, reference]
+    )
+    return row ? this.mapGeneratedTool(row) : null
+  }
+
+  async getGeneratedToolVersions (toolId: string) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT * FROM generated_tool_versions
+       WHERE tool_id = ? ORDER BY version DESC`,
+      [toolId]
+    )
+    return rows.map(row => this.mapGeneratedToolVersion(row))
+  }
+
+  async getActiveGeneratedToolVersions () {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT v.*
+       FROM generated_tools t
+       JOIN generated_tool_versions v ON v.id = t.active_version_id
+       WHERE t.enabled = 1 AND v.validation_status = 'valid'
+       ORDER BY t.updated_at DESC`
+    )
+    return rows.map(row => this.mapGeneratedToolVersion(row))
+  }
+
+  async addGeneratedToolVersion (input: {
+    toolId?: string
+    name: string
+    description: string
+    definition: AgentScriptToolDefinition
+    validationStatus: AgentGeneratedToolVersion['validationStatus']
+    validationReport: string
+    sourceTurnId: string
+    activate: boolean
+    legacyAlias?: string
+  }) {
+    const now = Date.now()
+    await this.exec('BEGIN IMMEDIATE')
+    try {
+      const existing = input.toolId
+        ? await this.get<Record<string, unknown>>(
+          'SELECT * FROM generated_tools WHERE id = ?',
+          [input.toolId]
+        )
+        : await this.get<Record<string, unknown>>(
+          'SELECT * FROM generated_tools WHERE name = ?',
+          [input.name]
+        )
+      if (input.toolId && !existing) throw new Error('Generated Tool 不存在')
+      const duplicate = await this.get<{ id: string }>(
+        'SELECT id FROM generated_tools WHERE name = ? AND id != ?',
+        [input.name, input.toolId || '']
+      )
+      if (duplicate) throw new Error(`Generated Tool 名称已存在: ${input.name}`)
+      const toolId = existing ? String(existing.id) : randomUUID()
+      if (!existing) {
+        await this.run(
+          `INSERT INTO generated_tools(
+            id, name, description, enabled, active_version_id, legacy_alias,
+            created_at, updated_at
+          ) VALUES(?, ?, ?, 1, NULL, ?, ?, ?)`,
+          [
+            toolId,
+            input.name,
+            input.description,
+            input.legacyAlias || null,
+            now,
+            now,
+          ]
+        )
+      }
+      const latest = await this.get<{ version: number }>(
+        `SELECT COALESCE(MAX(version), 0) AS version
+         FROM generated_tool_versions WHERE tool_id = ?`,
+        [toolId]
+      )
+      const versionId = randomUUID()
+      await this.run(
+        `INSERT INTO generated_tool_versions(
+          id, tool_id, version, definition_json, validation_status,
+          validation_report, source_turn_id, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          versionId,
+          toolId,
+          Number(latest?.version || 0) + 1,
+          JSON.stringify(input.definition),
+          input.validationStatus,
+          input.validationReport.slice(0, 20000),
+          input.sourceTurnId,
+          now,
+        ]
+      )
+      await this.run(
+        `UPDATE generated_tools
+         SET name = ?, description = ?, updated_at = ?,
+             active_version_id = CASE WHEN ? = 1 THEN ? ELSE active_version_id END
+         WHERE id = ?`,
+        [
+          input.name,
+          input.description,
+          now,
+          input.activate && input.validationStatus === 'valid' ? 1 : 0,
+          versionId,
+          toolId,
+        ]
+      )
+      await this.exec('COMMIT')
+      return { toolId, versionId }
+    } catch (error) {
+      await this.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  async setGeneratedToolEnabled (toolId: string, enabled: boolean) {
+    const result = await this.run(
+      'UPDATE generated_tools SET enabled = ?, updated_at = ? WHERE id = ?',
+      [enabled ? 1 : 0, Date.now(), toolId]
+    )
+    return result.changes > 0
+  }
+
+  async rollbackGeneratedTool (toolId: string, versionId: string) {
+    const version = await this.get<{ id: string; validation_status: string }>(
+      `SELECT id, validation_status FROM generated_tool_versions
+       WHERE id = ? AND tool_id = ?`,
+      [versionId, toolId]
+    )
+    if (!version) return false
+    if (version.validation_status !== 'valid') {
+      throw new Error('只能回滚到验证通过的 Generated Tool 版本')
+    }
+    const result = await this.run(
+      `UPDATE generated_tools
+       SET active_version_id = ?, updated_at = ?
+       WHERE id = ?`,
+      [versionId, Date.now(), toolId]
+    )
+    return result.changes > 0
+  }
+
+  async deleteGeneratedTool (toolId: string) {
+    const result = await this.run('DELETE FROM generated_tools WHERE id = ?', [toolId])
+    return result.changes > 0
   }
 
   async recordExperience (
@@ -2134,6 +3163,100 @@ export class AgentDatabase {
     }
   }
 
+  async listEvolutionLog (limit = 200): Promise<AgentEvolutionLogEntry[]> {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT
+         event.id,
+         event.candidate_id,
+         event.action,
+         event.actor_id,
+         event.detail_json,
+         event.created_at,
+         candidate.target,
+         candidate.summary,
+         candidate.candidate_version,
+         candidate.source_turn_ids_json,
+         candidate.payload_json
+       FROM evolution_events event
+       JOIN evolution_candidates candidate ON candidate.id = event.candidate_id
+       WHERE event.action IN (
+         'promoted',
+         'repair.applied',
+         'rolled_back',
+         'rollback.triggered',
+         'repair.rolled_back',
+         'repair.apply.failed'
+       )
+       ORDER BY event.created_at DESC
+       LIMIT ?`,
+      [Math.max(1, Math.min(limit, 1000))]
+    )
+    return rows.map(row => {
+      const detail = parseJson<Record<string, unknown>>(row.detail_json as string, {})
+      const payload = parseJson<Record<string, unknown>>(row.payload_json as string, {})
+      const sourceTurnIds = parseJson<string[]>(row.source_turn_ids_json as string, [])
+      const rawAction = String(row.action)
+      const action = rawAction === 'promoted' || rawAction === 'repair.applied'
+        ? 'improved'
+        : rawAction === 'repair.apply.failed'
+          ? 'failed'
+          : 'rolled_back'
+      const files = Array.isArray(detail.files) ? detail.files.map(String) : []
+      const resourceName = String(
+        payload.name || payload.skillId || payload.memoryId || payload.routingKey || ''
+      )
+      const change = files.length
+        ? `修改文件：${files.join('、')}`
+        : resourceName
+          ? `${row.target}：${resourceName}`
+          : String(row.summary)
+      return {
+        id: String(row.id),
+        candidateId: String(row.candidate_id),
+        action,
+        target: row.target as AgentEvolutionTarget,
+        summary: String(row.summary),
+        change,
+        candidateVersion: String(row.candidate_version),
+        sourceTurnIds,
+        actorId: String(row.actor_id),
+        detail,
+        createdAt: Number(row.created_at),
+      }
+    })
+  }
+
+  async deleteEvolutionLog (id: string) {
+    const result = await this.run(
+      `DELETE FROM evolution_events
+       WHERE id = ? AND action IN (
+         'promoted',
+         'repair.applied',
+         'rolled_back',
+         'rollback.triggered',
+         'repair.rolled_back',
+         'repair.apply.failed'
+       )`,
+      [id]
+    )
+    return result.changes > 0
+  }
+
+  async clearEvolutionLog () {
+    const result = await this.run(
+      `DELETE FROM evolution_events
+       WHERE action IN (
+         'promoted',
+         'repair.applied',
+         'rolled_back',
+         'rollback.triggered',
+         'repair.rolled_back',
+         'repair.apply.failed'
+       )`
+    )
+    return result.changes
+  }
+
   async touchSkillUsage (
     skillId: string,
     outcome: 'completed' | 'failed' | 'corrected'
@@ -2178,12 +3301,30 @@ export class AgentDatabase {
        WHERE pinned = 0 AND state = 'active' AND last_used_at IS NOT NULL AND last_used_at < ?`,
       [staleBefore]
     )
-    await this.run(
-      `UPDATE skill_usage SET state = 'archived', archived_at = ?
-       WHERE pinned = 0 AND state IN ('active', 'stale')
-       AND last_used_at IS NOT NULL AND last_used_at < ?`,
-      [Date.now(), archiveBefore]
-    )
+    const now = Date.now()
+    await this.exec('BEGIN IMMEDIATE')
+    try {
+      await this.run(
+        `UPDATE skill_usage SET state = 'archived', archived_at = ?
+         WHERE pinned = 0 AND state IN ('active', 'stale')
+         AND last_used_at IS NOT NULL AND last_used_at < ?
+         AND skill_id IN (
+           SELECT id FROM skills WHERE provenance = 'agent' AND adopted_at IS NULL
+         )`,
+        [now, archiveBefore]
+      )
+      await this.run(
+        `UPDATE skills SET archived_at = ?, updated_at = ?
+         WHERE provenance = 'agent' AND adopted_at IS NULL AND id IN (
+           SELECT skill_id FROM skill_usage WHERE state = 'archived' AND pinned = 0
+         )`,
+        [now, now]
+      )
+      await this.exec('COMMIT')
+    } catch (error) {
+      await this.exec('ROLLBACK')
+      throw error
+    }
     return this.getSkillUsage()
   }
 
@@ -2264,6 +3405,358 @@ export class AgentDatabase {
       [Date.now(), threadId]
     )
     return result.changes
+  }
+
+  async appendTurnEvent (
+    threadId: string,
+    type: AgentStreamEvent['type'],
+    data: unknown,
+    turnId?: string
+  ): Promise<AgentStreamEvent> {
+    const createdAt = Date.now()
+    const result = await this.run(
+      `INSERT INTO agent_turn_events(thread_id, turn_id, type, data_json, created_at)
+       VALUES(?, ?, ?, ?, ?)`,
+      [threadId, turnId || null, type, JSON.stringify(data ?? null), createdAt]
+    )
+    return {
+      id: result.lastID,
+      threadId,
+      turnId,
+      type,
+      data,
+      createdAt,
+    }
+  }
+
+  async listTurnEvents (threadId: string, afterId = 0, limit = 1000) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT * FROM agent_turn_events
+       WHERE thread_id = ? AND id > ? ORDER BY id ASC LIMIT ?`,
+      [threadId, Math.max(0, afterId), Math.max(1, Math.min(limit, 5000))]
+    )
+    return rows.map(row => ({
+      id: Number(row.id),
+      threadId: String(row.thread_id),
+      turnId: row.turn_id ? String(row.turn_id) : undefined,
+      type: row.type as AgentStreamEvent['type'],
+      data: parseJson<unknown>(row.data_json as string, null),
+      createdAt: Number(row.created_at),
+    }))
+  }
+
+  async pruneTurnEvents (retentionDays: number) {
+    const before = Date.now() - Math.max(1, retentionDays) * 86_400_000
+    return (await this.run(
+      'DELETE FROM agent_turn_events WHERE created_at < ?',
+      [before]
+    )).changes
+  }
+
+  async finalizeTurn (input: {
+    threadId: string
+    turnId: string
+    state: 'completed' | 'failed' | 'interrupted'
+    content: string
+    error?: string
+    publishFinal: boolean
+  }) {
+    return this.transaction(async () => {
+      const now = Date.now()
+      let finalMessageId: string | null = null
+      const type: AgentStreamEvent['type'] = input.state === 'completed'
+        ? 'turn.completed'
+        : 'turn.failed'
+      if (input.content && input.publishFinal) {
+        const current = await this.get<{ id: string; content: string }>(
+          `SELECT id, content FROM messages
+           WHERE turn_id = ? AND role = 'assistant'
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+          [input.turnId]
+        )
+        if (current && String(current.content) === input.content) {
+          finalMessageId = String(current.id)
+        } else {
+          finalMessageId = randomUUID()
+          await this.run(
+            `INSERT INTO messages(
+              id, thread_id, turn_id, role, content, name, tool_call_id,
+              tool_calls_json, source_key, created_at
+            ) VALUES(?, ?, ?, 'assistant', ?, NULL, NULL, NULL, NULL, ?)`,
+            [finalMessageId, input.threadId, input.turnId, input.content, now]
+          )
+          if (this.ftsAvailable) {
+            await this.run(
+              'INSERT INTO message_fts(message_id, thread_id, content) VALUES(?, ?, ?)',
+              [finalMessageId, input.threadId, input.content]
+            )
+          }
+        }
+      }
+      await this.run(
+        `UPDATE turns SET state = ?, error = ?, final_message_id = ?,
+         lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
+        [input.state, input.error || null, finalMessageId, now, input.turnId]
+      )
+      await this.run(
+        'UPDATE threads SET state = ?, updated_at = ? WHERE id = ?',
+        [input.state, now, input.threadId]
+      )
+      const inserted = await this.run(
+        `INSERT INTO agent_turn_events(thread_id, turn_id, type, data_json, created_at)
+         VALUES(?, ?, ?, ?, ?)`,
+        [
+          input.threadId,
+          input.turnId,
+          type,
+          JSON.stringify({ status: input.state, error: input.error }),
+          now,
+        ]
+      )
+      return {
+        finalMessageId,
+        event: {
+          id: inserted.lastID,
+          threadId: input.threadId,
+          turnId: input.turnId,
+          type,
+          data: { status: input.state, error: input.error },
+          createdAt: now,
+        } satisfies AgentStreamEvent,
+      }
+    })
+  }
+
+  async createDeliveryOperation (input: {
+    threadId: string
+    turnId: string
+    finalMessageId: string
+    idempotencyKey: string
+    channel: string
+    accountId: string
+    contactKey: string
+    payload: string
+  }): Promise<AgentDeliveryOperationRecord> {
+    const existing = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_delivery_operations WHERE idempotency_key = ?',
+      [input.idempotencyKey]
+    )
+    if (existing) return this.mapDeliveryOperation(existing)
+    const id = randomUUID()
+    const now = Date.now()
+    const payloadHash = createHash('sha256').update(input.payload).digest('hex')
+    await this.run(
+      `INSERT INTO agent_delivery_operations(
+        id, thread_id, turn_id, final_message_id, idempotency_key, channel,
+        account_id, contact_key, payload_hash, state, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      [
+        id,
+        input.threadId,
+        input.turnId,
+        input.finalMessageId,
+        input.idempotencyKey,
+        input.channel,
+        input.accountId,
+        input.contactKey,
+        payloadHash,
+        now,
+        now,
+      ]
+    )
+    return (await this.getDeliveryOperation(id))!
+  }
+
+  private mapDeliveryOperation (row: Record<string, unknown>): AgentDeliveryOperationRecord {
+    return {
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      turnId: String(row.turn_id),
+      finalMessageId: String(row.final_message_id),
+      idempotencyKey: String(row.idempotency_key),
+      channel: String(row.channel),
+      accountId: String(row.account_id),
+      contactKey: String(row.contact_key),
+      payloadHash: String(row.payload_hash),
+      state: row.state as AgentDeliveryState,
+      adapterMessageId: row.adapter_message_id ? String(row.adapter_message_id) : null,
+      attempts: Number(row.attempts || 0),
+      errorCode: row.error_code ? String(row.error_code) : null,
+      error: row.error ? String(row.error) : null,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
+  async getDeliveryOperation (id: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_delivery_operations WHERE id = ?',
+      [id]
+    )
+    return row ? this.mapDeliveryOperation(row) : null
+  }
+
+  async updateDeliveryOperation (input: {
+    id: string
+    state: AgentDeliveryState
+    adapterMessageId?: string
+    errorCode?: string
+    error?: string
+    incrementAttempts?: boolean
+  }) {
+    await this.run(
+      `UPDATE agent_delivery_operations SET state = ?,
+       adapter_message_id = COALESCE(?, adapter_message_id),
+       error_code = ?, error = ?,
+       attempts = attempts + ?, updated_at = ? WHERE id = ?`,
+      [
+        input.state,
+        input.adapterMessageId || null,
+        input.errorCode || null,
+        input.error || null,
+        input.incrementAttempts ? 1 : 0,
+        Date.now(),
+        input.id,
+      ]
+    )
+    return this.getDeliveryOperation(input.id)
+  }
+
+  async listDeliveryOperations (threadId: string, limit = 100) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT * FROM agent_delivery_operations
+       WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?`,
+      [threadId, Math.max(1, Math.min(limit, 500))]
+    )
+    return rows.map(row => this.mapDeliveryOperation(row))
+  }
+
+  async createToolArtifact (input: {
+    threadId: string
+    turnId: string
+    toolName: string
+    content: string
+    preview: string
+  }): Promise<AgentToolArtifact> {
+    const hash = createHash('sha256').update(input.content).digest('hex')
+    const existing = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_tool_artifacts WHERE hash = ?',
+      [hash]
+    )
+    if (existing) return this.mapToolArtifact(existing)
+    const id = randomUUID()
+    const bytes = Buffer.byteLength(input.content, 'utf8')
+    const createdAt = Date.now()
+    await this.run(
+      `INSERT INTO agent_tool_artifacts(
+        id, hash, content_json, preview, bytes, thread_id, turn_id, tool_name, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        hash,
+        input.content,
+        input.preview,
+        bytes,
+        input.threadId,
+        input.turnId,
+        input.toolName,
+        createdAt,
+      ]
+    )
+    return { id, hash, bytes, preview: input.preview, createdAt }
+  }
+
+  private mapToolArtifact (row: Record<string, unknown>): AgentToolArtifact {
+    return {
+      id: String(row.id),
+      hash: String(row.hash),
+      bytes: Number(row.bytes),
+      preview: String(row.preview),
+      createdAt: Number(row.created_at),
+    }
+  }
+
+  async getToolArtifact (id: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_tool_artifacts WHERE id = ?',
+      [id]
+    )
+    if (!row) return null
+    return {
+      ...this.mapToolArtifact(row),
+      content: String(row.content_json),
+      threadId: String(row.thread_id),
+      turnId: String(row.turn_id),
+      toolName: String(row.tool_name),
+    }
+  }
+
+  async recordSkillActivity (input: {
+    skillId: string
+    skillVersionId?: string
+    threadId?: string
+    turnId?: string
+    action: 'view' | 'use' | 'patch' | 'archive' | 'restore' | 'adopt' | 'pin'
+    detail?: unknown
+  }) {
+    await this.run(
+      `INSERT INTO skill_activity(
+        id, skill_id, skill_version_id, thread_id, turn_id, action, detail_json, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        randomUUID(),
+        input.skillId,
+        input.skillVersionId || null,
+        input.threadId || null,
+        input.turnId || null,
+        input.action,
+        JSON.stringify(input.detail ?? null),
+        Date.now(),
+      ]
+    )
+  }
+
+  async claimRecoverableTurns (maxAttempts: number, limit = 20) {
+    if (maxAttempts <= 0) return []
+    const now = Date.now()
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT * FROM turns
+       WHERE state = 'recovery_pending' AND recovery_attempts < ?
+       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+       ORDER BY updated_at ASC LIMIT ?`,
+      [maxAttempts, now, Math.max(1, Math.min(limit, 100))]
+    )
+    const claimed: Array<{
+      turnId: string
+      thread: AgentThreadRecord
+      userMessages: string[]
+      toolCalls: Awaited<ReturnType<AgentDatabase['listToolCalls']>>
+    }> = []
+    for (const row of rows) {
+      const leaseToken = randomUUID()
+      const updated = await this.run(
+        `UPDATE turns SET recovery_attempts = recovery_attempts + 1,
+         lease_token = ?, lease_expires_at = ?, updated_at = ?
+         WHERE id = ? AND state = 'recovery_pending'
+         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`,
+        [leaseToken, now + 120_000, now, String(row.id), now]
+      )
+      if (!updated.changes) continue
+      const thread = await this.getThread(String(row.thread_id))
+      if (!thread) continue
+      const messages = await this.all<{ content: string }>(
+        `SELECT content FROM messages
+         WHERE turn_id = ? AND role = 'user' ORDER BY created_at ASC, rowid ASC`,
+        [String(row.id)]
+      )
+      claimed.push({
+        turnId: String(row.id),
+        thread,
+        userMessages: messages.map(item => String(item.content)),
+        toolCalls: await this.listToolCalls(thread.id, String(row.id)),
+      })
+    }
+    return claimed
   }
 
   async listJobs () {
