@@ -6,7 +6,7 @@ import type { AgentRuntime } from '../runtime/runtime'
 import type { Message } from '@/types/event'
 
 const commandPattern =
-  /^(?:\/agent\s+(?:approve|deny)\s+[0-9a-f-]{36}(?:\s+(?:thread|delegate))?|\/(?:approve|deny)\s+[0-9a-f-]{36}(?:\s+(?:thread|delegate))?|\/model(?:\s+.+)?|\/(?:new|stop|help|同意|始终同意|拒绝)|同意|允许|拒绝)$/i
+  /^(?:\/agent\s+(?:approve|deny)\s+[0-9a-f-]{36}(?:\s+(?:thread|delegate))?|\/(?:approve|deny)\s+[0-9a-f-]{36}(?:\s+(?:thread|delegate))?|\/(?:model|persona)(?:\s+.+)?|\/(?:new|stop|help|同意|始终同意|拒绝)|同意|允许|拒绝)$/i
 
 const canManageSession = (event: Message) => {
   if (event.isPrivate) return true
@@ -34,12 +34,53 @@ export const registerAgentCommands = (runtime: AgentRuntime) => {
                 '/stop 停止当前会话及子 Agent',
                 '/model 查看或切换当前会话模型',
                 '/model reset 恢复全局主模型',
+                '/persona 查看或切换当前会话人物',
+                '/persona reset 恢复默认人物',
                 '/同意 本次同意',
                 '/始终同意 本会话内始终同意该 Tool',
                 '/拒绝 拒绝本次调用',
                 '/help 查看帮助',
               ].join('\n')
             )
+            return true
+          }
+          if (/^\/persona(?:\s|$)/i.test(content)) {
+            if (!canManageSession(event)) {
+              await event.reply('群聊或频道中只有主人、管理员、群主或群管理员可以切换人物。')
+              return true
+            }
+            const thread = await runtime.currentSession(actor)
+            const argument = content.replace(/^\/persona\b/i, '').trim()
+            const current = await runtime.describeThreadPersona(thread.id)
+            if (!argument) {
+              await event.reply([
+                `当前人物：${current.persona?.name || '未配置'}@${current.personaVersion.version}`,
+                `AGENT.md：v${current.instruction.version}`,
+                '',
+                '可用人物：',
+                ...current.personas.map((item, index) =>
+                  `${index + 1}. ${item.name} (${item.id}) — ${item.description}`
+                ),
+                '',
+                '使用 /persona <序号或ID> 切换，/persona reset 恢复默认人物。',
+              ].join('\n'))
+              return true
+            }
+            if (/^reset$/i.test(argument)) {
+              await runtime.setSessionPersona(actor, null)
+              await event.reply('当前会话已恢复默认人物。')
+              return true
+            }
+            const index = Number(argument)
+            const selected = Number.isInteger(index) && index > 0
+              ? current.personas[index - 1]
+              : current.personas.find(item => item.id === argument)
+            if (!selected) {
+              await event.reply('人物选择无效，请先使用 /persona 查看可用人物。')
+              return true
+            }
+            await runtime.setSessionPersona(actor, selected.id)
+            await event.reply(`当前会话将在下一回合使用人物“${selected.name}”。`)
             return true
           }
           if (/^\/model(?:\s|$)/i.test(content)) {
@@ -164,6 +205,9 @@ export const registerAgentCommands = (runtime: AgentRuntime) => {
           '/model <序号>',
           '/model <providerId> <model>',
           '/model reset',
+          '/persona',
+          '/persona <序号或ID>',
+          '/persona reset',
           '/同意',
           '/始终同意',
           '/拒绝',

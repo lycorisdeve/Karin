@@ -37,7 +37,7 @@ const explicitImageRetry = (content: string) =>
 
 const imageIntent = (content: string) => {
   if (reportsVerificationFailure(content) && !explicitImageRetry(content)) return false
-  return /图片|照片|相片|图像|截图|发(?:一|个|张|图|给|送)|传图|image|photo|picture/i.test(content)
+  return /图片|照片|相片|图像|截图|配图|传图|image|photo|picture/i.test(content)
 }
 
 const deliveryIntent = (content: string) =>
@@ -58,6 +58,7 @@ const fallbackPlan = (input: AgentTurnInput, tools: AvailableTool[]): AgentTaskP
   const toolNames = [
     wantsImage && available.has('karin.browser.search') ? 'karin.browser.search' : '',
     wantsImage && available.has('karin.browser.open') ? 'karin.browser.open' : '',
+    wantsImage && available.has('karin.browser.screenshot') ? 'karin.browser.screenshot' : '',
     wantsImage && available.has('karin.browser.download') ? 'karin.browser.download' : '',
     wantsDelivery && available.has('karin.bot.send_message') ? 'karin.bot.send_message' : '',
   ].filter(Boolean)
@@ -154,7 +155,7 @@ export class AgentTurnRecovery {
         )
       }
       if (postcondition.kind === 'media') {
-        return !matching.some(result =>
+        return !completedResults.some(result =>
           Boolean(result.receipt.media?.path || result.receipt.media?.url) ||
           (result.receipt.delivery?.imageSegments || 0) >= (postcondition.minimumCount || 1)
         )

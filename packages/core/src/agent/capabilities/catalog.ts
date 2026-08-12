@@ -18,9 +18,10 @@ export class AgentCapabilityCatalog {
     private readonly registry: AgentToolRegistry
   ) {}
 
-  async list (threadId: string, allowedTools?: string[]) {
+  async list (threadId: string, callableTools?: string[]) {
+    const callable = callableTools ? new Set(callableTools) : null
     const [tools, skills] = await Promise.all([
-      Promise.resolve(this.registry.list(allowedTools)),
+      Promise.resolve(this.registry.list()),
       this.database.getThreadSkillIndex(threadId),
     ])
     const descriptors: AgentCapabilityDescriptor[] = [
@@ -33,7 +34,9 @@ export class AgentCapabilityCatalog {
         tags: tool.tags,
         risk: tool.risk,
         reversible: tool.reversible,
+        registered: true,
         available: tool.available,
+        callable: tool.available && (!callable || callable.has(tool.name)),
         requirements: tool.requirements,
         owner: tool.owner,
         sensitivity: tool.sensitivity,
@@ -47,6 +50,7 @@ export class AgentCapabilityCatalog {
         source: 'skill-library' as const,
         tags: [],
         version: String(skill.version),
+        registered: true,
         available: true,
         requirements: skill.tools,
       })),
@@ -57,7 +61,7 @@ export class AgentCapabilityCatalog {
   async search (
     threadId: string,
     query: string,
-    allowedTools?: string[],
+    callableTools?: string[],
     limit = 24
   ) {
     const terms = termsFor(query)
@@ -70,8 +74,7 @@ export class AgentCapabilityCatalog {
       ].join(' ').toLowerCase()
       return terms.reduce((total, term) => total + (value.includes(term) ? 1 : 0), 0)
     }
-    return (await this.list(threadId, allowedTools))
-      .filter(item => item.available)
+    return (await this.list(threadId, callableTools))
       .map((item, index) => ({ item, index, score: score(item) }))
       .sort((left, right) => right.score - left.score || left.index - right.index)
       .slice(0, Math.max(1, Math.min(limit, 100)))

@@ -66,13 +66,14 @@ export const defaultConfig: {
     email: [],
   },
   agent: {
-    version: 9,
+    version: 10,
     enabled: false,
     providers: [
       {
         id: 'openai',
         name: 'OpenAI',
         kind: 'openai',
+        protocol: 'chat-completions',
         enabled: true,
         baseUrl: 'https://api.openai.com/v1',
         apiKey: '',
@@ -148,6 +149,22 @@ export const defaultConfig: {
         autoRollback: true,
         rollbackWindow: 20,
       },
+    },
+    memory: {
+      retrieval: {
+        maxCandidates: 50,
+        maxItems: 8,
+        maxPromptTokens: 1200,
+        minScore: 0.25,
+        recencyHalfLifeDays: 30,
+      },
+    },
+    execution: {
+      isolationMode: 'compat',
+      minimumIsolation: 'none',
+      hookTimeoutMs: 5000,
+      maxModelCalls: 40,
+      maxTurnDurationMs: 300000,
     },
     recovery: {
       enabled: true,

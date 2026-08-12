@@ -14,6 +14,7 @@ import {
   agentStructuredMessage,
 } from '../ingress/message-elements'
 import { updateNpmPlugin } from './plugin'
+import { agentConfig } from '@/utils/config/file/agent'
 
 import type { Contact, Scene } from '@/types/event'
 import type { AgentDatabase } from '../persistence/database'
@@ -259,7 +260,11 @@ export const registerBuiltinTools = (
 
   register({
     name: 'karin.tool.search',
-    description: '统一检索当前 Thread 可用的 Tool、Skill、来源、版本、风险、可逆性和运行要求',
+    description: [
+      '统一检索全局注册的 Tool 与当前 Thread Skill。',
+      '结果用 registered 表示全局注册态、available 表示运行环境可用态、',
+      'callable 表示是否实际暴露给当前模型调用。',
+    ].join(' '),
     toolset: 'karin.agent',
     tags: ['能力发现', 'Tool 搜索', 'Skill 搜索'],
     inputSchema: {
@@ -276,7 +281,7 @@ export const registerBuiltinTools = (
     execute: (input, context) => capabilities.search(
       context.threadId,
       String(input.query),
-      context.allowedTools,
+      context.callableTools,
       Number(input.limit || 24)
     ),
   })
@@ -435,17 +440,24 @@ export const registerBuiltinTools = (
 
   register({
     name: 'karin.browser.screenshot',
-    description: '保存当前网页截图到 Karin 临时目录',
+    description: '使用 Karin 已注册的 Puppeteer/Snapka 渲染器截图，必要时降级到当前交互式浏览器',
     toolset: 'karin.browser',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      properties: { fullPage: { type: 'boolean' } },
+      properties: {
+        url: { type: 'string', minLength: 8, maxLength: 2048 },
+        fullPage: { type: 'boolean' },
+      },
     },
     risk: 'read',
     idempotent: true,
     execute: (input, context) =>
-      browser.screenshot(context.threadId, Boolean(input.fullPage)),
+      browser.screenshot(
+        context.threadId,
+        Boolean(input.fullPage),
+        input.url ? String(input.url) : undefined
+      ),
   })
 
   register({
@@ -640,7 +652,7 @@ export const registerBuiltinTools = (
     risk: 'read',
     idempotent: true,
     execute: async input => {
-      const query = String(input.query).toLowerCase()
+      const query = String(input.query)
       const limit = Math.max(1, Math.min(Number(input.limit || 80), 200))
       const entries = await fs.promises.readdir(karinPathLogs, { withFileTypes: true })
         .catch(() => [])
@@ -764,9 +776,11 @@ export const registerBuiltinTools = (
       const scopes = own.scope === 'global'
         ? [{ scope: 'global', key: 'global' }]
         : [{ scope: 'global', key: 'global' }, { scope: own.scope, key: own.key }]
-      return (await database.listMemories(scopes))
-        .filter(item => item.enabled && item.content.toLowerCase().includes(query))
-        .slice(0, 50)
+      return (await database.retrieveMemories(scopes, query, {
+        ...agentConfig().memory.retrieval,
+        maxItems: 50,
+        maxPromptTokens: 20_000,
+      })).map(item => ({ ...item.memory, score: item.score }))
     },
   })
 
@@ -806,6 +820,8 @@ export const registerBuiltinTools = (
       properties: {
         content: { type: 'string', minLength: 1, maxLength: 2000 },
         scope: { enum: ['auto', 'global'] },
+        kind: { enum: ['preference', 'fact', 'relationship', 'procedure', 'constraint'] },
+        key: { type: 'string', maxLength: 200 },
       },
     },
     risk: 'write',
@@ -820,7 +836,14 @@ export const registerBuiltinTools = (
         context.actor,
         input.scope === 'global' ? 'global' : undefined
       )
-      const id = await database.addMemory(target.scope, target.key, content, context.turnId)
+      const id = await database.addMemory(target.scope, target.key, content, context.turnId, {
+        kind: (input.kind || 'fact') as 'preference' | 'fact' | 'relationship' |
+          'procedure' | 'constraint',
+        memoryKey: String(input.key || '').trim() || null,
+        confidence: 1,
+        importance: 0.8,
+        sourceType: 'explicit',
+      })
       await database.audit(
         context.actor.id,
         'memory.create',
@@ -1228,6 +1251,7 @@ export const registerBuiltinTools = (
           maxItems: 100,
           items: { type: 'string' },
         },
+        personaId: { type: 'string', maxLength: 100 },
         enabled: { type: 'boolean' },
       },
     },
@@ -1272,6 +1296,7 @@ export const registerBuiltinTools = (
           ? input.toolAllowlist.map(String)
           : [],
         skillIds: Array.isArray(input.skillIds) ? input.skillIds.map(String) : [],
+        personaId: input.personaId ? String(input.personaId) : null,
         enabled: input.enabled !== false,
         createdBy: context.actor.id,
       })

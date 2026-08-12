@@ -56,6 +56,9 @@ export class AgentScheduler {
         content: record.prompt,
         automated: true,
         allowedTools: record.toolAllowlist,
+        personaVersionId: record.personaId
+          ? (await this.database.getPersona(record.personaId))?.activeVersionId
+          : undefined,
       })
       const delivery = agentDeliveryTarget(actor)
       if (delivery && result.content) {
@@ -88,9 +91,14 @@ export class AgentScheduler {
     target: string
     toolAllowlist: string[]
     skillIds?: string[]
+    personaId?: string | null
     enabled: boolean
     createdBy: string
   }) {
+    if (input.personaId) {
+      const persona = await this.database.getPersona(input.personaId)
+      if (!persona?.enabled) throw new Error('定时任务人物预设不存在或已停用')
+    }
     const record: AgentJobRecord = {
       id: input.id || randomUUID(),
       name: input.name,
@@ -102,6 +110,7 @@ export class AgentScheduler {
       target: input.target,
       toolAllowlist: [...new Set(input.toolAllowlist)],
       skillIds: [...new Set(input.skillIds || [])],
+      personaId: input.personaId || null,
       enabled: input.enabled,
       createdBy: input.createdBy,
       lastRunAt: null,
@@ -138,6 +147,7 @@ export class AgentScheduler {
       target: existing.target,
       toolAllowlist: existing.toolAllowlist,
       skillIds: existing.skillIds,
+      personaId: existing.personaId,
       enabled,
       createdBy: existing.createdBy,
     })

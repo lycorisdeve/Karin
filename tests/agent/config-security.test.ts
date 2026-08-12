@@ -197,7 +197,7 @@ describe('versioned configuration and write-only secrets', () => {
       },
     } as never)
 
-    expect(migrated.version).toBe(9)
+    expect(migrated.version).toBe(10)
     expect(migrated.context).toMatchObject({
       defaultWindowTokens: 65536,
       softLimitRatio: 0.5,
@@ -215,6 +215,18 @@ describe('versioned configuration and write-only secrets', () => {
       model: 'legacy-model',
       apiKey: 'legacy-test-key',
       timeout: 12000,
+      protocol: 'chat-completions',
+    })
+    expect(migrated.memory.retrieval).toMatchObject({
+      maxCandidates: 50,
+      maxItems: 8,
+      maxPromptTokens: 1200,
+    })
+    expect(migrated.execution).toMatchObject({
+      isolationMode: 'compat',
+      minimumIsolation: 'none',
+      maxModelCalls: 40,
+      maxTurnDurationMs: 300000,
     })
   })
 
@@ -232,7 +244,7 @@ describe('versioned configuration and write-only secrets', () => {
       },
     }
     const migrated = migrateAgentConfig(legacy as never)
-    expect(migrated.version).toBe(9)
+    expect(migrated.version).toBe(10)
     expect(migrated.policy.hardDeny).toEqual([])
     expect(migrated.policy.defaults.destructive).toBe('ask')
 

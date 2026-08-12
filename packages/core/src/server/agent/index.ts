@@ -4,6 +4,7 @@ import path from 'node:path'
 import { Router } from 'express'
 import { getAgentServices, getAgentStatus, restartAgent } from '@/agent'
 import { AgentPythonRuntime } from '@/agent/scripts/runtime'
+import { probeAgentIsolationBackends } from '@/agent/execution/isolation'
 import { isManagedAgentMediaPath } from '@/agent/persistence/media'
 import {
   agentConfig,
@@ -27,6 +28,7 @@ import type {
   AgentActivityView,
   AgentActor,
   AgentConfig,
+  AgentPersonaDefinition,
   AgentStreamEvent,
   AgentThreadState,
 } from '@/types/agent'
@@ -64,6 +66,28 @@ const runtime = () => {
   const value = getAgentServices()?.runtime
   if (!value) throw new Error(getAgentStatus().reason || 'Agent 尚未启用')
   return value
+}
+
+const instructions = () => {
+  const value = getAgentServices()?.instructions
+  if (!value) throw new Error('AGENT.md 管理服务不可用')
+  return value
+}
+
+const personaDefinition = (value: unknown): AgentPersonaDefinition => {
+  const input = value && typeof value === 'object'
+    ? value as Partial<AgentPersonaDefinition>
+    : {}
+  return {
+    identity: String(input.identity || '').trim().slice(0, 2000),
+    expertise: Array.isArray(input.expertise)
+      ? [...new Set(input.expertise.map(String).map(item => item.trim()).filter(Boolean))]
+        .slice(0, 32)
+      : [],
+    tone: String(input.tone || '').trim().slice(0, 1000),
+    responseStyle: String(input.responseStyle || '').trim().slice(0, 2000),
+    language: String(input.language || '').trim().slice(0, 200),
+  }
 }
 
 const sensitiveKey = /authorization|cookie|token|password|api[-_]?key|secret/i
@@ -152,6 +176,7 @@ agentRouter.get(
       ...getAgentStatus(),
       apiKeyConfigured: hasAgentApiKey(),
       ftsAvailable: getAgentServices()?.database.isFtsAvailable() || false,
+      isolation: probeAgentIsolationBackends(),
       scriptRuntime: await scriptRuntime.status(),
     })
   })
@@ -184,9 +209,141 @@ agentRouter.post(
 )
 
 agentRouter.get(
+  '/instructions',
+  safe(async (_req, res) => {
+    createSuccessResponse(res, {
+      current: await instructions().current(),
+      filename: 'AGENT.md',
+      maxBytes: 32 * 1024,
+    })
+  })
+)
+
+agentRouter.put(
+  '/instructions',
+  safe(async (req, res) => {
+    try {
+      const actor = actorFromRequest(req)
+      const version = await instructions().save(
+        String(req.body?.content || ''),
+        String(req.body?.expectedHash || ''),
+        actor.id
+      )
+      await database().audit(actor.id, 'instructions.update', version.id, {
+        version: version.version,
+        contentHash: version.contentHash,
+      })
+      createSuccessResponse(res, version)
+    } catch (error) {
+      if ((error as Error & { code?: string }).code === 'INSTRUCTION_CONFLICT') {
+        res.status(409).json({ code: 409, data: null, message: (error as Error).message })
+        return
+      }
+      throw error
+    }
+  })
+)
+
+agentRouter.get(
+  '/instructions/versions',
+  safe(async (_req, res) => createSuccessResponse(res, await instructions().versions()))
+)
+
+agentRouter.get(
+  '/personas',
+  safe(async (_req, res) => createSuccessResponse(res, await database().listPersonas()))
+)
+
+agentRouter.post(
+  '/personas',
+  safe(async (req, res) => {
+    const actor = actorFromRequest(req)
+    const name = String(req.body?.name || '').trim().slice(0, 100)
+    if (!name) {
+      createBadRequestResponse(res, '人物名称不能为空')
+      return
+    }
+    const persona = await database().createPersona({
+      name,
+      description: String(req.body?.description || '').trim().slice(0, 500),
+      definition: personaDefinition(req.body?.definition),
+      createdBy: actor.id,
+    })
+    await database().audit(actor.id, 'persona.create', persona.id, {
+      version: persona.version,
+    })
+    createSuccessResponse(res, persona)
+  })
+)
+
+agentRouter.put(
+  '/personas/:id',
+  safe(async (req, res) => {
+    const actor = actorFromRequest(req)
+    const name = String(req.body?.name || '').trim().slice(0, 100)
+    if (!name) {
+      createBadRequestResponse(res, '人物名称不能为空')
+      return
+    }
+    const persona = await database().updatePersona(String(req.params.id), {
+      name,
+      description: String(req.body?.description || '').trim().slice(0, 500),
+      definition: personaDefinition(req.body?.definition),
+      createdBy: actor.id,
+    })
+    await database().audit(actor.id, 'persona.update', persona.id, {
+      version: persona.version,
+    })
+    createSuccessResponse(res, persona)
+  })
+)
+
+agentRouter.get(
+  '/personas/:id/versions',
+  safe(async (req, res) => createSuccessResponse(
+    res,
+    await database().listPersonaVersions(String(req.params.id))
+  ))
+)
+
+agentRouter.post(
+  '/personas/:id/state',
+  safe(async (req, res) => {
+    const actor = actorFromRequest(req)
+    const persona = await database().setPersonaEnabled(
+      String(req.params.id),
+      Boolean(req.body?.enabled)
+    )
+    await database().audit(actor.id, 'persona.state', persona.id, {
+      enabled: persona.enabled,
+    })
+    createSuccessResponse(res, persona)
+  })
+)
+
+agentRouter.post(
+  '/personas/:id/default',
+  safe(async (req, res) => {
+    const actor = actorFromRequest(req)
+    const persona = await database().setDefaultPersona(String(req.params.id))
+    await database().audit(actor.id, 'persona.default', persona.id, {})
+    createSuccessResponse(res, persona)
+  })
+)
+
+agentRouter.get(
   '/providers/presets',
   safe(async (_req, res) => {
     createSuccessResponse(res, agentProviderPresets())
+  })
+)
+
+agentRouter.get(
+  '/providers/:id/capabilities',
+  safe(async (req, res) => {
+    const provider = getAgentServices()?.providers
+    if (!provider) throw new Error('Provider Registry 不可用')
+    createSuccessResponse(res, provider.capabilitiesFor(String(req.params.id)))
   })
 )
 
@@ -413,6 +570,46 @@ agentRouter.patch(
   })
 )
 
+agentRouter.get(
+  '/threads/:id/customization',
+  safe(async (req, res) => {
+    createSuccessResponse(res, await runtime().describeThreadPersona(String(req.params.id)))
+  })
+)
+
+agentRouter.patch(
+  '/threads/:id/persona',
+  safe(async (req, res) => {
+    const personaId = req.body?.personaId == null ? null : String(req.body.personaId)
+    createSuccessResponse(res, await runtime().setThreadPersona(
+      String(req.params.id),
+      actorFromRequest(req),
+      personaId
+    ))
+  })
+)
+
+agentRouter.patch(
+  '/threads/:id/instruction-version',
+  safe(async (req, res) => {
+    const threadId = String(req.params.id)
+    const versionId = String(req.body?.versionId || '')
+    if (!versionId) {
+      createBadRequestResponse(res, 'versionId 不能为空')
+      return
+    }
+    const updated = await database().setThreadInstructionVersion(threadId, versionId)
+    await database().audit(
+      actorFromRequest(req).id,
+      'thread.instructions.set',
+      threadId,
+      { versionId },
+      threadId
+    )
+    createSuccessResponse(res, { updated, versionId })
+  })
+)
+
 agentRouter.delete(
   '/threads/:id',
   safe(async (req, res) => {
@@ -450,6 +647,7 @@ agentRouter.get(
         ...call,
         source: descriptor?.source || 'unknown',
         toolset: descriptor?.toolset || 'unknown',
+        isolation: descriptor?.isolation || 'legacy-inline',
         description: descriptor?.description || '',
         durationMs: call.completedAt
           ? Math.max(0, call.completedAt - call.createdAt)
@@ -520,6 +718,7 @@ agentRouter.get(
         status,
         label: descriptor?.description || call.name,
         source: descriptor?.source || 'unknown',
+        isolation: descriptor?.isolation || 'legacy-inline',
         risk: call.risk as AgentActivityView['risk'],
         decision: call.decision as AgentActivityView['decision'],
         input: call.input,
@@ -778,14 +977,14 @@ agentRouter.get(
     res.setHeader('Connection', 'keep-alive')
     res.flushHeaders()
 
-    const send = (event: AgentStreamEvent) => {
-      const safeEvent = redactValue(event)
+    const send = (event: AgentStreamEvent, replayed = false) => {
+      const safeEvent = redactValue(event) as AgentStreamEvent
       res.write(`id: ${event.id}\n`)
       res.write(`event: ${event.type}\n`)
-      res.write(`data: ${JSON.stringify(safeEvent)}\n\n`)
+      res.write(`data: ${JSON.stringify({ ...safeEvent, replayed })}\n\n`)
     }
     const threadId = String(req.params.id)
-    for (const event of await agent.events.replay(threadId, afterId)) send(event)
+    for (const event of await agent.events.replay(threadId, afterId)) send(event, true)
     const unsubscribe = agent.events.subscribe(threadId, send)
     const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000)
     req.once('close', () => {
@@ -888,8 +1087,39 @@ agentRouter.post(
 
 agentRouter.get(
   '/memories',
-  safe(async (_req, res) => {
-    createSuccessResponse(res, await database().listMemories())
+  safe(async (req, res) => {
+    const query = String(req.query.query || '').trim().toLowerCase()
+    const scope = String(req.query.scope || '')
+    const kind = String(req.query.kind || '')
+    const status = String(req.query.status || '')
+    const memories = (await database().listMemories()).filter(item =>
+      (!query || item.content.toLowerCase().includes(query) ||
+        item.memoryKey?.toLowerCase().includes(query)) &&
+      (!scope || item.scope === scope) &&
+      (!kind || item.kind === kind) &&
+      (!status || item.status === status)
+    )
+    createSuccessResponse(res, memories)
+  })
+)
+
+agentRouter.get(
+  '/memories/retrieval-preview',
+  safe(async (req, res) => {
+    const query = String(req.query.query || '').trim()
+    if (!query) {
+      createBadRequestResponse(res, 'query 不能为空')
+      return
+    }
+    const all = await database().listMemories()
+    const scopes = [...new Map(all.map(item => [
+      `${item.scope}:${item.scopeKey}`,
+      { scope: item.scope, key: item.scopeKey },
+    ])).values()]
+    createSuccessResponse(
+      res,
+      await database().retrieveMemories(scopes, query, agentConfig().memory.retrieval)
+    )
   })
 )
 
@@ -910,9 +1140,45 @@ agentRouter.post(
       createBadRequestResponse(res, '记忆内容不能超过 2000 字符')
       return
     }
-    const id = await database().addMemory(scope, scopeKey, content, `web:${Date.now()}`)
+    const kind = String(req.body?.kind || 'fact') as
+      'preference' | 'fact' | 'relationship' | 'procedure' | 'constraint'
+    if (!['preference', 'fact', 'relationship', 'procedure', 'constraint'].includes(kind)) {
+      createBadRequestResponse(res, '记忆 kind 无效')
+      return
+    }
+    const id = await database().addMemory(scope, scopeKey, content, `web:${Date.now()}`, {
+      kind,
+      memoryKey: String(req.body?.memoryKey || '').trim() || null,
+      confidence: Number(req.body?.confidence ?? 1),
+      importance: Number(req.body?.importance ?? 0.8),
+      pinned: Boolean(req.body?.pinned),
+      sourceType: 'web',
+      expiresAt: req.body?.expiresAt ? Number(req.body.expiresAt) : null,
+    })
     await database().audit(actor.id, 'memory.create', id, { scope, scopeKey })
     createSuccessResponse(res, { id })
+  })
+)
+
+agentRouter.patch(
+  '/memories/:id',
+  safe(async (req, res) => {
+    const memory = await database().updateMemory(String(req.params.id), {
+      content: req.body?.content === undefined ? undefined : String(req.body.content),
+      kind: req.body?.kind,
+      memoryKey: req.body?.memoryKey === undefined ? undefined : String(req.body.memoryKey),
+      confidence: req.body?.confidence === undefined ? undefined : Number(req.body.confidence),
+      importance: req.body?.importance === undefined ? undefined : Number(req.body.importance),
+      pinned: req.body?.pinned === undefined ? undefined : Boolean(req.body.pinned),
+      expiresAt: req.body?.expiresAt === undefined
+        ? undefined
+        : req.body.expiresAt == null ? null : Number(req.body.expiresAt),
+      status: req.body?.status,
+    })
+    await database().audit(actorFromRequest(req).id, 'memory.update', String(req.params.id), {
+      fields: Object.keys(req.body || {}),
+    })
+    createSuccessResponse(res, memory)
   })
 )
 
@@ -1234,6 +1500,7 @@ agentRouter.post(
       target: String(body.target),
       toolAllowlist: Array.isArray(body.toolAllowlist) ? body.toolAllowlist.map(String) : [],
       skillIds: Array.isArray(body.skillIds) ? body.skillIds.map(String) : [],
+      personaId: body.personaId ? String(body.personaId) : null,
       enabled: body.enabled !== false,
       createdBy: actorFromRequest(req).id,
     })

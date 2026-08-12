@@ -99,6 +99,25 @@ export class AgentToolRegistry {
     return this.compiled.get(name) || null
   }
 
+  isolation (name: string) {
+    const compiled = this.get(name)
+    const source = this.sources.get(name) || (
+      name.startsWith('karin.')
+        ? 'core'
+        : name.startsWith('mcp.')
+          ? 'mcp'
+          : name.startsWith('skill.') ? 'generated-sandbox' : 'plugin'
+    )
+    if (source === 'core') return 'core-inline' as const
+    if (source === 'generated-sandbox') return 'generated-sandbox' as const
+    if (source === 'mcp') {
+      return compiled?.tool.isolation === 'mcp-stdio' ? 'mcp-stdio' as const : 'mcp-remote' as const
+    }
+    return compiled?.tool.isolation === 'process-isolated'
+      ? 'process-isolated' as const
+      : 'legacy-inline' as const
+  }
+
   list (allowedTools?: string[]) {
     const allowed = allowedTools?.length ? new Set(allowedTools) : null
     return cache.tool
@@ -157,6 +176,7 @@ export class AgentToolRegistry {
             return `可用性检查失败：${(error as Error).message}`
           }
         })(),
+        isolation: this.isolation(tool.name),
       }))
   }
 

@@ -2,8 +2,9 @@ import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
 import dns from 'node:dns/promises'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { karinPathTemp } from '@/root'
+import { callRender, getRenderCount } from '@/adapter/render/admin/cache'
 
 import type { Browser, BrowserContext, Page } from 'playwright'
 
@@ -12,6 +13,139 @@ interface BrowserSession {
   context: BrowserContext
   page: Page
 }
+
+interface ManagedBrowserLaunchOptions {
+  headless: true
+  channel?: 'chrome' | 'msedge'
+  executablePath?: string
+}
+
+interface BrowserLaunchCandidate {
+  label: string
+  options: ManagedBrowserLaunchOptions
+}
+
+const existingExecutable = (
+  label: string,
+  executablePath: string | undefined,
+  exists: (value: string) => boolean
+): BrowserLaunchCandidate | null => executablePath && exists(executablePath)
+  ? { label, options: { headless: true, executablePath } }
+  : null
+
+export const browserLaunchCandidates = (
+  platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+  exists: (value: string) => boolean = fs.existsSync
+): BrowserLaunchCandidate[] => {
+  const values: Array<BrowserLaunchCandidate | null> = [
+    { label: 'playwright-chromium', options: { headless: true } },
+  ]
+  const custom = String(environment.KARIN_AGENT_BROWSER_EXECUTABLE || '').trim()
+  if (custom) values.push(existingExecutable('configured-executable', custom, exists))
+
+  if (platform === 'win32') {
+    values.push(
+      { label: 'system-edge', options: { headless: true, channel: 'msedge' } },
+      { label: 'system-chrome', options: { headless: true, channel: 'chrome' } },
+      existingExecutable(
+        'edge-program-files',
+        environment.PROGRAMFILES
+          ? path.join(environment.PROGRAMFILES, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+          : undefined,
+        exists
+      ),
+      existingExecutable(
+        'chrome-program-files',
+        environment.PROGRAMFILES
+          ? path.join(environment.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe')
+          : undefined,
+        exists
+      ),
+      existingExecutable(
+        'chrome-local-app-data',
+        environment.LOCALAPPDATA
+          ? path.join(environment.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe')
+          : undefined,
+        exists
+      )
+    )
+  } else if (platform === 'darwin') {
+    values.push(
+      { label: 'system-chrome', options: { headless: true, channel: 'chrome' } },
+      { label: 'system-edge', options: { headless: true, channel: 'msedge' } },
+      existingExecutable(
+        'macos-chrome',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        exists
+      ),
+      existingExecutable(
+        'macos-edge',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        exists
+      )
+    )
+  } else {
+    values.push(
+      { label: 'system-chrome', options: { headless: true, channel: 'chrome' } },
+      { label: 'system-edge', options: { headless: true, channel: 'msedge' } },
+      ...[
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/microsoft-edge',
+        '/usr/bin/microsoft-edge-stable',
+      ].map(value => existingExecutable(`system-executable:${value}`, value, exists))
+    )
+  }
+
+  const seen = new Set<string>()
+  return values.filter((value): value is BrowserLaunchCandidate => Boolean(value)).filter(value => {
+    const key = JSON.stringify(value.options)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+const decodeXml = (value: string) => value
+  .replace(/^<!\[CDATA\[([\s\S]*)\]\]>$/i, '$1')
+  .replace(/&#(x?[0-9a-f]+);/gi, (_match, code: string) => String.fromCodePoint(
+    code.toLowerCase().startsWith('x')
+      ? Number.parseInt(code.slice(1), 16)
+      : Number.parseInt(code, 10)
+  ))
+  .replace(/&lt;/gi, '<')
+  .replace(/&gt;/gi, '>')
+  .replace(/&quot;/gi, '"')
+  .replace(/&apos;/gi, "'")
+  .replace(/&amp;/gi, '&')
+
+const xmlField = (value: string, name: string) => {
+  const match = value.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${name}>`, 'i'))
+  return decodeXml(match?.[1]?.trim() || '')
+}
+
+const stripMarkup = (value: string) => decodeXml(value.replace(/<[^>]+>/g, ' '))
+  .replace(/\s+/g, ' ')
+  .trim()
+
+const parseBingRss = (value: string, limit: number) => [...value.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)]
+  .slice(0, limit)
+  .map(match => ({
+    title: stripMarkup(xmlField(match[1], 'title')).slice(0, 300),
+    url: xmlField(match[1], 'link').slice(0, 2048),
+    snippet: stripMarkup(xmlField(match[1], 'description')).slice(0, 1000),
+  }))
+  .filter(item => {
+    if (!item.title) return false
+    try {
+      return ['http:', 'https:'].includes(new URL(item.url).protocol)
+    } catch {
+      return false
+    }
+  })
 
 const privateIpv4 = (address: string) => {
   const parts = address.split('.').map(Number)
@@ -75,17 +209,59 @@ export class AgentBrowserManager {
   private readonly sessions = new Map<string, BrowserSession>()
   private readonly directory = path.join(karinPathTemp, 'agent-browser')
 
+  private async renderScreenshot (threadId: string, url: URL, fullPage: boolean) {
+    const rendered = await callRender({
+      file: url.toString(),
+      name: 'agent-browser',
+      type: 'png',
+      fullPage,
+      pageGotoParams: {
+        waitUntil: 'networkidle2',
+        timeout: 30_000,
+      },
+    })
+    if (Array.isArray(rendered)) throw new Error('Karin 渲染器返回了非预期的多图结果')
+
+    const encoded = rendered
+      .replace(/^base64:\/\//, '')
+      .replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '')
+    const buffer = Buffer.from(encoded, 'base64')
+    if (buffer.byteLength === 0) throw new Error('Karin 渲染器返回了空图片')
+    if (buffer.byteLength > 10 * 1024 * 1024) throw new Error('Karin 渲染器截图超过 10 MiB 限制')
+    const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+    if (!buffer.subarray(0, pngSignature.length).equals(pngSignature)) {
+      throw new Error('Karin 渲染器返回的内容不是有效 PNG 图片')
+    }
+
+    const safeThread = threadId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100)
+    const directory = path.join(this.directory, safeThread)
+    await fs.promises.mkdir(directory, { recursive: true })
+    const filename = path.join(directory, `${Date.now()}-${randomUUID()}.png`)
+    await fs.promises.writeFile(filename, buffer, { flag: 'wx' })
+    return { path: filename, url: url.toString(), renderer: 'karin' as const }
+  }
+
   private async session (threadId: string) {
     const existing = this.sessions.get(threadId)
     if (existing) return existing
     const { chromium } = await import('playwright')
-    let browser: Browser
-    try {
-      browser = await chromium.launch({ headless: true })
-    } catch (error) {
+    let browser: Browser | undefined
+    const failures: string[] = []
+    for (const candidate of browserLaunchCandidates()) {
+      try {
+        browser = await chromium.launch(candidate.options)
+        break
+      } catch (error) {
+        failures.push(`${candidate.label}: ${(error as Error).message.split('\n', 1)[0]}`)
+      }
+    }
+    if (!browser) {
       throw new Error(
-        'Playwright Chromium 启动失败，请先执行 pnpm exec playwright install chromium',
-        { cause: error }
+        [
+          '交互式浏览器不可用：已尝试 Playwright Chromium 和系统 Chrome/Edge/Chromium。',
+          '基础网页搜索和已注册的 Karin 渲染器截图仍可使用；点击与动态页面需要安装 Chromium，或设置 KARIN_AGENT_BROWSER_EXECUTABLE。',
+          failures.slice(0, 3).join('；'),
+        ].filter(Boolean).join(' ')
       )
     }
     const context = await browser.newContext({
@@ -138,29 +314,25 @@ export class AgentBrowserManager {
     }
   }
 
-  async search (threadId: string, query: string, limit = 8) {
+  async search (_threadId: string, query: string, limit = 8) {
     const normalized = query.trim().slice(0, 500)
     if (!normalized) throw new Error('搜索词不能为空')
-    const url = `https://www.bing.com/search?q=${encodeURIComponent(normalized)}`
-    const { page } = await this.session(threadId)
-    await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
+    const maximum = Math.max(1, Math.min(limit, 20))
+    const url = `https://www.bing.com/search?format=rss&count=${maximum}&q=${encodeURIComponent(normalized)}`
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(30_000),
+      headers: {
+        accept: 'application/rss+xml, application/xml;q=0.9, text/xml;q=0.8',
+        'user-agent': 'Karin-Agent/2.0',
+      },
     })
-    const results = await page.locator('li.b_algo').evaluateAll((elements, maximum) =>
-      elements.slice(0, Number(maximum)).map(element => {
-        const anchor = element.querySelector('h2 a') as HTMLAnchorElement | null
-        const snippet = element.querySelector('.b_caption p')
-        return {
-          title: (anchor?.textContent || '').trim().slice(0, 300),
-          url: anchor?.href || '',
-          snippet: (snippet?.textContent || '').trim().slice(0, 1000),
-        }
-      }).filter(item => item.title && item.url),
-    Math.max(1, Math.min(limit, 20)))
+    if (!response.ok) throw new Error(`网页搜索失败：HTTP ${response.status}`)
+    const body = await response.text()
+    if (Buffer.byteLength(body) > 2 * 1024 * 1024) throw new Error('网页搜索响应超过 2 MiB 上限')
+    const results = parseBingRss(body, maximum)
     return {
       query: normalized,
-      engine: 'bing',
+      engine: 'bing-rss',
       results,
       note: '搜索摘要仅用于发现来源；技术结论应继续打开官方文档或上游源码验证。',
     }
@@ -193,14 +365,45 @@ export class AgentBrowserManager {
     return { url: page.url(), values }
   }
 
-  async screenshot (threadId: string, fullPage = false) {
-    const { page } = await this.session(threadId)
+  async screenshot (threadId: string, fullPage = false, value?: string) {
+    const existing = this.sessions.get(threadId)
+    const currentUrl = existing?.page.url()
+    const target = value || (currentUrl?.startsWith('http') ? currentUrl : '')
+    const url = target ? await assertPublicUrl(target) : undefined
+    let renderError: Error | undefined
+
+    if (url && getRenderCount() > 0) {
+      try {
+        return await this.renderScreenshot(threadId, url, fullPage)
+      } catch (error) {
+        renderError = error as Error
+      }
+    }
+
+    let page: Page
+    try {
+      page = (existing || await this.session(threadId)).page
+      if (url && page.url() !== url.toString()) {
+        await page.goto(url.toString(), {
+          waitUntil: 'domcontentloaded',
+          timeout: 30_000,
+        })
+      }
+    } catch (error) {
+      if (renderError) {
+        throw new Error(
+          `Karin 渲染器与交互式浏览器均无法截图：${renderError.message}；${(error as Error).message}`
+        )
+      }
+      throw error
+    }
+
     const safeThread = threadId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100)
     const directory = path.join(this.directory, safeThread)
     await fs.promises.mkdir(directory, { recursive: true })
-    const filename = path.join(directory, `${Date.now()}.png`)
+    const filename = path.join(directory, `${Date.now()}-${randomUUID()}.png`)
     await page.screenshot({ path: filename, fullPage })
-    return { path: filename, url: page.url() }
+    return { path: filename, url: page.url(), renderer: 'interactive' as const }
   }
 
   async download (threadId: string, value: string) {

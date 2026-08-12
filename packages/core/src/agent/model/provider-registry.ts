@@ -31,6 +31,7 @@ const clientFor = (profile: AgentProviderProfile) =>
     baseUrl: profile.baseUrl,
     apiKey: profile.apiKey,
     timeout: profile.timeout,
+    protocol: profile.protocol,
   })
 
 const isTransient = (error: unknown) => {
@@ -85,6 +86,12 @@ export class AgentProviderRegistry implements AgentModelProvider {
 
   private profile (id: string) {
     return this.getConfig().providers.find(profile => profile.id === id) || null
+  }
+
+  capabilitiesFor (id: string) {
+    const profile = this.profile(id)
+    if (!profile) throw new Error(`Provider 不存在: ${id}`)
+    return clientFor(profile).capabilities
   }
 
   async complete (

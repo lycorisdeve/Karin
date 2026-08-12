@@ -26,6 +26,8 @@ import { AgentCapabilityCatalog } from './capabilities/catalog'
 import { AgentGeneratedToolLibrary } from './generated-tools/library'
 import type { AgentEvolutionPipeline } from './evolution'
 import { restartDirect } from '@/utils/system/restart'
+import { AgentInstructionStore } from './prompt/instructions'
+import { configureAgentHookTimeout } from '@/hooks/agent'
 
 export interface AgentServices {
   database: AgentDatabase
@@ -39,6 +41,7 @@ export interface AgentServices {
   generatedTools: AgentGeneratedToolLibrary | null
   capabilities: AgentCapabilityCatalog | null
   evolution: AgentEvolutionPipeline | null
+  instructions: AgentInstructionStore | null
 }
 
 let services: AgentServices | null = null
@@ -73,6 +76,7 @@ export const closeAgent = async () => {
   services?.scheduler?.stop()
   await services?.mcp?.close()
   services?.generatedTools?.close()
+  services?.instructions?.close()
   services?.registry.unregisterPrefix('karin.')
   services?.registry.unregisterPrefix('mcp.')
   await services?.database.close()
@@ -97,10 +101,14 @@ export const initAgent = async () => {
     generatedTools: null,
     capabilities: null,
     evolution: null,
+    instructions: null,
   }
 
   try {
     await database.init()
+    const instructions = new AgentInstructionStore(database)
+    await instructions.init()
+    services.instructions = instructions
     for (const tool of [...cache.tool]) {
       try {
         registry.validateDefinition(tool)
@@ -112,6 +120,7 @@ export const initAgent = async () => {
     }
 
     const config = agentConfig()
+    configureAgentHookTimeout(config.execution.hookTimeoutMs)
     await database.pruneTurnEvents(config.journal?.eventRetentionDays ?? 7)
     const provider = new AgentProviderRegistry(agentConfig)
     services.providers = provider

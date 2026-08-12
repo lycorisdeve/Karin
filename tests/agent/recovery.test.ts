@@ -122,6 +122,12 @@ const tools = [
     tags: ['图片'],
   },
   {
+    name: 'karin.browser.screenshot',
+    description: 'screenshot',
+    risk: 'read',
+    tags: ['截图'],
+  },
+  {
     name: 'karin.browser.download',
     description: 'download',
     risk: 'read',
@@ -141,6 +147,41 @@ const provider = (content: string): AgentModelProvider => ({
 })
 
 describe('Agent verifiable recovery', () => {
+  it('does not infer an image requirement from 发一下新闻', async () => {
+    const recovery = new AgentTurnRecovery(provider('unused'), () => config(false))
+    const result = await recovery.createPlan(
+      {
+        ...input,
+        actor: {
+          ...input.actor,
+          scene: 'web',
+          contactKey: 'web:admin',
+          origin: {
+            channel: 'web',
+            protocol: 'web',
+            accountId: 'web',
+            accountName: 'WebUI',
+            contactKey: 'web:admin',
+            contactId: 'admin',
+            contactSubId: '',
+            contactName: 'Admin',
+          },
+        },
+        content: '给我发一下今天的热点新闻',
+      },
+      tools,
+      'fake',
+      'fake',
+      new AbortController().signal
+    )
+
+    expect(result.plan.goals[0].postconditions.map(item => item.kind)).toEqual([
+      'information',
+    ])
+    expect(result.plan.goals[0].capabilities).not.toContain('karin.browser.download')
+    expect(result.plan.goals[0].capabilities).not.toContain('karin.bot.send_message')
+  })
+
   it('uses a conservative actionable plan until provider planning is verified', async () => {
     const model = provider('unused')
     const recovery = new AgentTurnRecovery(model, () => config(false))
@@ -227,6 +268,53 @@ describe('Agent verifiable recovery', () => {
     }]
     expect(recovery.finalContent(result.plan, media, '我没有发送图片的工具'))
       .toContain('附件展示')
+  })
+
+  it('accepts any completed Tool receipt that contains verified media', async () => {
+    const recovery = new AgentTurnRecovery(provider('unused'), () => config(false))
+    const result = await recovery.createPlan(
+      {
+        ...input,
+        actor: {
+          ...input.actor,
+          scene: 'web',
+          contactKey: 'web:admin',
+          origin: {
+            channel: 'web',
+            protocol: 'web',
+            accountId: 'web',
+            accountName: 'WebUI',
+            contactKey: 'web:admin',
+            contactId: 'admin',
+            contactSubId: '',
+            contactName: 'Admin',
+          },
+        },
+      },
+      tools,
+      'fake',
+      'fake',
+      new AbortController().signal
+    )
+    const screenshot: AgentToolResultEnvelope[] = [{
+      status: 'completed',
+      data: { path: 'controlled/news.png' },
+      receipt: {
+        toolName: 'karin.browser.screenshot',
+        status: 'completed',
+        startedAt: 1,
+        completedAt: 2,
+        idempotent: true,
+        media: { path: 'controlled/news.png', mime: 'image/png', size: 1024 },
+      },
+      evidence: ['media:controlled/news.png'],
+    }]
+
+    expect(result.plan.goals[0].capabilities).toContain('karin.browser.screenshot')
+    expect(recovery.verify(result.plan, screenshot, '图片已准备好')).toMatchObject({
+      completed: true,
+      missing: [],
+    })
   })
 
   it('requires a real image delivery receipt and replaces contradictory capability denial', () => {

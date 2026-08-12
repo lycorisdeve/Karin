@@ -128,6 +128,7 @@ export class AgentMcpClientManager {
           permission: 'all',
           timeout: 30_000,
           idempotent: risk.idempotent,
+          isolation: config.transport === 'stdio' ? 'mcp-stdio' : 'mcp-remote',
           execute: async input => {
             return client.callTool({
               name: remote.name,

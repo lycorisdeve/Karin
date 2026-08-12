@@ -22,6 +22,11 @@ interface LearningCandidate {
   memories?: Array<{
     content: string
     scope?: 'user' | 'group' | 'global'
+    kind?: 'preference' | 'fact' | 'relationship' | 'procedure' | 'constraint'
+    key?: string
+    confidence?: number
+    importance?: number
+    ttlDays?: number
   }>
   skill?: {
     name: string
@@ -69,21 +74,6 @@ const parseCandidate = (content: string): LearningCandidate | null => {
   } catch {
     return null
   }
-}
-
-const termsFor = (query: string) =>
-  [...new Set(
-    query
-      .toLowerCase()
-      .split(/[\s,，。！？、:：;；()[\]{}"'`]+/)
-      .map(item => item.trim())
-      .filter(item => item.length >= 2)
-  )].slice(0, 20)
-
-const relevance = (content: string, terms: string[]) => {
-  if (!terms.length) return 0
-  const normalized = content.toLowerCase()
-  return terms.reduce((score, term) => score + (normalized.includes(term) ? 1 : 0), 0)
 }
 
 const parseSkillDocument = (content: string) => {
@@ -136,28 +126,37 @@ export class AgentLearning {
     actor: AgentActor,
     query: string
   ) {
+    const retrieval = this.getConfig().memory?.retrieval || {
+      maxCandidates: 50,
+      maxItems: 8,
+      maxPromptTokens: 1200,
+      minScore: 0.25,
+      recencyHalfLifeDays: 30,
+    }
     const [memories, skills] = await Promise.all([
-      this.database.listMemories(this.memoryScopes(actor)),
+      this.database.retrieveMemories(this.memoryScopes(actor), query, {
+        ...retrieval,
+        threadId,
+        turnId,
+      }),
       this.database.getThreadSkillIndex(threadId),
     ])
-    const terms = termsFor(query)
-    const rankedMemories = memories
-      .map(item => ({ item, score: relevance(item.content, terms) }))
-      .sort((left, right) => right.score - left.score || right.item.createdAt - left.item.createdAt)
-      .slice(0, 12)
-    await Promise.all([
-      ...rankedMemories.map(({ item }, rank) =>
-        this.database.recordRetrieval({
-          threadId,
-          turnId,
-          kind: 'memory',
-          itemId: item.id,
-          rank,
-        })),
-    ])
+    await agentHookEmit('memoryRetrieved', {
+      threadId,
+      turnId,
+      candidateCount: memories.length,
+      itemIds: memories.map(item => item.memory.id),
+    })
 
     return {
-      memories: rankedMemories.map(({ item }) => item.content),
+      memories: memories.map(({ memory }) => ({
+        id: memory.id,
+        kind: memory.kind,
+        scope: memory.scope,
+        content: memory.content,
+        confidence: memory.confidence,
+        sourceType: memory.sourceType,
+      })),
       skills: skills.slice(0, 200),
     }
   }
@@ -178,6 +177,11 @@ export class AgentLearning {
       skillIds: loadedSkillIds,
       error: outcome.error,
     })
+    await this.database.completeRetrievals(
+      outcome.threadId,
+      outcome.turnId,
+      outcome.status
+    )
     await Promise.all(
       loadedSkillIds.map(skillId =>
         this.database.touchSkillUsage(
@@ -228,7 +232,7 @@ export class AgentLearning {
           role: 'system',
           content: [
             '你是 Karin Agent 的后台反思器，工作在独立 Thread 中。',
-            '只输出 JSON：{"memories":[{"content":"...","scope":"user|group|global"}],"skill":null}。',
+            '只输出 JSON：{"memories":[{"content":"...","scope":"user|group|global","kind":"preference|fact|relationship|procedure|constraint","key":"稳定主题键","confidence":0.0,"importance":0.0,"ttlDays":null}],"skill":null}。',
             '失败是改进信号，但不得把失败猜测写成事实。',
             '仅保留未来确实有用、由用户明确表达的稳定偏好、纠正或可复用工作流。',
             '不要保存密钥、令牌、密码、Cookie、隐私数据或临时任务内容。',
@@ -594,7 +598,18 @@ export class AgentLearning {
       sourceTurnIds: [outcome.turnId],
       candidateVersion: createHash('sha256').update(content).digest('hex').slice(0, 12),
       summary: content.slice(0, 160),
-      payload: { content, scope, scopeKey },
+      payload: {
+        content,
+        scope,
+        scopeKey,
+        kind: memory.kind || 'fact',
+        memoryKey: String(memory.key || '').trim().slice(0, 200) || null,
+        confidence: Math.max(0, Math.min(Number(memory.confidence) || 0.7, 1)),
+        importance: Math.max(0, Math.min(Number(memory.importance) || 0.5, 1)),
+        expiresAt: memory.ttlDays
+          ? Date.now() + Math.max(1, Number(memory.ttlDays)) * 86_400_000
+          : null,
+      },
     })
     if (candidate) await this.evaluateCandidate(candidate.id, outcome.actor)
   }
@@ -717,7 +732,24 @@ export class AgentLearning {
         scope,
         String(candidate.payload.scopeKey),
         String(candidate.payload.content),
-        candidate.sourceTurnIds.at(-1) || `evolution:${id}`
+        candidate.sourceTurnIds.at(-1) || `evolution:${id}`,
+        {
+          kind: (candidate.payload.kind || 'fact') as 'preference' | 'fact' |
+            'relationship' | 'procedure' | 'constraint',
+          memoryKey: candidate.payload.memoryKey
+            ? String(candidate.payload.memoryKey)
+            : null,
+          confidence: Number(candidate.payload.confidence) ||
+            (candidate.payload.priority === 'user-correction' ? 1 : 0.7),
+          importance: Number(candidate.payload.importance) ||
+            (candidate.payload.priority === 'user-correction' ? 0.9 : 0.5),
+          sourceType: candidate.payload.priority === 'user-correction'
+            ? 'correction'
+            : 'reflection',
+          expiresAt: candidate.payload.expiresAt
+            ? Number(candidate.payload.expiresAt)
+            : null,
+        }
       )
       resource = { memoryId }
       await agentHookEmit('memoryWrite', {
@@ -726,6 +758,11 @@ export class AgentLearning {
         turnId: candidate.sourceTurnIds.at(-1) || '',
         scope,
         key: String(candidate.payload.scopeKey),
+      })
+      await agentHookEmit('memoryPromoted', {
+        id: memoryId,
+        candidateId: id,
+        sourceTurnIds: candidate.sourceTurnIds,
       })
     } else if (candidate.target === 'skill') {
       if (!['master', 'admin'].includes(actor.role)) {
@@ -797,6 +834,10 @@ export class AgentLearning {
     this.lastCuratorRun = Date.now()
     const day = 24 * 60 * 60 * 1000
     await this.database.curateSkillUsage(
+      Date.now() - config.staleAfterDays * day,
+      Date.now() - config.archiveAfterDays * day
+    )
+    await this.database.curateMemories(
       Date.now() - config.staleAfterDays * day,
       Date.now() - config.archiveAfterDays * day
     )

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { agentHookEmit } from '@/hooks/agent'
+import { agentHookContext, agentHookEmit } from '@/hooks/agent'
 import { deliverAgentResult, dispatchAgentResult } from '../ingress/delivery'
 import { replyAgentResult } from '../ingress/reply'
 import { agentModelContent } from '../ingress/model-content'
@@ -32,6 +32,7 @@ import { AgentTaskLedger } from '../tasks/ledger'
 import { AgentPromptAssembler } from '../prompt/assembler'
 import { AgentCompletionGuard } from '../execution/completion-guard'
 import { AgentExecutionBudget } from '../execution/budget'
+import { AgentExecutionGateway } from '../execution/gateway'
 import { AgentEvolutionPipeline } from '../evolution'
 import { AgentContextEngine } from '../context/engine'
 import { AgentMessageLifecycle } from '../delivery/lifecycle'
@@ -62,9 +63,12 @@ interface ExecutionState {
   executionBudget: AgentExecutionBudget
   discoveryQuery: string
   startedAt: number
+  modelCalls: number
+  deadlineTimer: NodeJS.Timeout
   currentOperation: string
   superseded: boolean
   loadedSkillTools: Set<string>
+  currentCallableTools: string[]
   finishPromise?: Promise<AgentTurnResult>
   removeParentAbortListener?: () => void
 }
@@ -154,6 +158,7 @@ export class AgentRuntime {
   private readonly taskLedger: AgentTaskLedger
   private readonly promptAssembler: AgentPromptAssembler
   private readonly completionGuard: AgentCompletionGuard
+  private readonly executionGateway: AgentExecutionGateway
   private readonly contextEngine: AgentContextEngine
   private readonly messageLifecycle: AgentMessageLifecycle
   private readonly runJournal: AgentRunJournal
@@ -172,6 +177,7 @@ export class AgentRuntime {
     this.taskLedger = new AgentTaskLedger(database, getConfig)
     this.promptAssembler = new AgentPromptAssembler(this.taskLedger)
     this.completionGuard = new AgentCompletionGuard()
+    this.executionGateway = new AgentExecutionGateway(registry, getConfig)
     this.contextEngine = new AgentContextEngine(database, getConfig)
     this.messageLifecycle = new AgentMessageLifecycle(database)
     this.runJournal = new AgentRunJournal(database, getConfig)
@@ -414,6 +420,7 @@ export class AgentRuntime {
     result: AgentTurnResult,
     actorId = 'system'
   ) {
+    if (thread.channel === 'web') return true
     try {
       if (!result.finalMessageId) {
         const delivered = await deliverAgentResult(thread, result)
@@ -592,6 +599,47 @@ export class AgentRuntime {
     return this.setThreadModel(thread.id, actor, providerId, model)
   }
 
+  async describeThreadPersona (threadId: string) {
+    const thread = await this.database.getThread(threadId)
+    if (!thread) throw new Error('会话不存在')
+    const customization = await this.database.ensureThreadCustomization(threadId)
+    const personas = await this.database.listPersonas(false)
+    const selected = personas.find(item => item.id === customization.persona.personaId) || null
+    return {
+      thread: await this.database.getThread(threadId),
+      persona: selected,
+      personaVersion: customization.persona,
+      instruction: customization.instruction,
+      personas,
+    }
+  }
+
+  async setThreadPersona (threadId: string, actor: AgentActor, personaId: string | null) {
+    const thread = await this.database.getThread(threadId)
+    if (!thread) throw new Error('会话不存在')
+    if (actor.id !== thread.actorId && !['master', 'admin'].includes(actor.role)) {
+      throw new Error('只有会话发起者或管理员可以切换人物预设')
+    }
+    const persona = personaId
+      ? await this.database.getPersona(personaId)
+      : await this.database.getDefaultPersona()
+    if (!persona?.enabled) throw new Error('人物预设不存在或已停用')
+    await this.database.setThreadPersonaVersion(threadId, persona.activeVersionId)
+    await this.database.audit(
+      actor.id,
+      personaId ? 'thread.persona.set' : 'thread.persona.reset',
+      threadId,
+      { personaId: persona.id, versionId: persona.activeVersionId },
+      threadId
+    )
+    return this.describeThreadPersona(threadId)
+  }
+
+  async setSessionPersona (actor: AgentActor, personaId: string | null) {
+    const thread = await this.currentSession(actor)
+    return this.setThreadPersona(thread.id, actor, personaId)
+  }
+
   async listPendingSessionApprovals (actor: AgentActor) {
     const root = await this.database.getOrCreateSession(actor)
     const ids = await this.database.getThreadTreeIds(root.id)
@@ -628,6 +676,13 @@ export class AgentRuntime {
       input.actor,
       input.parentThreadId
     )
+    if (input.instructionVersionId) {
+      await this.database.setThreadInstructionVersion(thread.id, input.instructionVersionId)
+    }
+    if (input.personaVersionId) {
+      await this.database.setThreadPersonaVersion(thread.id, input.personaVersionId)
+    }
+    const customization = await this.database.ensureThreadCustomization(thread.id)
     if (this.stoppingThreads.has(thread.id)) throw new Error('Thread 正在停止')
     if (thread.archivedAt) throw new Error('已归档的 Thread 不能继续对话，请先恢复')
     if (input.idempotencyKey) {
@@ -697,6 +752,12 @@ export class AgentRuntime {
       input.actor,
       input.content
     )
+    const hookContext = await agentHookContext('beforeContext', {
+      threadId: thread.id,
+      turnId,
+      actor: input.actor,
+      query: input.content,
+    })
     const tasks = await this.taskLedger.read(thread.id)
     const system = this.promptAssembler.build({
       memories: learned.memories,
@@ -704,6 +765,9 @@ export class AgentRuntime {
       tasks,
       summary,
       origin: input.actor.origin,
+      instruction: customization.instruction,
+      persona: customization.persona,
+      hookContext,
     })
     const messages: AgentModelMessage[] = [
       { role: 'system', content: system },
@@ -756,6 +820,13 @@ export class AgentRuntime {
           input.signal?.removeEventListener('abort', abortFromParent)
       }
     }
+    const maxTurnDurationMs = Math.max(
+      10_000,
+      Number(this.getConfig().execution?.maxTurnDurationMs) || 300_000
+    )
+    const deadlineTimer = setTimeout(() => {
+      controller.abort(new Error('Agent Turn 已达到总执行时限'))
+    }, maxTurnDurationMs)
     const state: ExecutionState = {
       input,
       thread,
@@ -779,9 +850,12 @@ export class AgentRuntime {
       executionBudget: new AgentExecutionBudget(this.getConfig().limits.maxToolRounds),
       discoveryQuery: input.content,
       startedAt: Date.now(),
+      modelCalls: 0,
+      deadlineTimer,
       currentOperation: '模型思考',
       superseded: false,
       loadedSkillTools: new Set(),
+      currentCallableTools: [],
       removeParentAbortListener,
     }
     this.activeTurns.set(turnId, state)
@@ -798,7 +872,6 @@ export class AgentRuntime {
         '被更新的用户补充抢占'
       )
     }
-    await agentHookEmit('beforeContext', { thread, turnId, messages })
     await this.emit(state, 'turn.started', { actor: input.actor })
     if (input.resume) {
       await this.emit(state, 'turn.resumed', {
@@ -818,7 +891,6 @@ export class AgentRuntime {
     const planResult = await this.recovery.createPlan(
       {
         ...input,
-        automated: true,
         content: input.resume
           ? [input.resume.rootContent, ...input.resume.supplements].join('\n')
           : input.content,
@@ -912,6 +984,20 @@ export class AgentRuntime {
     try {
       while (true) {
         if (!state.pendingCalls.length) {
+          const maxModelCalls = Math.max(1, Number(config.execution?.maxModelCalls) || 40)
+          const maxTurnDurationMs = Math.max(
+            10_000,
+            Number(config.execution?.maxTurnDurationMs) || 300_000
+          )
+          if (
+            Date.now() - state.startedAt >= maxTurnDurationMs ||
+            state.modelCalls >= maxModelCalls
+          ) {
+            const content = state.modelCalls >= maxModelCalls
+              ? `执行已达到最大 ${maxModelCalls} 次模型调用，已安全停止。`
+              : `执行已达到 ${maxTurnDurationMs}ms 总时限，已安全停止。`
+            return this.finish(state, 'failed', content, content)
+          }
           const budget = state.executionBudget.beginIteration({
             tasks: state.tasks,
             toolResults: state.toolResults,
@@ -944,19 +1030,19 @@ export class AgentRuntime {
               ['delivery', 'media', 'tool'].includes(postcondition.kind)
             )
           )
+          state.modelCalls++
+          const callableTools = budget.remaining > 0 ? this.availableTools(state) : []
+          state.currentCallableTools = callableTools.map(tool => tool.name)
           const response = await this.provider.complete(
             {
               providerId: state.thread.modelProviderId || undefined,
               model: state.thread.modelName || '',
               messages: state.messages,
-              tools:
-              budget.remaining > 0
-                ? this.availableTools(state).map(tool => ({
-                  name: tool.name,
-                  description: tool.description,
-                  inputSchema: tool.inputSchema,
-                }))
-                : [],
+              tools: callableTools.map(tool => ({
+                name: tool.name,
+                description: tool.description,
+                inputSchema: tool.inputSchema,
+              })),
               toolChoice: state.needsTaskPlan && !state.tasks ? 'required' : undefined,
               signal: state.controller.signal,
             },
@@ -1487,6 +1573,7 @@ export class AgentRuntime {
       parentThreadId: state.input.parentThreadId,
       depth: state.input.depth || 0,
       allowedTools: state.input.allowedTools,
+      callableTools: state.currentCallableTools,
     }
   }
 
@@ -1497,7 +1584,7 @@ export class AgentRuntime {
       turnId: state.turnId,
       call,
     })
-    const result = await this.registry.executeWithReceipt(
+    const result = await this.executionGateway.executeWithReceipt(
       call.name,
       call.arguments,
       this.toolContext(state),
@@ -1611,7 +1698,7 @@ export class AgentRuntime {
       }))
     const expectedRestriction = failedTools.length > 0 && failedTools.every(item =>
       ['TOOL_UNSAFE_URL', 'TOOL_DENIED', 'TOOL_NOT_FOUND'].includes(item.code || '') ||
-      /Playwright Chromium 启动失败|module is not allowed|浏览器环境暂不可用/i.test(
+      /Playwright Chromium 启动失败|交互式浏览器不可用|module is not allowed|浏览器环境暂不可用/i.test(
         item.error || ''
       )
     )
@@ -2199,6 +2286,7 @@ export class AgentRuntime {
       publishFinal: Boolean(content && !(status === 'interrupted' && state.superseded)),
     })
     this.activeTurns.delete(state.turnId)
+    clearTimeout(state.deadlineTimer)
     state.removeParentAbortListener?.()
     const terminalEvent = {
       ...finalized.event,
@@ -2213,6 +2301,13 @@ export class AgentRuntime {
       content,
       error,
     })
+    if (status === 'failed') {
+      await agentHookEmit('turnFailed', {
+        threadId: state.thread.id,
+        turnId: state.turnId,
+        error,
+      })
+    }
 
     if (!state.input.parentThreadId) {
       this.evolution.reviewer

@@ -6,12 +6,15 @@ import type {
   AgentModelRequest,
   AgentModelResponse,
   AgentToolCall,
+  AgentProviderProtocol,
+  AgentProviderCapabilities,
 } from '@/types/agent'
 
 export interface OpenAICompatibleOptions {
   baseUrl: string
   apiKey: string
   timeout: number
+  protocol?: AgentProviderProtocol
 }
 
 export class AgentProviderError extends Error {
@@ -96,6 +99,38 @@ const toMessage = (message: AgentModelMessage, encodeToolName: (name: string) =>
   }
 }
 
+const toResponsesInput = (
+  messages: AgentModelMessage[],
+  encodeToolName: (name: string) => string
+) => messages.flatMap(message => {
+  if (message.role === 'tool') {
+    return [{
+      type: 'function_call_output',
+      call_id: message.toolCallId,
+      output: typeof message.content === 'string'
+        ? message.content
+        : JSON.stringify(message.content),
+    }]
+  }
+  const output: Array<Record<string, unknown>> = [{
+    role: message.role,
+    content: typeof message.content === 'string'
+      ? message.content
+      : message.content.map(part => part.type === 'text'
+        ? { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: part.text }
+        : { type: 'input_image', image_url: part.imageUrl }),
+  }]
+  for (const call of message.toolCalls || []) {
+    output.push({
+      type: 'function_call',
+      call_id: call.id,
+      name: encodeToolName(call.name),
+      arguments: JSON.stringify(call.arguments),
+    })
+  }
+  return output
+})
+
 const parseArguments = (value: string): Record<string, unknown> => {
   if (!value.trim()) return {}
   try {
@@ -143,17 +178,31 @@ const normalizeResponse = (
 
 export class OpenAICompatibleProvider implements AgentModelProvider {
   readonly name = 'openai-compatible'
+  readonly capabilities: AgentProviderCapabilities
   private readonly endpoint: string
 
   constructor (private readonly options: OpenAICompatibleOptions) {
     const baseUrl = options.baseUrl.replace(/\/+$/, '')
-    this.endpoint = `${baseUrl}/chat/completions`
+    const protocol: AgentProviderProtocol = options.protocol === 'responses'
+      ? 'responses'
+      : 'chat-completions'
+    this.endpoint = `${baseUrl}/${protocol === 'responses' ? 'responses' : 'chat/completions'}`
+    this.capabilities = {
+      protocol,
+      stream: true,
+      tools: true,
+      structuredOutput: true,
+      vision: true,
+    }
   }
 
   async complete (
     request: AgentModelRequest,
     onDelta?: (delta: string) => void | Promise<void>
   ): Promise<AgentModelResponse> {
+    if (this.capabilities.protocol === 'responses') {
+      return this.completeResponses(request, onDelta)
+    }
     const toolNames = createToolNameCodec(request)
     const timeoutSignal = AbortSignal.timeout(this.options.timeout)
     const signal = request.signal ? AbortSignal.any([request.signal, timeoutSignal]) : timeoutSignal
@@ -178,7 +227,9 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
             },
           }))
           : undefined,
-        tool_choice: request.tools.length ? request.toolChoice || 'auto' : undefined,
+        tool_choice: request.tools.length
+          ? request.toolChoice || 'auto'
+          : undefined,
         response_format: request.responseSchema
           ? {
             type: 'json_schema',
@@ -211,6 +262,148 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
 
     if (!response.body) throw new Error('[agent][model] SSE 响应缺少 body')
     return this.readStream(response.body, toolNames.decode, onDelta)
+  }
+
+  private async completeResponses (
+    request: AgentModelRequest,
+    onDelta?: (delta: string) => void | Promise<void>
+  ): Promise<AgentModelResponse> {
+    const toolNames = createToolNameCodec(request)
+    const timeoutSignal = AbortSignal.timeout(this.options.timeout)
+    const signal = request.signal ? AbortSignal.any([request.signal, timeoutSignal]) : timeoutSignal
+    const response = await fetch(this.endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.options.apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream, application/json',
+      },
+      body: JSON.stringify({
+        model: request.model,
+        input: toResponsesInput(request.messages, toolNames.encode),
+        tools: request.tools.map(tool => ({
+          type: 'function',
+          name: toolNames.encode(tool.name),
+          description: tool.description,
+          parameters: tool.inputSchema,
+          strict: true,
+        })),
+        tool_choice: request.tools.length
+          ? request.toolChoice || 'auto'
+          : undefined,
+        text: request.responseSchema
+          ? {
+            format: {
+              type: 'json_schema',
+              name: request.responseSchema.name,
+              schema: request.responseSchema.schema,
+              strict: request.responseSchema.strict !== false,
+            },
+          }
+          : undefined,
+        stream: Boolean(onDelta),
+      }),
+      signal,
+    })
+    if (!response.ok) {
+      const detail = redact((await response.text()).slice(0, 2048), [this.options.apiKey])
+      throw new AgentProviderError(
+        `[agent][model] Responses 请求失败 ${response.status}: ${detail || response.statusText}`,
+        response.status,
+        response.status === 408 || response.status === 429 || response.status >= 500
+      )
+    }
+    if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+      return this.normalizeResponses(await response.json(), toolNames.decode)
+    }
+    if (!response.body) throw new Error('[agent][model] Responses SSE 缺少 body')
+    return this.readResponsesStream(response.body, toolNames.decode, onDelta)
+  }
+
+  private normalizeResponses (data: any, decodeToolName: (name: string) => string) {
+    const output = Array.isArray(data?.output) ? data.output : []
+    const content = output.flatMap((item: any) => item.type === 'message'
+      ? (item.content || []).filter((part: any) => part.type === 'output_text')
+        .map((part: any) => String(part.text || ''))
+      : []).join('') || String(data?.output_text || '')
+    const toolCalls = output.filter((item: any) => item.type === 'function_call').map(
+      (item: any, index: number) => ({
+        id: String(item.call_id || item.id || `tool-call-${index}`),
+        name: decodeToolName(String(item.name || '')),
+        arguments: parseArguments(String(item.arguments || '{}')),
+      })
+    )
+    return {
+      content,
+      toolCalls,
+      usage: {
+        inputTokens: Number(data?.usage?.input_tokens) || undefined,
+        outputTokens: Number(data?.usage?.output_tokens) || undefined,
+      },
+    }
+  }
+
+  private async readResponsesStream (
+    stream: ReadableStream<Uint8Array>,
+    decodeToolName: (name: string) => string,
+    onDelta?: (delta: string) => void | Promise<void>
+  ): Promise<AgentModelResponse> {
+    const reader = stream.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let content = ''
+    let completed: any
+    const calls = new Map<number, { id: string; name: string; arguments: string }>()
+    const consume = async (block: string) => {
+      for (const line of block.split(/\r?\n/)) {
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (!payload || payload === '[DONE]') continue
+        const event = JSON.parse(payload)
+        if (event.type === 'response.output_text.delta') {
+          const delta = String(event.delta || '')
+          content += delta
+          await onDelta?.(delta)
+        } else if (event.type === 'response.output_item.added' &&
+          event.item?.type === 'function_call') {
+          calls.set(Number(event.output_index || 0), {
+            id: String(event.item.call_id || event.item.id || ''),
+            name: String(event.item.name || ''),
+            arguments: String(event.item.arguments || ''),
+          })
+        } else if (event.type === 'response.function_call_arguments.delta') {
+          const index = Number(event.output_index || 0)
+          const call = calls.get(index) || { id: '', name: '', arguments: '' }
+          call.arguments += String(event.delta || '')
+          calls.set(index, call)
+        } else if (event.type === 'response.completed') {
+          completed = event.response
+        }
+      }
+    }
+    while (true) {
+      const { done, value } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done })
+      const blocks = buffer.split(/\r?\n\r?\n/)
+      buffer = blocks.pop() || ''
+      for (const block of blocks) await consume(block)
+      if (done) break
+    }
+    if (buffer.trim()) await consume(buffer)
+    const normalized = completed
+      ? this.normalizeResponses(completed, decodeToolName)
+      : { content: '', toolCalls: [], usage: {} }
+    return {
+      ...normalized,
+      content: content || normalized.content,
+      toolCalls: calls.size
+        ? [...calls.entries()].sort(([left], [right]) => left - right).map(([index, call]) => ({
+          id: call.id || `tool-call-${index}`,
+          name: decodeToolName(call.name),
+          arguments: parseArguments(call.arguments || '{}'),
+        }))
+        : normalized.toolCalls,
+    }
   }
 
   private async readStream (
@@ -295,7 +488,7 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
 
   async listModels (signal?: AbortSignal) {
     const timeoutSignal = AbortSignal.timeout(this.options.timeout)
-    const response = await fetch(this.endpoint.replace(/\/chat\/completions$/, '/models'), {
+    const response = await fetch(this.endpoint.replace(/\/(?:chat\/completions|responses)$/, '/models'), {
       headers: {
         Authorization: `Bearer ${this.options.apiKey}`,
         Accept: 'application/json',

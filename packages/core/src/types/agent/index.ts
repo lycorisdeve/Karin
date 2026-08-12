@@ -99,6 +99,7 @@ export interface AgentModelResponse {
 
 export interface AgentModelProvider {
   readonly name: string
+  readonly capabilities?: AgentProviderCapabilities
   complete(
     request: AgentModelRequest,
     onDelta?: (delta: string) => void | Promise<void>,
@@ -135,6 +136,8 @@ export interface AgentToolContext {
   parentThreadId?: string
   depth?: number
   allowedTools?: string[]
+  /** 当前模型调用实际暴露的 Tool 名称。 */
+  callableTools?: string[]
 }
 
 export interface AgentToolOptions<
@@ -170,7 +173,20 @@ export interface AgentToolOptions<
   sensitivity?: 'public' | 'private' | 'credential'
   /** Core 重启后是否允许在幂等前提下自动重放。 */
   restartSafe?: boolean
+  /** 仅由 Core 注册器或 karin.processTool 设置；普通插件声明不会提升隔离等级。 */
+  isolation?: AgentToolIsolation
   execute: (input: TInput, context: AgentToolContext) => TOutput | Promise<TOutput>
+}
+
+export interface AgentProcessToolOptions<
+  TInput extends Record<string, unknown> = Record<string, unknown>
+> extends Omit<AgentToolOptions<TInput, unknown>, 'execute' | 'isolation'> {
+  process: {
+    command: string
+    args?: string[]
+    cwd?: string
+    envAllowlist?: string[]
+  }
 }
 
 export interface AgentTaskItem {
@@ -211,13 +227,26 @@ export interface AgentCapabilityDescriptor {
   version?: string
   risk?: AgentToolRisk
   reversible?: boolean
+  /** 能力是否存在于全局注册表。 */
+  registered: boolean
   available: boolean
+  /** Tool 是否实际暴露给当前模型调用；Skill 不设置此字段。 */
+  callable?: boolean
   requirements: string[]
   owner?: string
   sensitivity?: 'public' | 'private' | 'credential'
   restartSafe?: boolean
   unavailableReason?: string
+  isolation?: AgentToolIsolation
 }
+
+export type AgentToolIsolation =
+  | 'core-inline'
+  | 'legacy-inline'
+  | 'process-isolated'
+  | 'generated-sandbox'
+  | 'mcp-remote'
+  | 'mcp-stdio'
 
 export interface AgentPolicyRule {
   pattern: string
@@ -225,11 +254,21 @@ export interface AgentPolicyRule {
 }
 
 export type AgentProviderKind = 'openai' | 'deepseek' | 'kimi' | 'mimo' | 'custom'
+export type AgentProviderProtocol = 'chat-completions' | 'responses'
+
+export interface AgentProviderCapabilities {
+  protocol: AgentProviderProtocol
+  stream: boolean
+  tools: boolean
+  structuredOutput: boolean
+  vision: boolean
+}
 
 export interface AgentProviderProfile {
   id: string
   name: string
   kind: AgentProviderKind
+  protocol: AgentProviderProtocol
   enabled: boolean
   baseUrl: string
   apiKey: string
@@ -528,8 +567,50 @@ export interface AgentGeneratedToolVersion {
   createdAt: number
 }
 
+export interface AgentInstructionVersion {
+  id: string
+  version: number
+  content: string
+  contentHash: string
+  source: 'default' | 'web' | 'file'
+  createdBy: string
+  createdAt: number
+}
+
+export interface AgentPersonaDefinition {
+  identity: string
+  expertise: string[]
+  tone: string
+  responseStyle: string
+  language: string
+}
+
+export interface AgentPersonaRecord {
+  id: string
+  name: string
+  description: string
+  enabled: boolean
+  isDefault: boolean
+  activeVersionId: string
+  definition: AgentPersonaDefinition
+  version: number
+  threadReferences: number
+  jobReferences: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AgentPersonaVersion {
+  id: string
+  personaId: string
+  version: number
+  definition: AgentPersonaDefinition
+  createdBy: string
+  createdAt: number
+}
+
 export interface AgentConfig {
-  version: 9
+  version: 10
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: {
@@ -571,6 +652,22 @@ export interface AgentConfig {
     autoApproveTrustedReversible: boolean
   }
   learning: AgentLearningConfig
+  memory: {
+    retrieval: {
+      maxCandidates: number
+      maxItems: number
+      maxPromptTokens: number
+      minScore: number
+      recencyHalfLifeDays: number
+    }
+  }
+  execution: {
+    isolationMode: 'compat' | 'strict'
+    minimumIsolation: 'none' | 'process' | 'os'
+    hookTimeoutMs: number
+    maxModelCalls: number
+    maxTurnDurationMs: number
+  }
   recovery: AgentRecoveryConfig
   tools: {
     disabled: string[]
@@ -595,6 +692,8 @@ export interface AgentTurnInput {
   content: string
   event?: Message
   parentThreadId?: string
+  instructionVersionId?: string
+  personaVersionId?: string
   depth?: number
   automated?: boolean
   allowedTools?: string[]
@@ -631,6 +730,7 @@ export interface AgentActivityView {
     | 'interrupted'
   label: string
   source?: string
+  isolation?: AgentToolIsolation
   risk?: AgentToolRisk
   decision?: AgentPolicyDecision
   parentId?: string

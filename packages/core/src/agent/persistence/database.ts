@@ -25,6 +25,10 @@ import type {
   AgentDeliveryState,
   AgentStreamEvent,
   AgentToolArtifact,
+  AgentInstructionVersion,
+  AgentPersonaDefinition,
+  AgentPersonaRecord,
+  AgentPersonaVersion,
 } from '@/types/agent'
 
 export interface AgentContextSummaryRecord {
@@ -70,6 +74,8 @@ export interface AgentThreadRecord {
   lastMessagePreview: string
   modelProviderId: string | null
   modelName: string | null
+  instructionVersionId: string | null
+  personaVersionId: string | null
   channel: string
   protocol: string
   accountId: string
@@ -104,7 +110,20 @@ export interface AgentMemoryRecord {
   content: string
   sourceTurnId: string
   enabled: boolean
+  kind: 'preference' | 'fact' | 'relationship' | 'procedure' | 'constraint'
+  memoryKey: string | null
+  confidence: number
+  importance: number
+  pinned: boolean
+  status: 'active' | 'superseded' | 'archived'
+  contentHash: string
+  sourceType: 'legacy' | 'reflection' | 'correction' | 'explicit' | 'web'
+  expiresAt: number | null
+  lastUsedAt: number | null
+  useCount: number
+  supersededBy: string | null
   createdAt: number
+  updatedAt: number
 }
 
 export interface AgentSkillRecord {
@@ -128,6 +147,7 @@ export interface AgentJobRecord {
   target: string
   toolAllowlist: string[]
   skillIds: string[]
+  personaId: string | null
   enabled: boolean
   createdBy: string
   lastRunAt: number | null
@@ -727,6 +747,79 @@ const migrations = [
       ON skill_activity(skill_id, created_at);
     `,
   },
+  {
+    version: 14,
+    sql: `
+      ALTER TABLE threads ADD COLUMN instruction_version_id TEXT;
+      ALTER TABLE threads ADD COLUMN persona_version_id TEXT;
+      ALTER TABLE agent_jobs ADD COLUMN persona_id TEXT;
+
+      ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact';
+      ALTER TABLE memories ADD COLUMN memory_key TEXT;
+      ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 0.7;
+      ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;
+      ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+      ALTER TABLE memories ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+      ALTER TABLE memories ADD COLUMN source_type TEXT NOT NULL DEFAULT 'legacy';
+      ALTER TABLE memories ADD COLUMN expires_at INTEGER;
+      ALTER TABLE memories ADD COLUMN last_used_at INTEGER;
+      ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE memories ADD COLUMN superseded_by TEXT;
+      ALTER TABLE memories ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+
+      CREATE TABLE IF NOT EXISTS agent_instruction_versions (
+        id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_personas (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        active_version_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_persona_versions (
+        id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        definition_json TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(persona_id, version),
+        FOREIGN KEY(persona_id) REFERENCES agent_personas(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_sources (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        source_turn_id TEXT NOT NULL,
+        evidence TEXT NOT NULL DEFAULT '',
+        source_type TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_memories_retrieval
+      ON memories(scope, scope_key, status, pinned, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_memories_key
+      ON memories(scope, scope_key, memory_key, status);
+      CREATE INDEX IF NOT EXISTS idx_memory_sources_memory
+      ON memory_sources(memory_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_personas_default
+      ON agent_personas(is_default, enabled);
+    `,
+  },
 ]
 
 const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
@@ -896,10 +989,81 @@ export class AgentDatabase {
       }
     }
 
+    const bootstrapTime = Date.now()
+    await this.run(
+      `INSERT OR IGNORE INTO agent_instruction_versions(
+        id, version, content, content_hash, source, created_by, created_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      [
+        'instruction-default-v1',
+        1,
+        '',
+        createHash('sha256').update('').digest('hex'),
+        'default',
+        'karin',
+        bootstrapTime,
+      ]
+    )
+    const defaultPersona = {
+      identity: 'Karin Agent，一个以解决问题为目标的行动型 Agent。',
+      expertise: ['通用问题解决', '机器人自动化'],
+      tone: '清晰、直接、诚实',
+      responseStyle: '先给结论，再提供必要的过程与证据。',
+      language: '跟随用户使用的语言',
+    }
+    await this.run(
+      `INSERT OR IGNORE INTO agent_personas(
+        id, name, description, enabled, is_default, active_version_id, created_at, updated_at
+       ) VALUES(?, ?, ?, 1, 1, ?, ?, ?)`,
+      [
+        'karin-default',
+        'Karin',
+        '默认的行动型通用助手',
+        'persona-karin-default-v1',
+        bootstrapTime,
+        bootstrapTime,
+      ]
+    )
+    await this.run(
+      `INSERT OR IGNORE INTO agent_persona_versions(
+        id, persona_id, version, definition_json, created_by, created_at
+       ) VALUES(?, ?, 1, ?, ?, ?)`,
+      [
+        'persona-karin-default-v1',
+        'karin-default',
+        JSON.stringify(defaultPersona),
+        'karin',
+        bootstrapTime,
+      ]
+    )
+
+    const legacyMemories = await this.all<{ id: string; content: string; created_at: number }>(
+      `SELECT id, content, created_at FROM memories
+       WHERE content_hash = '' OR updated_at = 0`
+    )
+    for (const memory of legacyMemories) {
+      await this.run(
+        'UPDATE memories SET content_hash = ?, updated_at = ? WHERE id = ?',
+        [
+          createHash('sha256').update(memory.content.trim()).digest('hex'),
+          Number(memory.created_at) || bootstrapTime,
+          memory.id,
+        ]
+      )
+    }
+
     try {
       await this.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
-        USING fts5(message_id UNINDEXED, thread_id UNINDEXED, content)
+        USING fts5(message_id UNINDEXED, thread_id UNINDEXED, content);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+        USING fts5(memory_id UNINDEXED, scope UNINDEXED, scope_key UNINDEXED, content)
+      `)
+      await this.run('DELETE FROM memory_fts')
+      await this.exec(`
+        INSERT INTO memory_fts(memory_id, scope, scope_key, content)
+        SELECT id, scope, scope_key, content FROM memories
+        WHERE enabled = 1 AND status = 'active'
       `)
       this.ftsAvailable = true
     } catch (error) {
@@ -1071,6 +1235,10 @@ export class AgentDatabase {
       lastMessagePreview: String(row.last_message_preview || ''),
       modelProviderId: row.model_provider_id ? String(row.model_provider_id) : null,
       modelName: row.model_name ? String(row.model_name) : null,
+      instructionVersionId: row.instruction_version_id
+        ? String(row.instruction_version_id)
+        : null,
+      personaVersionId: row.persona_version_id ? String(row.persona_version_id) : null,
       channel: String(row.channel_kind || ''),
       protocol: String(row.protocol || ''),
       accountId: String(row.account_id || ''),
@@ -1144,12 +1312,24 @@ export class AgentDatabase {
     const now = Date.now()
     const parent = parentThreadId
       ? await this.get<Record<string, unknown>>(
-        `SELECT model_provider_id, model_name, channel_kind, protocol,
+        `SELECT model_provider_id, model_name, instruction_version_id, persona_version_id,
+          channel_kind, protocol,
           account_id, account_name, contact_key, contact_id, contact_sub_id, contact_name
          FROM threads WHERE id = ?`,
         [parentThreadId]
       )
       : null
+    const instructionVersionId = parent?.instruction_version_id
+      ? String(parent.instruction_version_id)
+      : (await this.get<{ id: string }>(
+        'SELECT id FROM agent_instruction_versions ORDER BY version DESC LIMIT 1'
+      ))?.id || 'instruction-default-v1'
+    const personaVersionId = parent?.persona_version_id
+      ? String(parent.persona_version_id)
+      : (await this.get<{ active_version_id: string }>(
+          `SELECT active_version_id FROM agent_personas
+           WHERE is_default = 1 AND enabled = 1 LIMIT 1`
+      ))?.active_version_id || 'persona-karin-default-v1'
     const inferred = inferAgentOrigin(threadKey, actor.scene, actor.id)
     const origin = actor.origin || (parent
       ? {
@@ -1167,10 +1347,11 @@ export class AgentDatabase {
       await this.run(
         `INSERT INTO threads(
           id, thread_key, parent_thread_id, actor_id, scene, state,
-          model_provider_id, model_name, channel_kind, protocol,
+          model_provider_id, model_name, instruction_version_id, persona_version_id,
+          channel_kind, protocol,
           account_id, account_name, contact_key, contact_id, contact_sub_id, contact_name,
           created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           threadKey,
@@ -1180,6 +1361,8 @@ export class AgentDatabase {
           'idle',
           parent?.model_provider_id || null,
           parent?.model_name || null,
+          instructionVersionId,
+          personaVersionId,
           origin.channel,
           origin.protocol,
           origin.accountId,
@@ -1229,6 +1412,8 @@ export class AgentDatabase {
       lastMessagePreview: '',
       modelProviderId: parent?.model_provider_id ? String(parent.model_provider_id) : null,
       modelName: parent?.model_name ? String(parent.model_name) : null,
+      instructionVersionId,
+      personaVersionId,
       channel: origin.channel,
       protocol: origin.protocol,
       accountId: origin.accountId,
@@ -2279,18 +2464,355 @@ export class AgentDatabase {
     return result.changes > 0
   }
 
+  async getActiveInstruction (): Promise<AgentInstructionVersion> {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_instruction_versions ORDER BY version DESC LIMIT 1'
+    )
+    if (!row) throw new Error('AGENT.md 默认版本不存在')
+    return this.mapInstruction(row)
+  }
+
+  async getInstructionVersion (id: string) {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_instruction_versions WHERE id = ?',
+      [id]
+    )
+    return row ? this.mapInstruction(row) : null
+  }
+
+  async listInstructionVersions (limit = 100) {
+    const rows = await this.all<Record<string, unknown>>(
+      'SELECT * FROM agent_instruction_versions ORDER BY version DESC LIMIT ?',
+      [Math.max(1, Math.min(limit, 500))]
+    )
+    return rows.map(row => this.mapInstruction(row))
+  }
+
+  async addInstructionVersion (
+    content: string,
+    contentHash: string,
+    source: AgentInstructionVersion['source'],
+    createdBy: string
+  ) {
+    const latest = await this.get<{ version: number }>(
+      'SELECT version FROM agent_instruction_versions ORDER BY version DESC LIMIT 1'
+    )
+    const value: AgentInstructionVersion = {
+      id: randomUUID(),
+      version: Number(latest?.version || 0) + 1,
+      content,
+      contentHash,
+      source,
+      createdBy,
+      createdAt: Date.now(),
+    }
+    await this.run(
+      `INSERT INTO agent_instruction_versions(
+        id, version, content, content_hash, source, created_by, created_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+      [
+        value.id,
+        value.version,
+        value.content,
+        value.contentHash,
+        value.source,
+        value.createdBy,
+        value.createdAt,
+      ]
+    )
+    return value
+  }
+
+  private mapInstruction (row: Record<string, unknown>): AgentInstructionVersion {
+    return {
+      id: String(row.id),
+      version: Number(row.version),
+      content: String(row.content || ''),
+      contentHash: String(row.content_hash),
+      source: row.source as AgentInstructionVersion['source'],
+      createdBy: String(row.created_by),
+      createdAt: Number(row.created_at),
+    }
+  }
+
+  private mapPersona (row: Record<string, unknown>): AgentPersonaRecord {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description || ''),
+      enabled: Boolean(row.enabled),
+      isDefault: Boolean(row.is_default),
+      activeVersionId: String(row.active_version_id),
+      definition: parseJson<AgentPersonaDefinition>(String(row.definition_json || '{}'), {
+        identity: '', expertise: [], tone: '', responseStyle: '', language: '',
+      }),
+      version: Number(row.version || 1),
+      threadReferences: Number(row.thread_references || 0),
+      jobReferences: Number(row.job_references || 0),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
+  async listPersonas (includeDisabled = true) {
+    const rows = await this.all<Record<string, unknown>>(
+      `SELECT p.*, v.version, v.definition_json,
+        (SELECT COUNT(*) FROM threads t
+         JOIN agent_persona_versions pv ON pv.id = t.persona_version_id
+         WHERE pv.persona_id = p.id) AS thread_references,
+        (SELECT COUNT(*) FROM agent_jobs j WHERE j.persona_id = p.id) AS job_references
+       FROM agent_personas p
+       JOIN agent_persona_versions v ON v.id = p.active_version_id
+       ${includeDisabled ? '' : 'WHERE p.enabled = 1'}
+       ORDER BY p.is_default DESC, p.name ASC`
+    )
+    return rows.map(row => this.mapPersona(row))
+  }
+
+  async getPersona (id: string) {
+    const row = await this.get<Record<string, unknown>>(
+      `SELECT p.*, v.version, v.definition_json,
+        (SELECT COUNT(*) FROM threads t
+         JOIN agent_persona_versions pv ON pv.id = t.persona_version_id
+         WHERE pv.persona_id = p.id) AS thread_references,
+        (SELECT COUNT(*) FROM agent_jobs j WHERE j.persona_id = p.id) AS job_references
+       FROM agent_personas p
+       JOIN agent_persona_versions v ON v.id = p.active_version_id
+       WHERE p.id = ?`,
+      [id]
+    )
+    return row ? this.mapPersona(row) : null
+  }
+
+  async getPersonaVersion (id: string): Promise<AgentPersonaVersion | null> {
+    const row = await this.get<Record<string, unknown>>(
+      'SELECT * FROM agent_persona_versions WHERE id = ?',
+      [id]
+    )
+    return row
+      ? {
+        id: String(row.id),
+        personaId: String(row.persona_id),
+        version: Number(row.version),
+        definition: parseJson<AgentPersonaDefinition>(String(row.definition_json || '{}'), {
+          identity: '', expertise: [], tone: '', responseStyle: '', language: '',
+        }),
+        createdBy: String(row.created_by),
+        createdAt: Number(row.created_at),
+      }
+      : null
+  }
+
+  async getDefaultPersona () {
+    const row = await this.get<Record<string, unknown>>(
+      `SELECT p.*, v.version, v.definition_json
+       FROM agent_personas p
+       JOIN agent_persona_versions v ON v.id = p.active_version_id
+       WHERE p.is_default = 1 AND p.enabled = 1 LIMIT 1`
+    )
+    if (!row) throw new Error('默认人物预设不存在')
+    return this.mapPersona(row)
+  }
+
+  async createPersona (input: {
+    name: string
+    description: string
+    definition: AgentPersonaDefinition
+    createdBy: string
+  }) {
+    return this.transaction(async () => {
+      const id = randomUUID()
+      const versionId = randomUUID()
+      const now = Date.now()
+      await this.run(
+        `INSERT INTO agent_personas(
+          id, name, description, enabled, is_default, active_version_id, created_at, updated_at
+         ) VALUES(?, ?, ?, 1, 0, ?, ?, ?)`,
+        [id, input.name, input.description, versionId, now, now]
+      )
+      await this.run(
+        `INSERT INTO agent_persona_versions(
+          id, persona_id, version, definition_json, created_by, created_at
+         ) VALUES(?, ?, 1, ?, ?, ?)`,
+        [versionId, id, JSON.stringify(input.definition), input.createdBy, now]
+      )
+      return (await this.getPersona(id))!
+    })
+  }
+
+  async updatePersona (id: string, input: {
+    name: string
+    description: string
+    definition: AgentPersonaDefinition
+    createdBy: string
+  }) {
+    return this.transaction(async () => {
+      const current = await this.getPersona(id)
+      if (!current) throw new Error('人物预设不存在')
+      const versionId = randomUUID()
+      const version = current.version + 1
+      const now = Date.now()
+      await this.run(
+        `INSERT INTO agent_persona_versions(
+          id, persona_id, version, definition_json, created_by, created_at
+         ) VALUES(?, ?, ?, ?, ?, ?)`,
+        [versionId, id, version, JSON.stringify(input.definition), input.createdBy, now]
+      )
+      await this.run(
+        `UPDATE agent_personas
+         SET name = ?, description = ?, active_version_id = ?, updated_at = ? WHERE id = ?`,
+        [input.name, input.description, versionId, now, id]
+      )
+      return (await this.getPersona(id))!
+    })
+  }
+
+  async listPersonaVersions (personaId: string): Promise<AgentPersonaVersion[]> {
+    const rows = await this.all<Record<string, unknown>>(
+      'SELECT * FROM agent_persona_versions WHERE persona_id = ? ORDER BY version DESC',
+      [personaId]
+    )
+    return rows.map(row => ({
+      id: String(row.id),
+      personaId: String(row.persona_id),
+      version: Number(row.version),
+      definition: parseJson<AgentPersonaDefinition>(String(row.definition_json || '{}'), {
+        identity: '', expertise: [], tone: '', responseStyle: '', language: '',
+      }),
+      createdBy: String(row.created_by),
+      createdAt: Number(row.created_at),
+    }))
+  }
+
+  async setDefaultPersona (id: string) {
+    const persona = await this.getPersona(id)
+    if (!persona?.enabled) throw new Error('只能把已启用的人物设为默认')
+    await this.transaction(async () => {
+      await this.run('UPDATE agent_personas SET is_default = 0 WHERE is_default = 1')
+      await this.run(
+        'UPDATE agent_personas SET is_default = 1, updated_at = ? WHERE id = ?',
+        [Date.now(), id]
+      )
+    })
+    return (await this.getPersona(id))!
+  }
+
+  async setPersonaEnabled (id: string, enabled: boolean) {
+    const persona = await this.getPersona(id)
+    if (!persona) throw new Error('人物预设不存在')
+    if (!enabled && persona.isDefault) throw new Error('默认人物预设不能停用')
+    if (!enabled) {
+      const job = await this.get<{ id: string }>(
+        'SELECT id FROM agent_jobs WHERE persona_id = ? AND enabled = 1 LIMIT 1',
+        [id]
+      )
+      if (job) throw new Error('人物预设仍被启用的定时任务引用')
+    }
+    await this.run(
+      'UPDATE agent_personas SET enabled = ?, updated_at = ? WHERE id = ?',
+      [enabled ? 1 : 0, Date.now(), id]
+    )
+    return (await this.getPersona(id))!
+  }
+
+  async setThreadInstructionVersion (threadId: string, versionId: string) {
+    if (!await this.getInstructionVersion(versionId)) throw new Error('AGENT.md 版本不存在')
+    const result = await this.run(
+      'UPDATE threads SET instruction_version_id = ?, updated_at = ? WHERE id = ?',
+      [versionId, Date.now(), threadId]
+    )
+    return result.changes > 0
+  }
+
+  async setThreadPersonaVersion (threadId: string, versionId: string) {
+    if (!await this.getPersonaVersion(versionId)) throw new Error('人物预设版本不存在')
+    const result = await this.run(
+      'UPDATE threads SET persona_version_id = ?, updated_at = ? WHERE id = ?',
+      [versionId, Date.now(), threadId]
+    )
+    return result.changes > 0
+  }
+
+  async ensureThreadCustomization (threadId: string) {
+    const thread = await this.getThread(threadId)
+    if (!thread) throw new Error('Thread 不存在')
+    const instruction = thread.instructionVersionId
+      ? await this.getInstructionVersion(thread.instructionVersionId)
+      : await this.getActiveInstruction()
+    const persona = thread.personaVersionId
+      ? await this.getPersonaVersion(thread.personaVersionId)
+      : await this.getPersonaVersion((await this.getDefaultPersona()).activeVersionId)
+    if (!instruction || !persona) throw new Error('Thread 定制版本不可用')
+    if (!thread.instructionVersionId || !thread.personaVersionId) {
+      await this.run(
+        `UPDATE threads SET instruction_version_id = ?, persona_version_id = ?, updated_at = ?
+         WHERE id = ?`,
+        [instruction.id, persona.id, Date.now(), threadId]
+      )
+    }
+    return { instruction, persona }
+  }
+
   async addMemory (
     scope: AgentMemoryRecord['scope'],
     scopeKey: string,
     content: string,
-    sourceTurnId: string
+    sourceTurnId: string,
+    options: Partial<Pick<
+      AgentMemoryRecord,
+      'kind' | 'memoryKey' | 'confidence' | 'importance' | 'pinned' | 'sourceType' |
+      'expiresAt'
+    >> = {}
   ) {
     const id = randomUUID()
+    const now = Date.now()
+    const normalized = content.trim()
+    const contentHash = createHash('sha256').update(normalized).digest('hex')
+    const kind = options.kind || 'fact'
+    const memoryKey = options.memoryKey?.trim().slice(0, 200) || null
+    const confidence = Math.max(0, Math.min(Number(options.confidence) || 0.7, 1))
+    const importance = Math.max(0, Math.min(Number(options.importance) || 0.5, 1))
+    if (memoryKey && ['explicit', 'correction', 'web'].includes(options.sourceType || '')) {
+      const previous = await this.all<{ id: string }>(
+        `SELECT id FROM memories
+         WHERE scope = ? AND scope_key = ? AND memory_key = ? AND status = 'active'`,
+        [scope, scopeKey, memoryKey]
+      )
+      for (const item of previous) {
+        await this.run(
+          `UPDATE memories SET status = 'superseded', enabled = 0,
+            superseded_by = ?, updated_at = ? WHERE id = ?`,
+          [id, now, item.id]
+        )
+        if (this.ftsAvailable) {
+          await this.run('DELETE FROM memory_fts WHERE memory_id = ?', [item.id])
+        }
+      }
+    }
     await this.run(
-      `INSERT INTO memories(id, scope, scope_key, content, source_turn_id, created_at)
-       VALUES(?, ?, ?, ?, ?, ?)`,
-      [id, scope, scopeKey, content, sourceTurnId, Date.now()]
+      `INSERT INTO memories(
+        id, scope, scope_key, content, source_turn_id, enabled, kind, memory_key,
+        confidence, importance, pinned, status, content_hash, source_type,
+        expires_at, use_count, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?)`,
+      [
+        id, scope, scopeKey, normalized, sourceTurnId, kind, memoryKey,
+        confidence, importance, options.pinned ? 1 : 0, contentHash,
+        options.sourceType || 'legacy', options.expiresAt || null, now, now,
+      ]
     )
+    await this.run(
+      `INSERT INTO memory_sources(
+        id, memory_id, source_turn_id, evidence, source_type, created_at
+       ) VALUES(?, ?, ?, '', ?, ?)`,
+      [randomUUID(), id, sourceTurnId, options.sourceType || 'legacy', now]
+    )
+    if (this.ftsAvailable) {
+      await this.run(
+        'INSERT INTO memory_fts(memory_id, scope, scope_key, content) VALUES(?, ?, ?, ?)',
+        [id, scope, scopeKey, normalized]
+      )
+    }
     return id
   }
 
@@ -2304,7 +2826,7 @@ export class AgentDatabase {
       const conditions = scopes.map(() => '(scope = ? AND scope_key = ?)').join(' OR ')
       const params = scopes.flatMap(item => [item.scope, item.key])
       rows = await this.all<Record<string, unknown>>(
-        `SELECT * FROM memories WHERE enabled = 1 AND (${conditions})
+        `SELECT * FROM memories WHERE enabled = 1 AND status = 'active' AND (${conditions})
          ORDER BY created_at DESC LIMIT 100`,
         params
       )
@@ -2316,19 +2838,229 @@ export class AgentDatabase {
       content: String(row.content),
       sourceTurnId: String(row.source_turn_id),
       enabled: Boolean(row.enabled),
+      kind: (row.kind || 'fact') as AgentMemoryRecord['kind'],
+      memoryKey: row.memory_key ? String(row.memory_key) : null,
+      confidence: Number(row.confidence ?? 0.7),
+      importance: Number(row.importance ?? 0.5),
+      pinned: Boolean(row.pinned),
+      status: (row.status || 'active') as AgentMemoryRecord['status'],
+      contentHash: String(row.content_hash || ''),
+      sourceType: (row.source_type || 'legacy') as AgentMemoryRecord['sourceType'],
+      expiresAt: row.expires_at ? Number(row.expires_at) : null,
+      lastUsedAt: row.last_used_at ? Number(row.last_used_at) : null,
+      useCount: Number(row.use_count || 0),
+      supersededBy: row.superseded_by ? String(row.superseded_by) : null,
       createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at || row.created_at),
     }))
   }
 
+  async retrieveMemories (
+    scopes: Array<{ scope: string; key: string }>,
+    query: string,
+    options: {
+      maxCandidates: number
+      maxItems: number
+      minScore: number
+      recencyHalfLifeDays: number
+      maxPromptTokens: number
+      threadId?: string
+      turnId?: string
+    }
+  ) {
+    const memories = await this.listMemories(scopes)
+    const normalized = query.toLowerCase()
+    const words = normalized
+      .split(/[\s,，。！？、:：;；()[\]{}"'`]+/)
+      .map(item => item.trim())
+      .filter(item => item.length >= 2)
+    const cjk = [...normalized.matchAll(/[\u3400-\u9fff]{2,}/g)]
+      .flatMap(match => [...match[0]].slice(0, -1).map((char, index) =>
+        `${char}${[...match[0]][index + 1]}`
+      ))
+    const terms = [...new Set([...words, ...cjk])].slice(0, 32)
+    let ftsIds = new Set<string>()
+    if (this.ftsAvailable && terms.length) {
+      const expression = terms.map(term => `"${term.replace(/"/g, '""')}"`).join(' OR ')
+      try {
+        const rows = await this.all<{ memory_id: string }>(
+          `SELECT memory_id FROM memory_fts
+           WHERE memory_fts MATCH ? LIMIT ?`,
+          [expression, Math.max(1, Math.min(options.maxCandidates, 500))]
+        )
+        ftsIds = new Set(rows.map(row => row.memory_id))
+      } catch {
+        ftsIds = new Set()
+      }
+    }
+    const now = Date.now()
+    const halfLifeMs = Math.max(1, options.recencyHalfLifeDays) * 86_400_000
+    const ranked = memories.map(memory => {
+      const content = memory.content.toLowerCase()
+      const hits = terms.filter(term => content.includes(term)).length
+      const lexical = terms.length ? hits / terms.length : 0
+      const fts = ftsIds.has(memory.id) ? 1 : 0
+      const age = Math.max(0, now - (memory.lastUsedAt || memory.updatedAt))
+      const recency = Math.pow(0.5, age / halfLifeMs)
+      const score = memory.pinned
+        ? 1
+        : 0.45 * fts + 0.2 * lexical + 0.15 * memory.importance +
+          0.1 * memory.confidence + 0.1 * recency
+      return { memory, score, matched: fts > 0 || lexical > 0 }
+    }).filter(item => item.memory.pinned || item.matched)
+      .filter(item => item.memory.pinned || item.score >= options.minScore)
+      .sort((left, right) =>
+        Number(right.memory.pinned) - Number(left.memory.pinned) ||
+        right.score - left.score || right.memory.updatedAt - left.memory.updatedAt
+      )
+      .slice(0, Math.max(1, Math.min(options.maxCandidates, 500)))
+
+    const selected: Array<(typeof ranked)[number]> = []
+    let estimatedTokens = 0
+    for (const item of ranked) {
+      const tokens = Math.max(1, Math.ceil(Buffer.byteLength(item.memory.content, 'utf8') / 3))
+      if (selected.length >= options.maxItems) break
+      if (selected.length && estimatedTokens + tokens > options.maxPromptTokens) continue
+      selected.push(item)
+      estimatedTokens += tokens
+    }
+    if (selected.length) {
+      const ids = selected.map(item => item.memory.id)
+      const placeholders = ids.map(() => '?').join(', ')
+      await this.run(
+        `UPDATE memories SET use_count = use_count + 1, last_used_at = ?, updated_at = updated_at
+         WHERE id IN (${placeholders})`,
+        [now, ...ids]
+      )
+    }
+    if (options.threadId && options.turnId) {
+      const selectedIds = new Set(selected.map(item => item.memory.id))
+      for (const [rank, item] of ranked.entries()) {
+        await this.recordRetrieval({
+          threadId: options.threadId,
+          turnId: options.turnId,
+          kind: 'memory',
+          itemId: item.memory.id,
+          rank,
+          selected: selectedIds.has(item.memory.id),
+          outcome: 'retrieved',
+        })
+      }
+    }
+    return selected
+  }
+
+  async updateMemory (id: string, input: Partial<Pick<
+    AgentMemoryRecord,
+    'content' | 'kind' | 'memoryKey' | 'confidence' | 'importance' | 'pinned' | 'expiresAt' |
+    'status'
+  >>) {
+    const current = (await this.listMemories()).find(item => item.id === id)
+    if (!current) throw new Error('记忆不存在')
+    const content = input.content?.trim() || current.content
+    const status = input.status || current.status
+    const enabled = status === 'active'
+    await this.run(
+      `UPDATE memories SET content = ?, kind = ?, memory_key = ?, confidence = ?,
+        importance = ?, pinned = ?, expires_at = ?, status = ?, enabled = ?,
+        content_hash = ?, updated_at = ? WHERE id = ?`,
+      [
+        content,
+        input.kind || current.kind,
+        input.memoryKey === undefined ? current.memoryKey : input.memoryKey || null,
+        Math.max(0, Math.min(Number(input.confidence ?? current.confidence), 1)),
+        Math.max(0, Math.min(Number(input.importance ?? current.importance), 1)),
+        input.pinned === undefined ? Number(current.pinned) : Number(input.pinned),
+        input.expiresAt === undefined ? current.expiresAt : input.expiresAt,
+        status,
+        Number(enabled),
+        createHash('sha256').update(content).digest('hex'),
+        Date.now(),
+        id,
+      ]
+    )
+    if (this.ftsAvailable) {
+      await this.run('DELETE FROM memory_fts WHERE memory_id = ?', [id])
+      if (enabled) {
+        await this.run(
+          'INSERT INTO memory_fts(memory_id, scope, scope_key, content) VALUES(?, ?, ?, ?)',
+          [id, current.scope, current.scopeKey, content]
+        )
+      }
+    }
+    return (await this.listMemories()).find(item => item.id === id) || null
+  }
+
+  async curateMemories (staleBefore: number, archiveBefore: number) {
+    const now = Date.now()
+    const active = await this.all<Record<string, unknown>>(
+      `SELECT * FROM memories WHERE status = 'active'
+       ORDER BY pinned DESC, importance DESC, confidence DESC, created_at ASC`
+    )
+    const canonical = new Map<string, string>()
+    let merged = 0
+    for (const row of active) {
+      const key = [row.scope, row.scope_key, row.memory_key || '', row.content_hash].join('\0')
+      const keeper = canonical.get(key)
+      if (!keeper) {
+        canonical.set(key, String(row.id))
+        continue
+      }
+      const duplicateId = String(row.id)
+      await this.run(
+        `UPDATE memories SET status = 'superseded', enabled = 0,
+          superseded_by = ?, updated_at = ? WHERE id = ?`,
+        [keeper, now, duplicateId]
+      )
+      await this.run(
+        'UPDATE OR IGNORE memory_sources SET memory_id = ? WHERE memory_id = ?',
+        [keeper, duplicateId]
+      )
+      if (this.ftsAvailable) {
+        await this.run('DELETE FROM memory_fts WHERE memory_id = ?', [duplicateId])
+      }
+      merged++
+    }
+    const expired = await this.run(
+      `UPDATE memories SET status = 'archived', enabled = 0, updated_at = ?
+       WHERE status = 'active' AND pinned = 0 AND expires_at IS NOT NULL AND expires_at <= ?`,
+      [now, now]
+    )
+    const archived = await this.run(
+      `UPDATE memories SET status = 'archived', enabled = 0, updated_at = ?
+       WHERE status = 'active' AND pinned = 0 AND importance < 0.7
+         AND COALESCE(last_used_at, created_at) < ? AND created_at < ?`,
+      [now, staleBefore, archiveBefore]
+    )
+    if (this.ftsAvailable && (expired.changes || archived.changes)) {
+      await this.run(
+        `DELETE FROM memory_fts WHERE memory_id IN (
+          SELECT id FROM memories WHERE status <> 'active' OR enabled = 0
+        )`
+      )
+    }
+    return { merged, expired: expired.changes, archived: archived.changes }
+  }
+
   async setMemoryEnabled (id: string, enabled: boolean) {
-    const result = await this.run('UPDATE memories SET enabled = ? WHERE id = ?', [
-      enabled ? 1 : 0,
-      id,
-    ])
+    const result = await this.run(
+      'UPDATE memories SET enabled = ?, status = ?, updated_at = ? WHERE id = ?',
+      [enabled ? 1 : 0, enabled ? 'active' : 'archived', Date.now(), id]
+    )
+    if (this.ftsAvailable) {
+      await this.run('DELETE FROM memory_fts WHERE memory_id = ?', [id])
+      if (enabled) {
+        await this.run(`
+          INSERT INTO memory_fts(memory_id, scope, scope_key, content)
+          SELECT id, scope, scope_key, content FROM memories WHERE id = ?
+        `, [id])
+      }
+    }
     return result.changes > 0
   }
 
   async deleteMemory (id: string) {
+    if (this.ftsAvailable) await this.run('DELETE FROM memory_fts WHERE memory_id = ?', [id])
     const result = await this.run('DELETE FROM memories WHERE id = ?', [id])
     return result.changes > 0
   }
@@ -2993,6 +3725,14 @@ export class AgentDatabase {
         input.outcome || null,
         Date.now(),
       ]
+    )
+  }
+
+  async completeRetrievals (threadId: string, turnId: string, outcome: string) {
+    await this.run(
+      `UPDATE agent_retrieval_log SET outcome = ?
+       WHERE thread_id = ? AND turn_id = ? AND selected = 1`,
+      [outcome, threadId, turnId]
     )
   }
 
@@ -3774,6 +4514,7 @@ export class AgentDatabase {
       target: String(row.target),
       toolAllowlist: parseJson<string[]>(row.tool_allowlist_json as string, []),
       skillIds: parseJson<string[]>(row.skill_ids_json as string, []),
+      personaId: row.persona_id ? String(row.persona_id) : null,
       enabled: Boolean(row.enabled),
       createdBy: String(row.created_by),
       lastRunAt: row.last_run_at ? Number(row.last_run_at) : null,
@@ -3791,9 +4532,9 @@ export class AgentDatabase {
     await this.run(
       `INSERT INTO agent_jobs(
         id, name, schedule_type, cron, run_at, timezone, prompt, target,
-        tool_allowlist_json, skill_ids_json, enabled, created_by, last_run_at,
+        tool_allowlist_json, skill_ids_json, persona_id, enabled, created_by, last_run_at,
         created_at, updated_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         schedule_type = excluded.schedule_type,
@@ -3804,6 +4545,7 @@ export class AgentDatabase {
         target = excluded.target,
         tool_allowlist_json = excluded.tool_allowlist_json,
         skill_ids_json = excluded.skill_ids_json,
+        persona_id = excluded.persona_id,
         enabled = excluded.enabled,
         updated_at = excluded.updated_at`,
       [
@@ -3817,6 +4559,7 @@ export class AgentDatabase {
         input.target,
         JSON.stringify(input.toolAllowlist),
         JSON.stringify(input.skillIds),
+        input.personaId,
         input.enabled ? 1 : 0,
         input.createdBy,
         input.lastRunAt || null,

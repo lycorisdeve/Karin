@@ -1,5 +1,6 @@
 import type { AgentConfig, AgentToolCall } from '@/types/agent'
 import type { AgentDatabase } from '../persistence/database'
+import { agentHookEmit } from '@/hooks/agent'
 
 export interface AgentHistoryMessage {
   id: string
@@ -136,6 +137,11 @@ export class AgentContextEngine {
       [latest?.content || input.legacySummary, ...lines].filter(Boolean).join('\n'),
       context.summaryTargetTokens
     )
+    await agentHookEmit('beforeCompaction', {
+      threadId: input.threadId,
+      messageIds: compacted.map(message => message.id),
+      estimatedTokens,
+    })
     const stored = await this.database.createContextSummary({
       threadId: input.threadId,
       parentId: latest?.id,
@@ -145,6 +151,12 @@ export class AgentContextEngine {
         ...(latest?.sourceMessageIds || []),
         ...compacted.map(message => message.id),
       ],
+    })
+    await agentHookEmit('afterCompaction', {
+      threadId: input.threadId,
+      summaryId: stored.id,
+      sourceMessageIds: stored.sourceMessageIds,
+      estimatedTokens: stored.estimatedTokens,
     })
     return {
       history,

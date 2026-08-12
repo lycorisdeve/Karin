@@ -125,6 +125,98 @@ const learning = {
 } as unknown as AgentLearning
 
 describe('Agent runtime', () => {
+  it('keeps a Web news request interactive while building its verification plan', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const plans: Array<Record<string, unknown>> = []
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete () {
+        return { content: '今日新闻摘要', toolCalls: [] }
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(config),
+      provider,
+      learning,
+      config
+    )
+    const webActor: AgentActor = {
+      id: 'web-admin',
+      role: 'admin',
+      selfId: 'web',
+      scene: 'web',
+      contactKey: 'web:web-admin',
+      origin: {
+        channel: 'web',
+        protocol: 'web',
+        accountId: 'web',
+        accountName: 'WebUI',
+        contactKey: 'web:web-admin',
+        contactId: 'web-admin',
+        contactSubId: '',
+        contactName: 'Admin',
+      },
+    }
+
+    const result = await runtime.runTurn({
+      threadKey: 'web:web-admin:news',
+      actor: webActor,
+      content: '给我发一下今天的热点新闻',
+      onEvent: event => {
+        if (event.type === 'plan.created') plans.push(event.data as Record<string, unknown>)
+      },
+    })
+
+    expect(result.state).toBe('completed')
+    expect(JSON.stringify(plans)).not.toContain('media-ready')
+    expect(JSON.stringify(plans)).not.toContain('delivery-completed')
+    await db.close()
+  })
+
+  it('does not create an external delivery operation for a Web terminal result', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(config),
+      { name: 'fake', async complete () { return { content: '', toolCalls: [] } } },
+      learning,
+      config
+    )
+    const webActor: AgentActor = {
+      id: 'web-admin',
+      role: 'admin',
+      selfId: 'web',
+      scene: 'web',
+      contactKey: 'web:web-admin',
+      origin: {
+        channel: 'web',
+        protocol: 'web',
+        accountId: 'web',
+        accountName: 'WebUI',
+        contactKey: 'web:web-admin',
+        contactId: 'web-admin',
+        contactSubId: '',
+        contactName: 'Admin',
+      },
+    }
+    const thread = await db.getOrCreateThread('web:web-admin:delivery', webActor)
+
+    await expect(runtime.deliverThreadResult(thread, {
+      threadId: thread.id,
+      turnId: 'turn-web',
+      state: 'completed',
+      content: 'Web terminal result',
+      finalMessageId: 'final-web',
+    })).resolves.toBe(true)
+    await expect(db.listDeliveryOperations(thread.id)).resolves.toEqual([])
+    await db.close()
+  })
+
   it('interrupts an active interactive turn and resumes with the user supplement', async () => {
     const db = await database()
     const registry = new AgentToolRegistry()

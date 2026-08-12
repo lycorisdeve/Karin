@@ -15,7 +15,8 @@ type LegacyLearningConfig = {
 
 interface LegacyAgentConfig extends Omit<
   AgentConfig,
-  'version' | 'providers' | 'routing' | 'learning' | 'recovery' | 'tasks' | 'context' | 'journal'
+  'version' | 'providers' | 'routing' | 'learning' | 'recovery' | 'tasks' | 'context' |
+  'journal' | 'memory' | 'execution'
 > {
   learning?: LegacyLearningConfig
   provider?: {
@@ -127,6 +128,49 @@ const normalizeLimits = (
   maxSubagents: Math.max(1, Math.min(Number(value?.maxSubagents) || 3, 32)),
 })
 
+const normalizeMemory = (
+  value?: Partial<AgentConfig['memory']>
+): AgentConfig['memory'] => ({
+  retrieval: {
+    maxCandidates: Math.max(
+      8,
+      Math.min(Number(value?.retrieval?.maxCandidates) || 50, 500)
+    ),
+    maxItems: Math.max(1, Math.min(Number(value?.retrieval?.maxItems) || 8, 32)),
+    maxPromptTokens: Math.max(
+      128,
+      Math.min(Number(value?.retrieval?.maxPromptTokens) || 1200, 8192)
+    ),
+    minScore: Math.max(0, Math.min(Number(value?.retrieval?.minScore) || 0.25, 1)),
+    recencyHalfLifeDays: Math.max(
+      1,
+      Math.min(Number(value?.retrieval?.recencyHalfLifeDays) || 30, 3650)
+    ),
+  },
+})
+
+const normalizeExecution = (
+  value?: Partial<AgentConfig['execution']>,
+  legacyLimits?: Record<string, unknown>
+): AgentConfig['execution'] => ({
+  isolationMode: value?.isolationMode === 'strict' ? 'strict' : 'compat',
+  minimumIsolation: ['process', 'os'].includes(String(value?.minimumIsolation))
+    ? value!.minimumIsolation as 'process' | 'os'
+    : 'none',
+  hookTimeoutMs: Math.max(100, Math.min(Number(value?.hookTimeoutMs) || 5000, 60_000)),
+  maxModelCalls: Math.max(
+    1,
+    Math.min(Number(value?.maxModelCalls ?? legacyLimits?.maxModelCalls) || 40, 200)
+  ),
+  maxTurnDurationMs: Math.max(
+    10_000,
+    Math.min(
+      Number(value?.maxTurnDurationMs ?? legacyLimits?.maxTurnDurationMs) || 300_000,
+      3_600_000
+    )
+  ),
+})
+
 const normalizeScriptRuntime = (
   value?: Partial<AgentConfig['scriptRuntime']>
 ): AgentConfig['scriptRuntime'] => {
@@ -224,6 +268,7 @@ export const agentProviderFingerprint = (profile: AgentProviderProfile) =>
     .update([
       profile.id,
       profile.kind,
+      profile.protocol,
       profile.baseUrl,
       profile.model,
       profile.apiKey,
@@ -255,6 +300,7 @@ const normalizeProfile = (
     id: id || `${kind}-${index + 1}`,
     name: String(value.name || defaults.name).trim().slice(0, 100),
     kind,
+    protocol: value.protocol === 'responses' ? 'responses' : 'chat-completions',
     enabled: value.enabled !== false,
     baseUrl: String(value.baseUrl || defaults.baseUrl).trim().replace(/\/+$/, ''),
     apiKey: String(value.apiKey || ''),
@@ -307,7 +353,7 @@ export const migrateAgentConfig = (
       : unique[0]?.id || ''
     return {
       ...(value as AgentConfig),
-      version: 9,
+      version: 10,
       providers: unique,
       routing: {
         primary,
@@ -329,6 +375,11 @@ export const migrateAgentConfig = (
       policy: normalizePolicy(current.policy, sourceVersion),
       scriptRuntime: normalizeScriptRuntime(current.scriptRuntime),
       learning: normalizeLearning((value as AgentConfig).learning),
+      memory: normalizeMemory((value as AgentConfig).memory),
+      execution: normalizeExecution(
+        (value as AgentConfig).execution,
+        current.limits as unknown as Record<string, unknown>
+      ),
       recovery: normalizeRecovery((value as AgentConfig).recovery),
     }
   }
@@ -349,8 +400,11 @@ export const migrateAgentConfig = (
   )
   const { provider: _provider, ...rest } = legacy
   return {
-    ...(rest as Omit<AgentConfig, 'version' | 'providers' | 'routing' | 'learning'>),
-    version: 9,
+    ...(rest as Omit<
+      AgentConfig,
+      'version' | 'providers' | 'routing' | 'learning' | 'memory' | 'execution'
+    >),
+    version: 10,
     providers: [profile],
     routing: { primary: profile.id, fallback: [] },
     limits: normalizeLimits(legacy.limits),
@@ -360,6 +414,8 @@ export const migrateAgentConfig = (
     policy: normalizePolicy(legacy.policy, 0),
     scriptRuntime: normalizeScriptRuntime(legacy.scriptRuntime),
     learning: normalizeLearning(legacy.learning),
+    memory: normalizeMemory(),
+    execution: normalizeExecution(undefined, legacy.limits as unknown as Record<string, unknown>),
     recovery: normalizeRecovery(),
     tools: { disabled: [], disabledToolsets: [] },
   }
@@ -370,7 +426,7 @@ const initAgent = (dir: string) => {
   configFile = path.join(dir, name)
   const stored = requireFileSync<AgentConfig | LegacyAgentConfig>(configFile, { type: 'json' })
   cache = migrateAgentConfig(stored)
-  if (Number((stored as Partial<AgentConfig>).version) !== 9 || !('journal' in stored)) {
+  if (Number((stored as Partial<AgentConfig>).version) !== 10 || !('memory' in stored)) {
     const temporary = `${configFile}.migration.tmp`
     fs.writeFileSync(temporary, JSON.stringify(cache, null, 2), 'utf8')
     fs.renameSync(temporary, configFile)
@@ -439,7 +495,7 @@ export const mergeAgentConfig = (
   return migrateAgentConfig({
     ...current,
     ...update,
-    version: 9,
+    version: 10,
     providers,
     routing: update.routing || current.routing,
   } as AgentConfig)

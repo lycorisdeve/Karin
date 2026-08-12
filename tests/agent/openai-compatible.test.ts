@@ -127,4 +127,70 @@ describe('OpenAI-compatible provider', () => {
     })
     expect(JSON.stringify(result)).not.toContain('do-not-return')
   })
+
+  it('normalizes Responses tool calls, tool outputs, streaming text, and usage', async () => {
+    const encoder = new TextEncoder()
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}'))
+      expect(body.input).toContainEqual({
+        type: 'function_call_output',
+        call_id: 'call-old',
+        output: '{"ok":true}',
+      })
+      expect(body.input).toContainEqual(expect.objectContaining({
+        type: 'function_call',
+        call_id: 'call-old',
+      }))
+      const alias = body.tools[0].name
+      const chunks = [
+        'data: {"type":"response.output_text.delta","delta":"好"}\n\n',
+        `data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call-new","name":"${alias}","arguments":""}}\n\n`,
+        'data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\\"value\\":\\"ok\\"}"}\n\n',
+        'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
+      ]
+      return new Response(new ReadableStream({
+        start (controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+          controller.close()
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: 'http://localhost/v1',
+      apiKey: 'secret',
+      timeout: 1000,
+      protocol: 'responses',
+    })
+    const response = await provider.complete({
+      model: 'fake',
+      messages: [
+        { role: 'user', content: 'run' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call-old', name: 'test.echo', arguments: { value: 'old' } }],
+        },
+        {
+          role: 'tool',
+          content: '{"ok":true}',
+          toolCallId: 'call-old',
+          name: 'test.echo',
+        },
+      ],
+      tools: [{
+        name: 'test.echo',
+        description: 'echo',
+        inputSchema: { type: 'object' },
+      }],
+    }, () => undefined)
+
+    expect(response.content).toBe('好')
+    expect(response.toolCalls).toEqual([{
+      id: 'call-new',
+      name: 'test.echo',
+      arguments: { value: 'ok' },
+    }])
+    expect(response.usage).toEqual({ inputTokens: 7, outputTokens: 3 })
+  })
 })
