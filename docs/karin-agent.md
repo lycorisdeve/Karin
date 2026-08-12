@@ -18,12 +18,13 @@ Karin Agent 是 `node-karin` Core 内置模块，不更改 npm 包名、CLI 名�
 
 ```json
 {
-  "version": 9,
+  "version": 10,
   "enabled": true,
   "providers": [{
     "id": "openai",
     "name": "OpenAI",
     "kind": "openai",
+    "protocol": "chat-completions",
     "enabled": true,
     "baseUrl": "https://api.openai.com/v1",
     "model": "your-model",
@@ -37,9 +38,29 @@ Karin Agent 是 `node-karin` Core 内置模块，不更改 npm 包名、CLI 名�
     "hardLimitRatio": 0.85,
     "protectedRecentMessages": 12,
     "summaryTargetTokens": 4096
+  },
+  "memory": {
+    "retrieval": {
+      "maxCandidates": 50,
+      "maxItems": 8,
+      "maxPromptTokens": 1200,
+      "minScore": 0.25,
+      "recencyHalfLifeDays": 30
+    }
+  },
+  "execution": {
+    "isolationMode": "compat",
+    "minimumIsolation": "none",
+    "hookTimeoutMs": 5000,
+    "maxModelCalls": 40,
+    "maxTurnDurationMs": 300000
   }
 }
 ```
+
+v9 配置会在读取时迁移到 v10。Provider 默认继续使用 `chat-completions`；需要 OpenAI
+Responses 兼容协议时将 `protocol` 设为 `responses`。迁移保留现有 Provider、密钥和路由，
+不会自动删除用户数据。
 
 密钥只放在运行环境：
 
@@ -56,8 +77,26 @@ API Key 通过 Web 的只写字段或本地忽略配置保存。Web 接口和日
 复杂请求先调用 `karin.agent.todo` 建立 Thread 持久化清单；无参数读取，`merge=false`
 替换，`merge=true` 按任务 ID 更新或追加。简单问答不会为了形式创建任务。
 
-模型上下文分为 stable、context 和 volatile 三层。stable 只放执行纪律与 Thread 固定的
-Skill 索引，不预注入 Skill 全文；volatile 每轮加入相关记忆、当前任务清单、时间和恢复信息。
+Prompt 由 `HarnessKernel`、`AgentInstructionStore`、人物版本、`MemoryRetriever` 与
+`AgentPromptAssembler` 分层组成，优先级固定为：
+
+```text
+Harness Kernel > AGENT.md 版本 > 人物预设版本 > Skill 索引与会话摘要
+  > 长期记忆 > 当前任务与用户消息
+```
+
+`AGENT.md` 是全局工作章程；人物预设只定义身份、专业领域、语气、回答风格和默认语言；长期
+记忆只保存特定用户/群组的事实、偏好与纠正。三者不重复，也都不能改变 Tool 权限、审批和
+完成验证。`AGENT.md` 保存上限为 32 KiB，使用 UTF-8/LF、内容哈希、乐观锁和原子替换；外部
+文件编辑会导入新版本，非法编码或超限文件不会覆盖最后有效版本。
+
+新 Thread 锁定当时的 `AGENT.md` 和默认人物版本，已有 Thread 不会随全局编辑漂移；WebUI 可
+手动升级。子 Agent 继承父 Thread 的两个版本，定时任务创建新 Thread 时解析所选人物的最新
+有效版本。
+
+模型上下文分为 stable、context 和 volatile 三层。stable 放 Kernel、工作章程、人物与 Thread
+固定 Skill 索引，不预注入 Skill 全文；volatile 每轮加入相关记忆、当前任务清单、时间和恢复
+信息。
 Context Engine 在预计输入达到上下文窗口 50% 时预压缩、85% 时强制压缩。摘要采用不可变
 版本并继承上一个摘要，最近消息、完整 Tool-call/result 对、活动任务和非幂等回执继续保留；
 `maxRecentMessages` 只作为估算或摘要失败时的降级上限。
@@ -71,7 +110,8 @@ Context Engine 在预计输入达到上下文窗口 50% 时预压缩、85% 时�
 
 Execution Budget 管理模型与 Tool 的循环。每轮比较任务状态、Tool 回执、错误和结果证据；
 连续三轮没有新增证据时提前停止。`limits.maxToolRounds` 可配置为 1–99，默认 99，只承担防止
-无限循环的最终熔断职责。诊断 Tool 的兼容计数仅作为整次执行的额外安全熔断器。
+无限循环的最终熔断职责。`execution.maxModelCalls` 和 `execution.maxTurnDurationMs` 同时限制
+整个 Turn 的模型调用次数和持续时间。诊断 Tool 的兼容计数仅作为额外安全熔断器。
 
 模型 Provider 超时会在重试和 fallback 均失败后返回中文可操作提示，不再向用户暴露原生
 `The operation was aborted due to timeout`。Tool 超时同样记录为包含 Tool 名称和毫秒数的失败回执。
@@ -101,6 +141,19 @@ export const status = karin.tool({
 Tool 可声明 `owner`、`sensitivity` 和 `restartSafe`，这些字段只用于策略解释、恢复和审计，
 插件或 MCP 不能借此提升自己的信任级别。超过模型输出上限的结果保存为脱敏 Tool Result
 Artifact，模型只收到有效 JSON 预览和 Artifact ID。
+
+所有调用都经过 `AgentExecutionGateway`。隔离等级为 `core-inline`、`legacy-inline`、
+`process-isolated`、`generated-sandbox`、`mcp-remote` 或 `mcp-stdio`。默认兼容模式允许旧插件的
+`legacy-inline` 并在 WebUI 告警；严格模式拒绝。`karin.processTool()` 使用 JSON stdin/stdout、
+环境变量白名单、受限 cwd、无 Shell 拼接、输出上限和进程树终止。进程隔离不等于安全沙箱；
+Core 会探测 bwrap/Seatbelt，但当前未验证为硬隔离执行后端，因此配置要求 `os` 时失败关闭，
+不会在 UI 中宣称为安全沙箱。
+
+`karin.browser.search` 使用受控 HTTP/RSS 搜索，不依赖浏览器二进制。截图优先复用 Karin
+Render Registry 中已有的 Puppeteer/Snapka 渲染器；没有可用渲染器或渲染失败时，再降级到
+Agent 的交互式浏览器。动态页面和点击能力会依次尝试 Playwright Chromium、Windows/macOS
+的系统 Edge/Chrome 和 Linux 的 Chromium/Chrome；特殊部署可通过
+`KARIN_AGENT_BROWSER_EXECUTABLE` 指定浏览器绝对路径。
 
 策略计算顺序为 Karin 角色权限、硬拒绝、精确规则、通配规则、风险默认值与可信可逆判定。默认：
 
@@ -137,9 +190,33 @@ Artifact，模型只收到有效 JSON 预览和 Artifact ID。
 会话模型不可用时继续按全局主模型和 Fallback 路由执行。群聊和频道中的模型切换
 沿用 `/new`、`/stop` 的会话管理权限，私聊用户可以管理自己的会话。
 
+会话人物命令：
+
+```text
+/persona
+/persona <序号或ID>
+/persona reset
+```
+
+人物切换只影响当前 Thread，不改变 Provider、Tool、权限或安全策略。
+
+## 长期记忆 v2
+
+记忆具有 `kind`、`memoryKey`、可信度、重要度、置顶、状态、内容哈希、来源、使用次数和过期
+时间。召回先做 global/user/group 作用域隔离，再使用 SQLite FTS5 与词项匹配取候选；FTS5
+不可用时自动退回词项检索。零相关且未置顶的记忆不会进入 Prompt，默认最多 8 条、约 1200
+Token。
+
+用户明确记住、纠正或管理员创建的记录具有较高可信度；相同 `memoryKey` 的明确纠正会把旧值
+标记为 `superseded`。后台反思只能产生候选，不能覆盖用户或管理员记忆。Curator 合并完全重复
+项和来源，归档到期或长期未召回的低重要度记录；置顶记录不自动归档，自动整理不物理删除。
+召回候选、最终选择和 Turn 结果记录在统一日志中，便于后续评测或混合检索。
+
 ## 数据
 
-Agent 数据库位于 `@karinjs/data/db/agent/agent.db`，使用显式迁移和 WAL。v13 起 Turn、终态
+Agent 数据库位于 `@karinjs/data/db/agent/agent.db`，使用显式迁移和 WAL。v14 增加指令版本、
+人物及人物版本、记忆来源、Thread 版本锁和定时任务人物引用；v13 数据向前迁移，旧记忆按
+`active/fact` 保留并补齐哈希与时间字段。v13 起 Turn、终态
 消息和 terminal event 原子提交；运行中的 Turn 重启后先进入 `recovery_pending`。只读、幂等且
 `restartSafe` 的未完成操作可由新 Turn 接管，无法确认的非幂等副作用不会自动重放。
 
@@ -166,6 +243,11 @@ Shell、子进程和依赖安装能力只生成高风险提案。
 对话、当前任务清单、Thread/子 Agent、Skill/Tool
 加载轨迹、审批理由、记忆、技能版本、Generated Tool、自我进化改进日志、自动任务、MCP、
 配置和审计。
+
+`/web/agent/customization` 提供“指令与人物”页面：Monaco 编辑与预览 `AGENT.md`、哈希冲突
+提示、不可变版本恢复、人物 CRUD/版本历史/默认值及引用数量。对话页可选择人物、查看并升级
+当前指令版本；定时任务可选择人物；记忆页展示类型、状态、来源、可信度、重要度、置顶、
+过期和召回次数；Tool 与轨迹页展示实际执行来源和隔离等级。
 
 “自我进化”页面是变更日志，只展示已经生效、已回滚或应用失败的改进及其来源 Turn；管理员可
 删除单条或清空日志，操作需要二次确认并写入审计。候选评测、补丁 Diff、批准、应用和回滚
