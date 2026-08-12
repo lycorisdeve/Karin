@@ -9,6 +9,7 @@ import {
   RiShieldCheckFill,
   RiSparkling2Fill,
   RiToolsFill,
+  RiUserSettingsFill,
 } from 'react-icons/ri'
 import { BsInfoCircleFill } from 'react-icons/bs'
 import {
@@ -97,6 +98,7 @@ export const defaultSiteConfig: SiteConfigType = {
         { id: 'agent-mcp', href: '/agent/mcp', label: 'MCP 服务', Icon: MdCable, kind: 'route' },
         { id: 'agent-approvals', href: '/agent/approvals', label: '审批中心', Icon: RiShieldCheckFill, kind: 'route' },
         { id: 'agent-runs', href: '/agent/runs', label: '运行记录', Icon: RiFileList3Fill, kind: 'route' },
+        { id: 'agent-customization', href: '/agent/customization', label: '指令与人物', Icon: RiUserSettingsFill, kind: 'route' },
         { id: 'agent-config', href: '/agent/config', label: '配置管理', Icon: RiSettings2Fill, kind: 'route' },
       ],
     },

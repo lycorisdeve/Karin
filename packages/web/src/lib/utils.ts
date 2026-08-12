@@ -49,6 +49,7 @@ export const getPageTitle = (pathname: string) => {
       '/agent/approvals': 'Karin Agent 审批',
       '/agent/runs': 'Karin Agent 运行记录',
       '/agent/config': 'Karin Agent 配置',
+      '/agent/customization': 'Agent 指令与人物',
     }
     return titles[pathname] || 'Karin Agent'
   }

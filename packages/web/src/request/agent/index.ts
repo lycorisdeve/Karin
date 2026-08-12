@@ -7,6 +7,13 @@ export interface AgentStatus {
   configured: boolean
   apiKeyConfigured: boolean
   ftsAvailable: boolean
+  isolation: {
+    platform: string
+    processIsolation: boolean
+    hardIsolation: boolean
+    detectedBackends: Array<'bwrap' | 'seatbelt'>
+    reason: string
+  }
   scriptRuntime: {
     available: boolean
     executable: string
@@ -21,6 +28,7 @@ export interface AgentProviderProfile {
   id: string
   name: string
   kind: AgentProviderKind
+  protocol: 'chat-completions' | 'responses'
   enabled: boolean
   baseUrl: string
   apiKey: string
@@ -42,7 +50,7 @@ export interface AgentProviderProfile {
 }
 
 export interface AgentConfig {
-  version: 9
+  version: 10
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: { primary: string; fallback: string[] }
@@ -101,6 +109,22 @@ export interface AgentConfig {
       autoRollback: boolean
       rollbackWindow: number
     }
+  }
+  memory: {
+    retrieval: {
+      maxCandidates: number
+      maxItems: number
+      maxPromptTokens: number
+      minScore: number
+      recencyHalfLifeDays: number
+    }
+  }
+  execution: {
+    isolationMode: 'compat' | 'strict'
+    minimumIsolation: 'none' | 'process' | 'os'
+    hookTimeoutMs: number
+    maxModelCalls: number
+    maxTurnDurationMs: number
   }
   recovery: {
     enabled: boolean
@@ -229,6 +253,7 @@ export interface AgentToolCallView {
   name: string
   source: string
   toolset: string
+  isolation: 'core-inline' | 'legacy-inline' | 'process-isolated' | 'generated-sandbox' | 'mcp-remote' | 'mcp-stdio'
   description?: string
   risk: string
   decision: string
@@ -270,6 +295,7 @@ export interface AgentActivityView {
     | 'interrupted'
   label: string
   source?: string
+  isolation?: AgentToolCallView['isolation']
   risk?: string
   decision?: string
   parentId?: string
@@ -309,7 +335,51 @@ export interface AgentMemory {
   scopeKey: string
   content: string
   enabled: boolean
+  kind: 'preference' | 'fact' | 'relationship' | 'procedure' | 'constraint'
+  memoryKey: string | null
+  confidence: number
+  importance: number
+  pinned: boolean
+  status: 'active' | 'superseded' | 'archived'
+  sourceType: string
+  expiresAt: number | null
+  lastUsedAt: number | null
+  useCount: number
   createdAt: number
+  updatedAt: number
+}
+
+export interface AgentInstructionVersion {
+  id: string
+  version: number
+  content: string
+  contentHash: string
+  source: 'default' | 'web' | 'file'
+  createdBy: string
+  createdAt: number
+}
+
+export interface AgentPersonaDefinition {
+  identity: string
+  expertise: string[]
+  tone: string
+  responseStyle: string
+  language: string
+}
+
+export interface AgentPersona {
+  id: string
+  name: string
+  description: string
+  enabled: boolean
+  isDefault: boolean
+  activeVersionId: string
+  definition: AgentPersonaDefinition
+  version: number
+  threadReferences: number
+  jobReferences: number
+  createdAt: number
+  updatedAt: number
 }
 
 export interface AgentSkill {
@@ -389,6 +459,7 @@ export interface AgentJob {
   target: string
   toolAllowlist: string[]
   skillIds: string[]
+  personaId: string | null
   enabled: boolean
   lastRunAt: number | null
 }
@@ -438,6 +509,43 @@ export const agentRequest = {
       apiKeyConfigured: boolean
     }>(`${base}/config`),
   saveConfig: (config: AgentConfig) => request.serverPost(`${base}/config`, config),
+  instructions: () => request.serverGet<{
+    current: AgentInstructionVersion
+    filename: string
+    maxBytes: number
+  }>(`${base}/instructions`),
+  saveInstructions: (content: string, expectedHash: string) =>
+    request.put(`${base}/instructions`, { content, expectedHash })
+      .then(response => response.data.data as AgentInstructionVersion),
+  instructionVersions: () =>
+    request.serverGet<AgentInstructionVersion[]>(`${base}/instructions/versions`),
+  personaVersions: (id: string) => request.serverGet<Array<{
+    id: string
+    personaId: string
+    version: number
+    definition: AgentPersonaDefinition
+    createdBy: string
+    createdAt: number
+  }>>(`${base}/personas/${encodeURIComponent(id)}/versions`),
+  personas: () => request.serverGet<AgentPersona[]>(`${base}/personas`),
+  createPersona: (input: {
+    name: string
+    description: string
+    definition: AgentPersonaDefinition
+  }) => request.serverPost<AgentPersona, typeof input>(`${base}/personas`, input),
+  updatePersona: (id: string, input: {
+    name: string
+    description: string
+    definition: AgentPersonaDefinition
+  }) => request.put(`${base}/personas/${id}`, input)
+    .then(response => response.data.data as AgentPersona),
+  setPersonaState: (id: string, enabled: boolean) =>
+    request.serverPost<AgentPersona, { enabled: boolean }>(
+      `${base}/personas/${id}/state`,
+      { enabled }
+    ),
+  setDefaultPersona: (id: string) =>
+    request.serverPost<AgentPersona, Record<string, never>>(`${base}/personas/${id}/default`, {}),
   providerPresets: () =>
     request.serverGet<Array<{ kind: AgentProviderKind; name: string; baseUrl: string }>>(
       `${base}/providers/presets`
@@ -508,6 +616,17 @@ export const agentRequest = {
   ) =>
     request.patch(`${base}/threads/${threadId}/model`, { providerId, model })
       .then(response => response.data.data as AgentThread),
+  threadCustomization: (threadId: string) => request.serverGet<{
+    thread: AgentThread
+    persona: AgentPersona | null
+    personaVersion: { id: string; version: number; definition: AgentPersonaDefinition }
+    instruction: AgentInstructionVersion
+    personas: AgentPersona[]
+  }>(`${base}/threads/${threadId}/customization`),
+  setThreadPersona: (threadId: string, personaId: string | null) =>
+    request.patch(`${base}/threads/${threadId}/persona`, { personaId }),
+  setThreadInstruction: (threadId: string, versionId: string) =>
+    request.patch(`${base}/threads/${threadId}/instruction-version`, { versionId }),
   deleteThread: (threadId: string) =>
     request.delete(`${base}/threads/${threadId}`).then(response => response.data.data as {
       deleted: boolean
@@ -574,8 +693,24 @@ export const agentRequest = {
     input: { turnId?: string; rating?: -1 | 0 | 1; correction?: string }
   ) => request.serverPost(`${base}/threads/${threadId}/feedback`, input),
   memories: () => request.serverGet<AgentMemory[]>(`${base}/memories`),
-  createMemory: (input: { scope: string; scopeKey: string; content: string }) =>
+  createMemory: (input: {
+    scope: string
+    scopeKey: string
+    content: string
+    kind?: AgentMemory['kind']
+    memoryKey?: string
+    confidence?: number
+    importance?: number
+    pinned?: boolean
+    expiresAt?: number | null
+  }) =>
     request.serverPost(`${base}/memories`, input),
+  updateMemory: (id: string, input: Partial<AgentMemory>) =>
+    request.patch(`${base}/memories/${id}`, input),
+  previewMemoryRetrieval: (query: string) =>
+    request.serverGet<Array<{ memory: AgentMemory; score: number }>>(
+      `${base}/memories/retrieval-preview?query=${encodeURIComponent(query)}`
+    ),
   setMemoryState: (id: string, enabled: boolean) =>
     request.serverPost(`${base}/memories/${id}/state`, { enabled }),
   deleteMemory: (id: string) => request.serverPost(`${base}/memories/${id}/delete`),

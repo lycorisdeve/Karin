@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import Markdown from '@/components/Markdown'
 import { request } from '@/lib/request'
+import { shouldNotifyDelivery } from './event-notifications'
 import {
   Bot,
   Brain,
@@ -41,7 +42,9 @@ import {
   type AgentConfig,
   type AgentDeliveryOperation,
   type AgentJob,
+  type AgentInstructionVersion,
   type AgentMemory,
+  type AgentPersona,
   type AgentMessage,
   type AgentSkill,
   type AgentScriptToolDefinition,
@@ -62,6 +65,7 @@ import {
   threadName,
   writeThreadSelection,
 } from './thread-selection'
+import AgentCustomization from './customization'
 
 type Page =
   | 'chat'
@@ -73,6 +77,7 @@ type Page =
   | 'mcp'
   | 'approvals'
   | 'runs'
+  | 'customization'
   | 'config'
 
 const pages: Page[] = [
@@ -85,6 +90,7 @@ const pages: Page[] = [
   'mcp',
   'approvals',
   'runs',
+  'customization',
   'config',
 ]
 
@@ -544,6 +550,9 @@ export default function AgentDashboard () {
   const [now, setNow] = useState(Date.now())
   const [approvals, setApprovals] = useState<AgentApproval[]>([])
   const [memories, setMemories] = useState<AgentMemory[]>([])
+  const [personas, setPersonas] = useState<AgentPersona[]>([])
+  const [currentCustomization, setCurrentCustomization] = useState<Awaited<ReturnType<typeof agentRequest.threadCustomization>> | null>(null)
+  const [latestInstruction, setLatestInstruction] = useState<AgentInstructionVersion | null>(null)
   const [skills, setSkills] = useState<AgentSkill[]>([])
   const [jobs, setJobs] = useState<AgentJob[]>([])
   const [jobRuns, setJobRuns] = useState<Array<Record<string, unknown>>>([])
@@ -574,11 +583,16 @@ export default function AgentDashboard () {
     target: 'web',
     toolAllowlist: '',
     skillIds: '',
+    personaId: '',
   })
   const [memoryDraft, setMemoryDraft] = useState({
     scope: 'user',
     scopeKey: 'web-admin',
     content: '',
+    kind: 'fact' as AgentMemory['kind'],
+    memoryKey: '',
+    importance: 0.8,
+    pinned: false,
   })
   const [skillDraft, setSkillDraft] = useState(emptySkillDraft)
   const [selectedJobId, setSelectedJobId] = useState('')
@@ -620,6 +634,7 @@ export default function AgentDashboard () {
       nextThreads,
       nextApprovals,
       nextMemories,
+      nextPersonas,
       nextSkills,
       nextJobs,
       nextJobRuns,
@@ -639,6 +654,7 @@ export default function AgentDashboard () {
       }),
       agentRequest.approvals(),
       agentRequest.memories(),
+      agentRequest.personas(),
       agentRequest.skills(),
       agentRequest.jobs(),
       agentRequest.jobRuns(),
@@ -654,6 +670,7 @@ export default function AgentDashboard () {
     setThreads(nextThreads)
     setApprovals(nextApprovals)
     setMemories(nextMemories)
+    setPersonas(nextPersonas)
     setSkills(nextSkills)
     setJobs(nextJobs)
     setJobRuns(nextJobRuns)
@@ -673,6 +690,20 @@ export default function AgentDashboard () {
     )
     setProviderPresets(await agentRequest.providerPresets())
   }, [selectedChannel, threadState])
+
+  useEffect(() => {
+    if (!current) {
+      setCurrentCustomization(null)
+      return
+    }
+    Promise.all([
+      agentRequest.threadCustomization(current.id),
+      agentRequest.instructions(),
+    ]).then(([customization, instruction]) => {
+      setCurrentCustomization(customization)
+      setLatestInstruction(instruction.current)
+    }).catch(() => setCurrentCustomization(null))
+  }, [current?.id])
 
   useEffect(() => {
     refresh().catch(error => toast.error(error.message))
@@ -820,6 +851,7 @@ export default function AgentDashboard () {
         turnId?: string
         data: Record<string, unknown>
         createdAt: number
+        replayed?: boolean
       }) => void
     ) => {
       ;(source as any).addEventListener(type, (event: { data: string; lastEventId?: string }) => {
@@ -950,12 +982,15 @@ export default function AgentDashboard () {
       )
       refreshActivity()
     })
-    listen('delivery.completed', () => {
+    listen('delivery.completed', payload => {
       agentRequest.deliveries(current.id).then(setDeliveries)
-      if (current.channel !== 'web') toast.success(`回复已发送到 ${channelName(current.channel)}`)
+      if (current.channel !== 'web' && shouldNotifyDelivery(payload)) {
+        toast.success(`回复已发送到 ${channelName(current.channel)}`)
+      }
     })
     listen('delivery.failed', payload => {
       agentRequest.deliveries(current.id).then(setDeliveries)
+      if (!shouldNotifyDelivery(payload)) return
       setChatError(
         `回复已保存在会话中，但发送到 ${channelName(current.channel)} 失败：${
           String(payload.data.error || '适配器未返回成功结果')
@@ -1111,7 +1146,7 @@ export default function AgentDashboard () {
 
   const handleSessionCommand = async (content: string) => {
     if (
-      !/^(?:\/model(?:\s+.+)?|\/(?:new|stop|help|同意|始终同意|拒绝)|\/(?:approve|deny)\s+[0-9a-f-]{36}|同意|允许|拒绝)$/i.test(
+      !/^(?:\/(?:model|persona)(?:\s+.+)?|\/(?:new|stop|help|同意|始终同意|拒绝)|\/(?:approve|deny)\s+[0-9a-f-]{36}|同意|允许|拒绝)$/i.test(
         content
       )
     ) {
@@ -1133,6 +1168,8 @@ export default function AgentDashboard () {
           '/stop 停止当前会话及子 Agent',
           '/model 查看或切换当前会话模型',
           '/model reset 恢复全局主模型',
+          '/persona 查看或切换当前会话人物',
+          '/persona reset 恢复默认人物',
           '/同意 本次同意',
           '/始终同意 本会话内始终同意该 Tool',
           '/拒绝 拒绝本次调用',
@@ -1192,6 +1229,39 @@ export default function AgentDashboard () {
       setCurrent(updated)
       setThreads(value => value.map(item => (item.id === updated.id ? updated : item)))
       addNotice(`当前会话将在下一回合使用 ${selected.providerName} · ${selected.model}。`)
+      return true
+    }
+    if (/^\/persona(?:\s|$)/i.test(content)) {
+      const thread = await ensureThread()
+      const argument = content.replace(/^\/persona\b/i, '').trim()
+      const customization = await agentRequest.threadCustomization(thread.id)
+      const enabled = customization.personas.filter(item => item.enabled)
+      if (!argument) {
+        addNotice([
+          `当前人物：${customization.persona?.name || '默认人物'}`,
+          '',
+          '可用人物：',
+          ...enabled.map((item, index) => `${index + 1}. ${item.name} (${item.id})`),
+          '',
+          '使用 /persona <序号或ID> 切换，/persona reset 恢复默认人物。',
+        ].join('\n'))
+        return true
+      }
+      const selected = /^reset$/i.test(argument)
+        ? null
+        : Number.isInteger(Number(argument)) && Number(argument) > 0
+          ? enabled[Number(argument) - 1]
+          : enabled.find(item => item.id === argument)
+      if (selected === undefined) {
+        addNotice('人物选择无效，请先使用 /persona 查看可用人物。')
+        return true
+      }
+      await agentRequest.setThreadPersona(thread.id, selected?.id || null)
+      const next = await agentRequest.threadCustomization(thread.id)
+      setCurrentCustomization(next)
+      setCurrent(next.thread)
+      setThreads(value => value.map(item => item.id === next.thread.id ? next.thread : item))
+      addNotice(`当前会话将在下一回合使用人物：${next.persona?.name || '默认人物'}。`)
       return true
     }
 
@@ -1333,6 +1403,7 @@ export default function AgentDashboard () {
             id,
             name: 'Custom',
             kind: 'custom',
+            protocol: 'chat-completions',
             enabled: true,
             baseUrl: 'http://127.0.0.1:8000/v1',
             apiKey: '',
@@ -1507,6 +1578,7 @@ export default function AgentDashboard () {
         target: 'web',
         toolAllowlist: '',
         skillIds: '',
+        personaId: '',
       })
       toast.success(editingJobId ? '自动任务已更新' : '自动任务已创建')
     } catch (error) {
@@ -1526,6 +1598,7 @@ export default function AgentDashboard () {
       target: 'web',
       toolAllowlist: '',
       skillIds: '',
+      personaId: '',
     })
     setTaskEditorOpen(true)
   }
@@ -1544,6 +1617,7 @@ export default function AgentDashboard () {
       target: job.target,
       toolAllowlist: job.toolAllowlist.join(', '),
       skillIds: job.skillIds.join(', '),
+      personaId: job.personaId || '',
     })
     setTaskEditorOpen(true)
   }
@@ -1999,6 +2073,41 @@ export default function AgentDashboard () {
                       )?.model ||
                       '未选择模型'}
                   </p>
+                  <div className='flex items-center gap-2 sm:col-span-2'>
+                    <select
+                      value={currentCustomization?.persona?.id || ''}
+                      disabled={!current || Boolean(current.parentThreadId)}
+                      onChange={async event => {
+                        if (!current) return
+                        await agentRequest.setThreadPersona(current.id, event.target.value || null)
+                        setCurrentCustomization(await agentRequest.threadCustomization(current.id))
+                        toast.success('人物预设已切换')
+                      }}
+                      aria-label='当前会话人物预设'
+                      className='max-w-44 rounded-lg border border-default-200 bg-default-50 px-2 py-1 text-[11px]'
+                    >
+                      {personas.filter(item => item.enabled).map(item => (
+                        <option key={item.id} value={item.id}>{item.name}</option>
+                      ))}
+                    </select>
+                    <span className='truncate text-[11px] text-default-400'>
+                      AGENT.md v{currentCustomization?.instruction.version || '—'}
+                    </span>
+                    {current && !current.parentThreadId && latestInstruction &&
+                      currentCustomization?.instruction.id !== latestInstruction.id && (
+                        <button
+                          type='button'
+                          onClick={async () => {
+                            await agentRequest.setThreadInstruction(current.id, latestInstruction.id)
+                            setCurrentCustomization(await agentRequest.threadCustomization(current.id))
+                            toast.success(`当前会话已升级到 AGENT.md v${latestInstruction.version}`)
+                          }}
+                          className='rounded-full bg-primary-50 px-2 py-1 text-[10px] text-primary'
+                        >
+                          升级到 v{latestInstruction.version}
+                        </button>
+                    )}
+                  </div>
                 </div>
               </div>
               <div className='flex shrink-0 items-center gap-1'>
@@ -2301,7 +2410,7 @@ export default function AgentDashboard () {
                   placeholder={
                     current?.parentThreadId
                       ? '子 Agent 会话只读'
-                      : '输入消息；/model 切换模型，/help 查看命令'
+                      : '输入消息；/model 切换模型，/persona 切换人物'
                   }
                   className='max-h-32 min-h-[56px] flex-1 resize-none rounded-2xl border border-default-200 bg-default-50 px-4 py-3 text-sm outline-none focus:border-primary'
                 />
@@ -2555,9 +2664,14 @@ export default function AgentDashboard () {
                               >
                                 {selectedMemory.enabled ? '已启用' : '已禁用'}
                               </span>
+                              <span className='rounded-full bg-default-100 px-2.5 py-1 text-xs'>
+                                {selectedMemory.kind} · {selectedMemory.status}
+                              </span>
                             </div>
                             <p className='mt-3 text-xs text-default-400'>
-                              创建于 {date(selectedMemory.createdAt)}
+                              创建于 {date(selectedMemory.createdAt)} · 召回 {selectedMemory.useCount} 次 ·
+                              可信度 {selectedMemory.confidence.toFixed(2)} ·
+                              重要度 {selectedMemory.importance.toFixed(2)}
                             </p>
                           </div>
                           <div className='flex gap-2'>
@@ -3293,6 +3407,74 @@ export default function AgentDashboard () {
                           className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
                         />
                       </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        类型
+                        <select
+                          value={memoryDraft.kind}
+                          onChange={event => setMemoryDraft(value => ({
+                            ...value,
+                            kind: event.target.value as AgentMemory['kind'],
+                          }))}
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        >
+                          <option value='fact'>事实</option>
+                          <option value='preference'>偏好</option>
+                          <option value='relationship'>关系</option>
+                          <option value='procedure'>流程</option>
+                          <option value='constraint'>约束</option>
+                        </select>
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        稳定主题键（可选）
+                        <input
+                          value={memoryDraft.memoryKey}
+                          onChange={event => setMemoryDraft(value => ({
+                            ...value,
+                            memoryKey: event.target.value,
+                          }))}
+                          placeholder='例如 user.locale'
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5 font-mono'
+                        />
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        重要度 {memoryDraft.importance.toFixed(1)}
+                        <input
+                          type='range'
+                          min={0}
+                          max={1}
+                          step={0.1}
+                          value={memoryDraft.importance}
+                          onChange={event => setMemoryDraft(value => ({
+                            ...value,
+                            importance: Number(event.target.value),
+                          }))}
+                        />
+                      </label>
+                      <label className='flex items-center gap-2 text-sm font-medium'>
+                        <input
+                          type='checkbox'
+                          checked={memoryDraft.pinned}
+                          onChange={event => setMemoryDraft(value => ({
+                            ...value,
+                            pinned: event.target.checked,
+                          }))}
+                        />
+                        始终置顶召回
+                      </label>
+                      <label className='grid gap-1.5 text-sm font-medium'>
+                        人物预设
+                        <select
+                          value={jobDraft.personaId}
+                          onChange={event =>
+                            setJobDraft(value => ({ ...value, personaId: event.target.value }))}
+                          className='rounded-xl border border-default-200 bg-default-50 px-3 py-2.5'
+                        >
+                          <option value=''>运行时使用默认人物</option>
+                          {personas.filter(item => item.enabled).map(item => (
+                            <option key={item.id} value={item.id}>{item.name}</option>
+                          ))}
+                        </select>
+                      </label>
                       <label className='grid gap-1.5 text-sm font-medium md:col-span-2'>
                         运行 Prompt
                         <textarea
@@ -3952,6 +4134,7 @@ export default function AgentDashboard () {
           </div>
         </Panel>
       )}
+      {tab === 'customization' && <AgentCustomization />}
 
       {tab === 'tools' && (
         <Panel>
@@ -4029,12 +4212,25 @@ export default function AgentDashboard () {
                     <span className='rounded-full bg-default-100 px-2 py-1 text-xs'>
                       {String(item.risk || 'read')}
                     </span>
+                    <span className={`rounded-full px-2 py-1 text-xs ${
+                      item.isolation === 'legacy-inline'
+                        ? 'bg-warning-50 text-warning-700'
+                        : 'bg-success-50 text-success-700'
+                    }`}
+                    >
+                      {String(item.isolation || 'legacy-inline')}
+                    </span>
                   </div>
                 </summary>
                 <p className='mt-3 text-sm text-default-500'>{String(item.description || '')}</p>
                 <p className='mt-2 text-xs text-default-400'>
                   来源 {String(item.source || 'unknown')} · 权限 {String(item.permission || 'all')}
                 </p>
+                {item.isolation === 'legacy-inline' && (
+                  <p className='mt-2 rounded-lg bg-warning-50 px-3 py-2 text-xs text-warning-700'>
+                    此插件 Tool 在 Core 进程内执行；开启严格隔离模式后会被拒绝。
+                  </p>
+                )}
                 <div className='mt-3'>
                   <Action onClick={() => toggleTool(String(item.name || ''))}>
                     {agentConfig?.tools.disabled.includes(String(item.name || ''))
@@ -4278,6 +4474,19 @@ export default function AgentDashboard () {
                             className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                           />
                         </label>
+                        <label className='text-xs text-default-500'>
+                          Provider 协议
+                          <select
+                            value={provider.protocol || 'chat-completions'}
+                            onChange={event => updateProvider(provider.id, {
+                              protocol: event.target.value as 'chat-completions' | 'responses',
+                            })}
+                            className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                          >
+                            <option value='chat-completions'>Chat Completions</option>
+                            <option value='responses'>Responses</option>
+                          </select>
+                        </label>
                         <label className='flex items-center gap-2 self-end pb-2 text-xs text-danger'>
                           <input
                             type='checkbox'
@@ -4365,6 +4574,103 @@ export default function AgentDashboard () {
                       className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     />
                   </label>
+                </div>
+
+                <div className='grid gap-4 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
+                  <h3 className='md:col-span-2 font-semibold'>记忆召回与执行边界</h3>
+                  <label className='text-xs text-default-500'>最多注入记忆
+                    <input
+                      type='number' min={1} max={50}
+                      value={agentConfig.memory.retrieval.maxItems}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        memory: {
+                          ...agentConfig.memory,
+                          retrieval: { ...agentConfig.memory.retrieval, maxItems: Number(event.target.value) },
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>Prompt Token 预算
+                    <input
+                      type='number' min={128} max={16000}
+                      value={agentConfig.memory.retrieval.maxPromptTokens}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        memory: {
+                          ...agentConfig.memory,
+                          retrieval: { ...agentConfig.memory.retrieval, maxPromptTokens: Number(event.target.value) },
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>执行兼容模式
+                    <select
+                      value={agentConfig.execution.isolationMode}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          isolationMode: event.target.value as 'compat' | 'strict',
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    >
+                      <option value='compat'>兼容（允许 legacy inline）</option>
+                      <option value='strict'>严格（拒绝 legacy inline）</option>
+                    </select>
+                  </label>
+                  <label className='text-xs text-default-500'>最低隔离等级
+                    <select
+                      value={agentConfig.execution.minimumIsolation}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          minimumIsolation: event.target.value as 'none' | 'process' | 'os',
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    >
+                      <option value='none'>不强制</option>
+                      <option value='process'>进程隔离</option>
+                      <option value='os'>操作系统硬隔离</option>
+                    </select>
+                  </label>
+                  <label className='text-xs text-default-500'>单 Turn 时限（ms）
+                    <input
+                      type='number' min={1000} max={3600000}
+                      value={agentConfig.execution.maxTurnDurationMs}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          maxTurnDurationMs: Number(event.target.value),
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>单 Turn 模型调用上限
+                    <input
+                      type='number' min={1} max={200}
+                      value={agentConfig.execution.maxModelCalls}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          maxModelCalls: Number(event.target.value),
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <p className='md:col-span-2 text-xs text-default-500'>
+                    “进程隔离”不等于安全沙箱；选择操作系统硬隔离时，无可用后端将失败关闭。
+                    {status?.isolation?.reason ? ` 当前主机：${status.isolation.reason}` : ''}
+                  </p>
                 </div>
 
                 <div className='grid gap-4 rounded-2xl border border-default-200 p-4 md:grid-cols-2'>
