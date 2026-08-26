@@ -1,13 +1,16 @@
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/client/stdio'
 
-import type { AgentConfig, AgentMcpServerConfig } from '@/types/agent'
+import type { AgentConfig, AgentMcpServerConfig, AgentSandboxExecution } from '@/types/agent'
 import type { AgentToolRegistry } from '../tools/registry'
+import { agentSandbox, type AgentSandboxLaunch } from '../execution/sandbox'
 
 interface Connection {
   config: AgentMcpServerConfig
   client: Client
   tools: string[]
+  cleanup?: () => Promise<void>
+  sandbox?: AgentSandboxExecution
 }
 
 const expandEnv = (value: string) =>
@@ -92,15 +95,28 @@ export class AgentMcpClientManager {
       const configuredEnv = Object.fromEntries(
         Object.entries(config.env || {}).map(([key, value]) => [key, expandEnv(value)])
       )
-      await client.connect(
-        new StdioClientTransport({
-          command: expandEnv(config.command),
-          args: (config.args || []).map(expandEnv),
-          cwd: config.cwd ? expandEnv(config.cwd) : undefined,
-          env: { ...getDefaultEnvironment(), ...configuredEnv },
-          stderr: 'pipe',
-        })
-      )
+      const launch = await agentSandbox().prepare({
+        command: expandEnv(config.command),
+        args: (config.args || []).map(expandEnv),
+        cwd: config.cwd ? expandEnv(config.cwd) : process.cwd(),
+        env: { ...getDefaultEnvironment(), ...configuredEnv } as NodeJS.ProcessEnv,
+        sandbox: config.sandbox,
+      })
+      ;(client as Client & { __karinSandbox?: AgentSandboxLaunch }).__karinSandbox = launch
+      try {
+        await client.connect(
+          new StdioClientTransport({
+            command: launch.command,
+            args: launch.args,
+            cwd: launch.cwd,
+            env: launch.env as Record<string, string>,
+            stderr: 'pipe',
+          })
+        )
+      } catch (error) {
+        await launch.cleanup?.()
+        throw error
+      }
     } else {
       if (!config.url) throw new Error('HTTP MCP Server 缺少 url')
       const headers = Object.fromEntries(
@@ -129,7 +145,13 @@ export class AgentMcpClientManager {
           timeout: 30_000,
           idempotent: risk.idempotent,
           isolation: config.transport === 'stdio' ? 'mcp-stdio' : 'mcp-remote',
-          execute: async input => {
+          execute: async (input, context) => {
+            const launch = (client as Client & {
+              __karinSandbox?: AgentSandboxLaunch
+            }).__karinSandbox
+            if (launch && context.sandboxTrace) {
+              context.sandboxTrace.execution = launch.execution
+            }
             return client.callTool({
               name: remote.name,
               arguments: input,
@@ -142,7 +164,14 @@ export class AgentMcpClientManager {
       registered.push(name)
     }
 
-    this.connections.set(config.name, { config, client, tools: registered })
+    const launch = (client as Client & { __karinSandbox?: AgentSandboxLaunch }).__karinSandbox
+    this.connections.set(config.name, {
+      config,
+      client,
+      tools: registered,
+      cleanup: launch?.cleanup,
+      sandbox: launch?.execution,
+    })
     logger.info(`[agent][mcp] ${config.name} 已连接，发现 ${registered.length} 个工具`)
   }
 
@@ -160,7 +189,10 @@ export class AgentMcpClientManager {
 
   async close () {
     await Promise.allSettled(
-      [...this.connections.values()].map(connection => connection.client.close())
+      [...this.connections.values()].flatMap(connection => [
+        connection.client.close(),
+        connection.cleanup?.() || Promise.resolve(),
+      ])
     )
     this.connections.clear()
   }

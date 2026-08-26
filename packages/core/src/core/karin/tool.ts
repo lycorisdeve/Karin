@@ -1,9 +1,10 @@
 import { createFile, createPkg } from '@/plugin/tools'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import path from 'node:path'
 
 import type { AgentProcessToolOptions, AgentToolOptions } from '@/types/agent'
 import type { AgentTool } from '@/types/plugin'
+import { agentSandbox } from '@/agent/execution/sandbox'
 
 const TOOL_NAME = /^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/
 
@@ -56,8 +57,8 @@ export const tool = <
   ) => createAgentTool(options)
 
 /**
- * 注册使用 JSON stdin/stdout 协议的进程型 Tool。该边界隔离生命周期与环境变量，
- * 不等同于操作系统沙箱；实际隔离等级会在 Agent Tool 管理页展示。
+ * 注册使用 JSON stdin/stdout 协议的进程型 Tool。实际进程只能由 Core SandboxRunner
+ * 启动；Tool 声明只能缩小管理员配置允许的文件和网络权限。
  */
 export const processTool = <TInput extends Record<string, unknown> = Record<string, unknown>>(
   options: AgentProcessToolOptions<TInput>
@@ -73,10 +74,13 @@ export const processTool = <TInput extends Record<string, unknown> = Record<stri
   const cwd = options.process.cwd
     ? path.resolve(options.process.cwd)
     : process.cwd()
+  if (options.process.sandbox?.network === 'inherit' && options.risk !== 'external') {
+    throw new Error(`[agent][tool] ${options.name} 继承网络必须声明 external 风险`)
+  }
   return createAgentTool<TInput>({
     ...options,
     isolation: 'process-isolated',
-    execute: (input, context) => new Promise((resolve, reject) => {
+    execute: async (input, context) => {
       const environment = Object.fromEntries(
         (options.process.envAllowlist || [])
           .filter(key => /^[A-Z_][A-Z0-9_]*$/i.test(key) && process.env[key] !== undefined)
@@ -87,68 +91,85 @@ export const processTool = <TInput extends Record<string, unknown> = Record<stri
         PATH: process.env.PATH,
         SystemRoot: process.env.SystemRoot,
       } as unknown as NodeJS.ProcessEnv
-      const child = spawn(command, args, {
+      const runner = agentSandbox()
+      const current = runner.status()
+      const attemptedSandbox = {
+        backend: current.backend,
+        mode: current.mode,
+        network: options.process.sandbox?.network === 'inherit' ? 'inherit' as const : 'deny' as const,
+        hardIsolation: current.hardIsolation,
+        reason: current.reason,
+      }
+      if (context.sandboxTrace) context.sandboxTrace.execution = attemptedSandbox
+      const sandboxProcess = await runner.spawn({
+        command,
+        args,
         cwd,
         env: spawnEnvironment,
-        shell: false,
-        windowsHide: true,
+        sandbox: options.process.sandbox,
+      }, {
         detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'pipe'],
-      }) as ChildProcessWithoutNullStreams
-      const chunks: Buffer[] = []
-      const errors: Buffer[] = []
-      let bytes = 0
-      const terminateTree = () => {
-        if (!child.pid) return
-        if (process.platform === 'win32') {
-          const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-            shell: false,
-            windowsHide: true,
-            stdio: 'ignore',
-          })
-          killer.unref()
-          return
-        }
-        try {
-          process.kill(-child.pid, 'SIGKILL')
-        } catch {
-          child.kill('SIGKILL')
-        }
+      })
+      const { launch } = sandboxProcess
+      if (context.sandboxTrace) context.sandboxTrace.execution = launch.execution
+      context.sandbox = launch.execution
+      if (context.signal.aborted) {
+        await runner.terminate(sandboxProcess.child)
+        await launch.cleanup?.()
+        throw context.signal.reason || new Error(`进程 Tool ${options.name} 已中断`)
       }
-      const abort = () => terminateTree()
-      context.signal.addEventListener('abort', abort, { once: true })
-      child.stdout.on('data', (chunk: Buffer) => {
-        bytes += chunk.byteLength
-        if (bytes > 5 * 1024 * 1024) {
+      return new Promise((resolve, reject) => {
+        const child = sandboxProcess.child as ChildProcessWithoutNullStreams
+        const chunks: Buffer[] = []
+        const errors: Buffer[] = []
+        let bytes = 0
+        const terminateTree = () => {
+          runner.terminate(child).catch(() => undefined)
+        }
+        const abort = () => {
           terminateTree()
-          reject(new Error(`进程 Tool ${options.name} 输出超过 5 MiB`))
-          return
-        }
-        chunks.push(chunk)
-      })
-      child.stderr.on('data', (chunk: Buffer) => {
-        if (Buffer.concat(errors).byteLength < 8192) errors.push(chunk)
-      })
-      child.once('error', reject)
-      child.once('close', (code: number | null) => {
-        context.signal.removeEventListener('abort', abort)
-        if (context.signal.aborted) {
+          launch.cleanup?.().catch(() => undefined)
           reject(context.signal.reason || new Error(`进程 Tool ${options.name} 已中断`))
-          return
         }
-        if (code !== 0) {
-          reject(new Error(
-            `进程 Tool ${options.name} 退出码 ${code}: ${Buffer.concat(errors).toString('utf8').slice(0, 2048)}`
-          ))
-          return
-        }
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null'))
-        } catch (error) {
-          reject(new Error(`进程 Tool ${options.name} 未返回有效 JSON`, { cause: error }))
-        }
+        context.signal.addEventListener('abort', abort, { once: true })
+        child.stdout.on('data', (chunk: Buffer) => {
+          bytes += chunk.byteLength
+          if (bytes > 5 * 1024 * 1024) {
+            terminateTree()
+            reject(new Error(`进程 Tool ${options.name} 输出超过 5 MiB`))
+            return
+          }
+          chunks.push(chunk)
+        })
+        child.stderr.on('data', (chunk: Buffer) => {
+          if (Buffer.concat(errors).byteLength < 8192) errors.push(chunk)
+        })
+        child.once('error', error => {
+          launch.cleanup?.().catch(() => undefined)
+          reject(error)
+        })
+        child.once('close', (code: number | null) => {
+          context.signal.removeEventListener('abort', abort)
+          launch.cleanup?.().catch(() => undefined)
+          if (context.signal.aborted) {
+            reject(context.signal.reason || new Error(`进程 Tool ${options.name} 已中断`))
+            return
+          }
+          if (code !== 0) {
+            reject(new Error(
+              `进程 Tool ${options.name} 退出码 ${code}: ${Buffer.concat(errors).toString('utf8').slice(0, 2048)}`
+            ))
+            return
+          }
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null'))
+          } catch (error) {
+            reject(new Error(`进程 Tool ${options.name} 未返回有效 JSON`, { cause: error }))
+          }
+        })
+        child.stdin.end(JSON.stringify(input))
       })
-      child.stdin.end(JSON.stringify(input))
-    }),
+    },
   })
 }

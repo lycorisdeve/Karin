@@ -180,7 +180,7 @@ export class AgentGeneratedToolLibrary {
       requirements: ['Python 3'],
       availability: () => true,
       execute: (input, context) =>
-        this.runtime.execute(normalized, input, context.signal),
+        this.runtime.execute(normalized, input, context.signal, context),
     }, true, 'generated-sandbox')
     this.registered.add(tool.name)
   }

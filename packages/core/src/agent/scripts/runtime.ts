@@ -1,6 +1,5 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import Ajv from 'ajv'
 import { karinPathTemp } from '@/root'
@@ -8,7 +7,9 @@ import { karinPathTemp } from '@/root'
 import type {
   AgentConfig,
   AgentScriptToolDefinition,
+  AgentToolContext,
 } from '@/types/agent'
+import { agentSandbox } from '../execution/sandbox'
 
 const pythonWorker = String.raw`
 import ast
@@ -219,26 +220,40 @@ export class AgentPythonRuntime {
   constructor (private readonly getConfig: () => AgentConfig) {}
 
   private async probe (command: string, args: string[]) {
-    return new Promise<Interpreter | null>(resolve => {
-      const child = spawn(command, [...args, '--version'], {
-        windowsHide: true,
+    try {
+      const sandboxProcess = await agentSandbox().spawn({
+        command,
+        args: [...args, '--version'],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH || '' } as unknown as NodeJS.ProcessEnv,
+      }, {
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       })
-      let output = ''
-      const timer = setTimeout(() => child.kill(), 5000)
-      child.stdout.on('data', chunk => { output += String(chunk) })
-      child.stderr.on('data', chunk => { output += String(chunk) })
-      child.once('error', () => {
-        clearTimeout(timer)
-        resolve(null)
+      const { launch, child } = sandboxProcess
+      return await new Promise<Interpreter | null>(resolve => {
+        let output = ''
+        const timer = setTimeout(() => {
+          agentSandbox().terminate(child).catch(() => undefined)
+        }, 5000)
+        child.stdout!.on('data', chunk => { output += String(chunk) })
+        child.stderr!.on('data', chunk => { output += String(chunk) })
+        child.once('error', () => {
+          clearTimeout(timer)
+          launch.cleanup?.().catch(() => undefined)
+          resolve(null)
+        })
+        child.once('close', code => {
+          clearTimeout(timer)
+          launch.cleanup?.().catch(() => undefined)
+          resolve(code === 0
+            ? { command, args, version: output.trim() || 'Python' }
+            : null)
+        })
       })
-      child.once('close', code => {
-        clearTimeout(timer)
-        resolve(code === 0
-          ? { command, args, version: output.trim() || 'Python' }
-          : null)
-      })
-    })
+    } catch {
+      return null
+    }
   }
 
   private async interpreter () {
@@ -316,13 +331,14 @@ export class AgentPythonRuntime {
   async execute (
     definition: AgentScriptToolDefinition,
     payload: Record<string, unknown>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    context?: AgentToolContext
   ) {
     const normalized = await this.validate(definition, signal)
     let lastError: Error | undefined
     for (let attempt = 1; attempt <= normalized.failure.maxAttempts; attempt++) {
       try {
-        return await this.invoke(normalized, 'execute', payload, signal)
+        return await this.invoke(normalized, 'execute', payload, signal, context)
       } catch (error) {
         lastError = error as Error
         if (
@@ -348,7 +364,8 @@ export class AgentPythonRuntime {
     definition: AgentScriptToolDefinition,
     mode: 'validate' | 'execute',
     payload: unknown,
-    signal: AbortSignal
+    signal: AbortSignal,
+    context?: AgentToolContext
   ) {
     const interpreter = await this.interpreter()
     if (!interpreter) {
@@ -370,26 +387,48 @@ export class AgentPythonRuntime {
         },
         mode === 'validate' ? 15000 : definition.stop.timeoutMs,
         mode === 'validate' ? 16384 : definition.stop.maxOutputBytes,
-        signal
+        signal,
+        context
       )
     } finally {
       await fs.promises.rm(directory, { recursive: true, force: true })
     }
   }
 
-  private runProcess (
+  private async runProcess (
     interpreter: Interpreter,
     cwd: string,
     request: Record<string, unknown>,
     timeoutMs: number,
     maximumBytes: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    context?: AgentToolContext
   ) {
     if (signal.aborted) {
       return Promise.reject(
         signal.reason instanceof Error ? signal.reason : new Error('Script Tool 已取消')
       )
     }
+    const environment = {
+      PYTHONHASHSEED: '0',
+      PYTHONIOENCODING: 'utf-8',
+      PATH: process.env.PATH || '',
+      SYSTEMROOT: process.env.SYSTEMROOT || process.env.SystemRoot || '',
+      WINDIR: process.env.WINDIR || '',
+    } as unknown as NodeJS.ProcessEnv
+    const sandboxProcess = await agentSandbox().spawn({
+      command: interpreter.command,
+      args: [...interpreter.args, '-I', '-S', '-c', pythonWorker],
+      cwd,
+      env: environment,
+      sandbox: { writeRoots: [cwd], network: 'deny' },
+    }, {
+      detached: process.platform !== 'win32',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const { launch, child } = sandboxProcess
+    if (context?.sandboxTrace) context.sandboxTrace.execution = launch.execution
+    if (context) context.sandbox = launch.execution
     return new Promise<unknown>((resolve, reject) => {
       let settled = false
       let terminationError: Error | undefined
@@ -400,32 +439,19 @@ export class AgentPythonRuntime {
         settled = true
         clearTimeout(timer)
         signal.removeEventListener('abort', abort)
+        launch.cleanup?.().catch(() => undefined)
         if (error) reject(error)
         else resolve(result)
       }
       const terminate = (error: Error) => {
         if (settled || terminationError) return
         terminationError = error
-        if (!child.kill()) finish(error)
+        agentSandbox().terminate(child).then(terminated => {
+          if (!terminated) finish(error)
+        }).catch(() => finish(error))
       }
       const abort = () => terminate(
         signal.reason instanceof Error ? signal.reason : new Error('Script Tool 已取消')
-      )
-      const child = spawn(
-        interpreter.command,
-        [...interpreter.args, '-I', '-S', '-c', pythonWorker],
-        {
-          cwd,
-          windowsHide: true,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: {
-            PYTHONHASHSEED: '0',
-            PYTHONIOENCODING: 'utf-8',
-            PATH: process.env.PATH || '',
-            SYSTEMROOT: process.env.SYSTEMROOT || process.env.SystemRoot || '',
-            WINDIR: process.env.WINDIR || '',
-          } as unknown as NodeJS.ProcessEnv,
-        }
       )
       const timer = setTimeout(
         () => terminate(new Error(`Script Tool 执行超时（${timeoutMs}ms）`)),
@@ -433,13 +459,13 @@ export class AgentPythonRuntime {
       )
       signal.addEventListener('abort', abort, { once: true })
       child.once('error', error => finish(new Error('Python 子进程启动失败', { cause: error })))
-      child.stdout.on('data', chunk => {
+      child.stdout!.on('data', chunk => {
         stdout = Buffer.concat([stdout, Buffer.from(chunk)])
         if (stdout.byteLength > maximumBytes) {
           terminate(new Error(`Script Tool 输出超过 ${maximumBytes} bytes`))
         }
       })
-      child.stderr.on('data', chunk => {
+      child.stderr!.on('data', chunk => {
         stderr = Buffer.concat([stderr, Buffer.from(chunk)])
         if (stderr.byteLength > 16384) stderr = stderr.subarray(0, 16384)
       })
@@ -467,7 +493,7 @@ export class AgentPythonRuntime {
         }
         finish(undefined, response.result)
       })
-      child.stdin.end(JSON.stringify(request))
+      child.stdin!.end(JSON.stringify(request))
     })
   }
 }

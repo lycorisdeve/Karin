@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { OpenAICompatibleProvider } from '../../packages/core/src/agent/model/openai-compatible'
+import {
+  AgentProviderError,
+  OpenAICompatibleProvider,
+} from '../../packages/core/src/agent/model/openai-compatible'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -99,6 +102,32 @@ describe('OpenAI-compatible provider', () => {
       },
     ])
     expect(response.usage).toEqual({ inputTokens: 3, outputTokens: 4 })
+  })
+
+  it('labels malformed SSE data as a retryable stream failure', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('data: not-json\n\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      }))
+    )
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: 'http://localhost/v1',
+      apiKey: 'secret',
+      timeout: 1000,
+    })
+
+    const error = await provider.complete({
+      model: 'fake',
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [],
+    }).catch(error => error)
+
+    expect(error).toBeInstanceOf(AgentProviderError)
+    expect(error).toMatchObject({
+      code: 'RESPONSE_STREAM_DISCONNECTED',
+      transient: true,
+    })
   })
 
   it('never includes the API key in a successful result', async () => {

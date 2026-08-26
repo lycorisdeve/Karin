@@ -79,6 +79,16 @@
       "release-type": "node",
       "package-name": "karin-webui",
       "component": "web"
+    },
+    "packages/sandbox-win32-x64": {
+      "release-type": "node",
+      "package-name": "@karinjs/sandbox-win32-x64",
+      "component": "sandbox-win32-x64"
+    },
+    "packages/sandbox-win32-arm64": {
+      "release-type": "node",
+      "package-name": "@karinjs/sandbox-win32-arm64",
+      "component": "sandbox-win32-arm64"
     }
   },
   "commit-search-depth": 50

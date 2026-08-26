@@ -332,6 +332,8 @@ export class AgentToolRegistry {
     const startedAt = Date.now()
     const compiled = this.get(name)
     const idempotent = Boolean(compiled?.tool.idempotent)
+    const sandboxTrace = context.sandboxTrace || {}
+    context.sandboxTrace = sandboxTrace
     try {
       const data = await this.execute(name, input, context, maxOutputBytes)
       const object = data && typeof data === 'object' && !Array.isArray(data)
@@ -378,6 +380,7 @@ export class AgentToolRegistry {
           artifactId: typeof object.artifactId === 'string'
             ? object.artifactId
             : undefined,
+          sandbox: sandboxTrace.execution,
           delivery,
           media,
         },
@@ -398,6 +401,7 @@ export class AgentToolRegistry {
           startedAt,
           completedAt: Date.now(),
           idempotent,
+          sandbox: sandboxTrace.execution,
         },
         evidence: [],
       }

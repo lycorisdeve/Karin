@@ -60,6 +60,10 @@ export interface AgentModelMessage {
   name?: string
   toolCallId?: string
   toolCalls?: AgentToolCall[]
+  /** Core 内部稳定上下文标识；Provider 序列化时忽略。 */
+  contextId?: string
+  /** 禁止上下文压缩移除的恢复、审批或任务状态。 */
+  protected?: boolean
 }
 
 export interface AgentModelTool {
@@ -95,6 +99,20 @@ export interface AgentModelResponse {
     inputTokens?: number
     outputTokens?: number
   }
+}
+
+export interface ContextCheckpointV1 {
+  version: 1
+  goal: string
+  constraints: string[]
+  decisions: string[]
+  evidence: string[]
+  completedActions: Array<{ action: string; receipt: string }>
+  pendingTasks: string[]
+  artifacts: string[]
+  failures: string[]
+  unresolvedQuestions: string[]
+  legacySummary: string
 }
 
 export interface AgentModelProvider {
@@ -138,6 +156,27 @@ export interface AgentToolContext {
   allowedTools?: string[]
   /** 当前模型调用实际暴露的 Tool 名称。 */
   callableTools?: string[]
+  /** 由本地执行器回填实际沙箱结果，供 Receipt 审计。 */
+  sandbox?: AgentSandboxExecution
+  /** Core 内部共享追踪对象，跨 Tool context 克隆传递实际执行结果。 */
+  sandboxTrace?: { execution?: AgentSandboxExecution }
+}
+
+export type AgentSandboxNetwork = 'deny' | 'inherit'
+export type AgentSandboxBackend = 'none' | 'bwrap' | 'seatbelt' | 'windows'
+
+export interface AgentSandboxRequest {
+  readRoots?: string[]
+  writeRoots?: string[]
+  network?: AgentSandboxNetwork
+}
+
+export interface AgentSandboxExecution {
+  backend: AgentSandboxBackend
+  mode: 'hard' | 'fallback' | 'off'
+  network: AgentSandboxNetwork
+  hardIsolation: boolean
+  reason?: string
 }
 
 export interface AgentToolOptions<
@@ -186,6 +225,7 @@ export interface AgentProcessToolOptions<
     args?: string[]
     cwd?: string
     envAllowlist?: string[]
+    sandbox?: AgentSandboxRequest
   }
 }
 
@@ -300,6 +340,7 @@ export interface AgentMcpServerConfig {
   url?: string
   headers?: Record<string, string>
   env?: Record<string, string>
+  sandbox?: AgentSandboxRequest
 }
 
 export type AgentEvolutionTarget =
@@ -406,6 +447,8 @@ export interface AgentToolReceipt {
   idempotent: boolean
   restartSafe?: boolean
   artifactId?: string
+  /** 声明的 isolation 之外，本次执行实际采用的动态沙箱结果。 */
+  sandbox?: AgentSandboxExecution
   delivery?: {
     completed: boolean
     channel?: string
@@ -610,7 +653,7 @@ export interface AgentPersonaVersion {
 }
 
 export interface AgentConfig {
-  version: 10
+  version: 11
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: {
@@ -634,6 +677,8 @@ export interface AgentConfig {
     hardLimitRatio: number
     protectedRecentMessages: number
     summaryTargetTokens: number
+    semanticCompaction: boolean
+    reservedOutputTokens: number
   }
   journal: {
     recoveryAttempts: number
@@ -667,6 +712,13 @@ export interface AgentConfig {
     hookTimeoutMs: number
     maxModelCalls: number
     maxTurnDurationMs: number
+    sandbox: {
+      mode: 'auto' | 'off'
+      backend: 'auto' | Exclude<AgentSandboxBackend, 'none'>
+      readRoots: string[]
+      writeRoots: string[]
+      networkDefault: 'deny'
+    }
   }
   recovery: AgentRecoveryConfig
   tools: {
@@ -742,6 +794,27 @@ export interface AgentActivityView {
   durationMs?: number
 }
 
+export type AgentErrorCode =
+  | 'CONTEXT_WINDOW_EXCEEDED'
+  | 'USAGE_LIMIT_EXCEEDED'
+  | 'HTTP_CONNECTION_FAILED'
+  | 'RESPONSE_STREAM_CONNECTION_FAILED'
+  | 'RESPONSE_STREAM_DISCONNECTED'
+  | 'RESPONSE_TOO_MANY_FAILED_ATTEMPTS'
+  | 'BAD_REQUEST'
+  | 'UNAUTHORIZED'
+  | 'MODEL_TIMEOUT'
+  | 'RUNTIME_LIMIT_EXCEEDED'
+  | 'INTERRUPTED'
+  | 'OTHER'
+
+export interface AgentErrorInfo {
+  code: AgentErrorCode
+  source: 'provider' | 'runtime'
+  retryable: boolean
+  httpStatusCode?: number
+}
+
 export interface AgentTurnResult {
   threadId: string
   turnId: string
@@ -749,6 +822,7 @@ export interface AgentTurnResult {
   content: string
   finalMessageId?: string
   approvalId?: string
+  errorInfo?: AgentErrorInfo
 }
 
 export type AgentDeliveryState =
@@ -807,6 +881,7 @@ export interface AgentStreamEvent {
     | 'capability.missing'
     | 'verification.completed'
     | 'execution.budget'
+    | 'context.compacted'
     | 'recovery.started'
     | 'recovery.completed'
     | 'repair.candidate'

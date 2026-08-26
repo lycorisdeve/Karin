@@ -5,6 +5,7 @@ import { Router } from 'express'
 import { getAgentServices, getAgentStatus, restartAgent } from '@/agent'
 import { AgentPythonRuntime } from '@/agent/scripts/runtime'
 import { probeAgentIsolationBackends } from '@/agent/execution/isolation'
+import { agentSandbox } from '@/agent/execution/sandbox'
 import { isManagedAgentMediaPath } from '@/agent/persistence/media'
 import {
   agentConfig,
@@ -179,6 +180,13 @@ agentRouter.get(
       isolation: probeAgentIsolationBackends(),
       scriptRuntime: await scriptRuntime.status(),
     })
+  })
+)
+
+agentRouter.post(
+  '/sandbox/doctor',
+  safe(async (_req, res) => {
+    createSuccessResponse(res, await agentSandbox().doctor())
   })
 )
 
@@ -977,20 +985,24 @@ agentRouter.get(
     res.setHeader('Connection', 'keep-alive')
     res.flushHeaders()
 
+    let closed = false
     const send = (event: AgentStreamEvent, replayed = false) => {
+      if (closed) return
       const safeEvent = redactValue(event) as AgentStreamEvent
       res.write(`id: ${event.id}\n`)
       res.write(`event: ${event.type}\n`)
       res.write(`data: ${JSON.stringify({ ...safeEvent, replayed })}\n\n`)
     }
     const threadId = String(req.params.id)
-    for (const event of await agent.events.replay(threadId, afterId)) send(event, true)
-    const unsubscribe = agent.events.subscribe(threadId, send)
+    let unsubscribe = () => {}
     const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000)
     req.once('close', () => {
+      closed = true
       clearInterval(heartbeat)
       unsubscribe()
     })
+    unsubscribe = await agent.events.subscribeFrom(threadId, afterId, send)
+    if (closed) unsubscribe()
   })
 )
 

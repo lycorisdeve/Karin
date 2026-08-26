@@ -38,6 +38,7 @@ export default defineConfig({
     root: 'src/root.ts',
     'start/index': 'src/start/index.ts',
     'start/app': 'src/start/app.ts',
+    'agent/execution/sandbox': 'src/agent/execution/sandbox.ts',
     ...moduleEntries,
   },
   format: ['esm'],

@@ -45,7 +45,7 @@ const database = async () => {
 }
 
 describe('Agent Harness v10', () => {
-  it('keeps legacy memory data while bootstrapping database schema v14 fields', async () => {
+  it('keeps legacy data while bootstrapping database schema v15 fields', async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'karin-harness-v14-migration-'))
     directories.push(directory)
     const first = new AgentDatabase(directory)
@@ -59,6 +59,16 @@ describe('Agent Harness v10', () => {
        VALUES(?, ?, ?, ?, ?, 1, ?)`,
       ['legacy-memory', 'user', actor.id, '旧版本记忆', 'legacy-turn', 1234]
     )
+    await raw.run('DROP TABLE agent_context_compaction_leases', [])
+    await raw.run('ALTER TABLE agent_context_summaries DROP COLUMN source_count', [])
+    await raw.run(
+      'ALTER TABLE agent_context_summaries DROP COLUMN covered_through_message_id',
+      []
+    )
+    await raw.run('ALTER TABLE agent_context_summaries DROP COLUMN checkpoint_json', [])
+    await raw.run('ALTER TABLE agent_context_summaries DROP COLUMN format', [])
+    await raw.run('ALTER TABLE usage DROP COLUMN purpose', [])
+    await raw.run('DELETE FROM schema_migrations WHERE version = 15', [])
     await first.close()
 
     const migrated = new AgentDatabase(directory)
@@ -74,6 +84,18 @@ describe('Agent Harness v10', () => {
       const versions = await (migrated as unknown as typeof raw)
         .all<{ version: number }>('SELECT version FROM schema_migrations')
       expect(versions.some(item => item.version === 14)).toBe(true)
+      expect(versions.some(item => item.version === 15)).toBe(true)
+      const summaryColumns = await (migrated as unknown as typeof raw)
+        .all<{ name: string }>('PRAGMA table_info(agent_context_summaries)')
+      expect(summaryColumns.map(item => item.name)).toEqual(expect.arrayContaining([
+        'format',
+        'checkpoint_json',
+        'covered_through_message_id',
+        'source_count',
+      ]))
+      const usageColumns = await (migrated as unknown as typeof raw)
+        .all<{ name: string }>('PRAGMA table_info(usage)')
+      expect(usageColumns.map(item => item.name)).toContain('purpose')
     } finally {
       await migrated.close()
     }

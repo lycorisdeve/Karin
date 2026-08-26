@@ -207,6 +207,13 @@ importers:
       cross-env:
         specifier: ^7.0.3
         version: 7.0.3
+    optionalDependencies:
+      '@karinjs/sandbox-win32-arm64':
+        specifier: workspace:*
+        version: link:../sandbox-win32-arm64
+      '@karinjs/sandbox-win32-x64':
+        specifier: workspace:*
+        version: link:../sandbox-win32-x64
 
   packages/create-karin:
     dependencies:
@@ -262,6 +269,10 @@ importers:
       node-karin:
         specifier: workspace:*
         version: link:../core
+
+  packages/sandbox-win32-arm64: {}
+
+  packages/sandbox-win32-x64: {}
 
   packages/test:
     dependencies:

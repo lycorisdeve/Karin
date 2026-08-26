@@ -66,6 +66,7 @@ blob-report/
 .vite/
 .turbo/
 .nx/
+packages/sandbox-win32-*/target/
 .eslintcache
 .stylelintcache
 *.tsbuildinfo

@@ -8,6 +8,7 @@ import type {
   AgentToolCall,
   AgentProviderProtocol,
   AgentProviderCapabilities,
+  AgentErrorCode,
 } from '@/types/agent'
 
 export interface OpenAICompatibleOptions {
@@ -21,9 +22,11 @@ export class AgentProviderError extends Error {
   constructor (
     message: string,
     readonly status?: number,
-    readonly transient = false
+    readonly transient = false,
+    readonly code?: AgentErrorCode
   ) {
     super(message)
+    this.name = 'AgentProviderError'
   }
 }
 
@@ -260,7 +263,14 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
       return normalizeResponse(await response.json(), toolNames.decode)
     }
 
-    if (!response.body) throw new Error('[agent][model] SSE 响应缺少 body')
+    if (!response.body) {
+      throw new AgentProviderError(
+        '[agent][model] SSE 响应缺少 body',
+        undefined,
+        true,
+        'RESPONSE_STREAM_CONNECTION_FAILED'
+      )
+    }
     return this.readStream(response.body, toolNames.decode, onDelta)
   }
 
@@ -316,7 +326,14 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
     if (!response.headers.get('content-type')?.includes('text/event-stream')) {
       return this.normalizeResponses(await response.json(), toolNames.decode)
     }
-    if (!response.body) throw new Error('[agent][model] Responses SSE 缺少 body')
+    if (!response.body) {
+      throw new AgentProviderError(
+        '[agent][model] Responses SSE 缺少 body',
+        undefined,
+        true,
+        'RESPONSE_STREAM_CONNECTION_FAILED'
+      )
+    }
     return this.readResponsesStream(response.body, toolNames.decode, onDelta)
   }
 
@@ -359,7 +376,17 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
         if (!line.startsWith('data:')) continue
         const payload = line.slice(5).trim()
         if (!payload || payload === '[DONE]') continue
-        const event = JSON.parse(payload)
+        let event: any
+        try {
+          event = JSON.parse(payload)
+        } catch {
+          throw new AgentProviderError(
+            '[agent][model] 收到无法解析的 Responses SSE 数据',
+            undefined,
+            true,
+            'RESPONSE_STREAM_DISCONNECTED'
+          )
+        }
         if (event.type === 'response.output_text.delta') {
           const delta = String(event.delta || '')
           content += delta
@@ -435,7 +462,12 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
         try {
           data = JSON.parse(payload)
         } catch {
-          throw new Error('[agent][model] 收到无法解析的 SSE 数据')
+          throw new AgentProviderError(
+            '[agent][model] 收到无法解析的 SSE 数据',
+            undefined,
+            true,
+            'RESPONSE_STREAM_DISCONNECTED'
+          )
         }
 
         if (data.usage) {

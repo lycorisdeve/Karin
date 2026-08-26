@@ -8,6 +8,7 @@ import { start } from './start'
 import { updateAll } from './update'
 import { buildDep } from './build-dep'
 import { program } from 'commander'
+import { sandboxDoctor, sandboxSetup } from './agent-sandbox'
 
 /** 讨厌的报错 */
 if (!process.argv?.[2]) process.argv.push('-h')
@@ -37,6 +38,11 @@ program.command('rs')
   .action((options) => pm2.restart(options.force))
 
 program.command('log').description('查看日志').action(pm2.log)
+
+const agent = program.command('agent').description('Karin Agent 管理')
+const sandbox = agent.command('sandbox').description('Agent 本地执行沙箱')
+sandbox.command('doctor').description('验证越界写、断网和进程树隔离').action(sandboxDoctor)
+sandbox.command('setup').description('验证 Windows Sandbox Helper 安装与签名').action(sandboxSetup)
 
 program.command('up')
   .description('更新插件')

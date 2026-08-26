@@ -103,6 +103,11 @@ const normalizeContext = (
       512,
       Math.min(Number(value?.summaryTargetTokens) || 4096, 32768)
     ),
+    semanticCompaction: value?.semanticCompaction !== false,
+    reservedOutputTokens: Math.max(
+      256,
+      Math.min(Number(value?.reservedOutputTokens) || 4096, 131072)
+    ),
   }
 }
 
@@ -152,24 +157,40 @@ const normalizeMemory = (
 const normalizeExecution = (
   value?: Partial<AgentConfig['execution']>,
   legacyLimits?: Record<string, unknown>
-): AgentConfig['execution'] => ({
-  isolationMode: value?.isolationMode === 'strict' ? 'strict' : 'compat',
-  minimumIsolation: ['process', 'os'].includes(String(value?.minimumIsolation))
-    ? value!.minimumIsolation as 'process' | 'os'
-    : 'none',
-  hookTimeoutMs: Math.max(100, Math.min(Number(value?.hookTimeoutMs) || 5000, 60_000)),
-  maxModelCalls: Math.max(
-    1,
-    Math.min(Number(value?.maxModelCalls ?? legacyLimits?.maxModelCalls) || 40, 200)
-  ),
-  maxTurnDurationMs: Math.max(
-    10_000,
-    Math.min(
-      Number(value?.maxTurnDurationMs ?? legacyLimits?.maxTurnDurationMs) || 300_000,
-      3_600_000
-    )
-  ),
-})
+): AgentConfig['execution'] => {
+  const sandbox = value?.sandbox
+  const backend = ['bwrap', 'seatbelt', 'windows'].includes(String(sandbox?.backend))
+    ? sandbox!.backend as 'bwrap' | 'seatbelt' | 'windows'
+    : 'auto'
+  const roots = (items?: string[]) => [...new Set((items || [])
+    .map(root => String(root).trim())
+    .filter(root => path.isAbsolute(root)))]
+  return {
+    isolationMode: value?.isolationMode === 'strict' ? 'strict' : 'compat',
+    minimumIsolation: ['process', 'os'].includes(String(value?.minimumIsolation))
+      ? value!.minimumIsolation as 'process' | 'os'
+      : 'none',
+    hookTimeoutMs: Math.max(100, Math.min(Number(value?.hookTimeoutMs) || 5000, 60_000)),
+    maxModelCalls: Math.max(
+      1,
+      Math.min(Number(value?.maxModelCalls ?? legacyLimits?.maxModelCalls) || 40, 200)
+    ),
+    maxTurnDurationMs: Math.max(
+      10_000,
+      Math.min(
+        Number(value?.maxTurnDurationMs ?? legacyLimits?.maxTurnDurationMs) || 300_000,
+        3_600_000
+      )
+    ),
+    sandbox: {
+      mode: sandbox?.mode === 'off' ? 'off' : 'auto',
+      backend,
+      readRoots: roots(sandbox?.readRoots).slice(0, 64),
+      writeRoots: roots(sandbox?.writeRoots).slice(0, 64),
+      networkDefault: 'deny',
+    },
+  }
+}
 
 const normalizeScriptRuntime = (
   value?: Partial<AgentConfig['scriptRuntime']>
@@ -353,7 +374,7 @@ export const migrateAgentConfig = (
       : unique[0]?.id || ''
     return {
       ...(value as AgentConfig),
-      version: 10,
+      version: 11,
       providers: unique,
       routing: {
         primary,
@@ -404,7 +425,7 @@ export const migrateAgentConfig = (
       AgentConfig,
       'version' | 'providers' | 'routing' | 'learning' | 'memory' | 'execution'
     >),
-    version: 10,
+    version: 11,
     providers: [profile],
     routing: { primary: profile.id, fallback: [] },
     limits: normalizeLimits(legacy.limits),
@@ -426,7 +447,7 @@ const initAgent = (dir: string) => {
   configFile = path.join(dir, name)
   const stored = requireFileSync<AgentConfig | LegacyAgentConfig>(configFile, { type: 'json' })
   cache = migrateAgentConfig(stored)
-  if (Number((stored as Partial<AgentConfig>).version) !== 10 || !('memory' in stored)) {
+  if (Number((stored as Partial<AgentConfig>).version) !== 11 || !('memory' in stored)) {
     const temporary = `${configFile}.migration.tmp`
     fs.writeFileSync(temporary, JSON.stringify(cache, null, 2), 'utf8')
     fs.renameSync(temporary, configFile)
@@ -495,7 +516,7 @@ export const mergeAgentConfig = (
   return migrateAgentConfig({
     ...current,
     ...update,
-    version: 10,
+    version: 11,
     providers,
     routing: update.routing || current.routing,
   } as AgentConfig)

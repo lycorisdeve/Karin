@@ -66,7 +66,7 @@ export const defaultConfig: {
     email: [],
   },
   agent: {
-    version: 10,
+    version: 11,
     enabled: false,
     providers: [
       {
@@ -102,6 +102,8 @@ export const defaultConfig: {
       hardLimitRatio: 0.85,
       protectedRecentMessages: 12,
       summaryTargetTokens: 4096,
+      semanticCompaction: true,
+      reservedOutputTokens: 4096,
     },
     journal: {
       recoveryAttempts: 2,
@@ -165,6 +167,13 @@ export const defaultConfig: {
       hookTimeoutMs: 5000,
       maxModelCalls: 40,
       maxTurnDurationMs: 300000,
+      sandbox: {
+        mode: 'auto',
+        backend: 'auto',
+        readRoots: [],
+        writeRoots: [],
+        networkDefault: 'deny',
+      },
     },
     recovery: {
       enabled: true,

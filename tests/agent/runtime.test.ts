@@ -8,11 +8,13 @@ import { AgentPolicy } from '../../packages/core/src/agent/policy/policy'
 import { AgentRuntime } from '../../packages/core/src/agent/runtime/runtime'
 import { AgentToolRegistry } from '../../packages/core/src/agent/tools/registry'
 import { getAgentTriggerContent } from '../../packages/core/src/agent/ingress/message'
+import { AgentProviderError } from '../../packages/core/src/agent/model/openai-compatible'
 
 import type {
   AgentActor,
   AgentConfig,
   AgentModelProvider,
+  AgentStreamEvent,
   AgentToolContext,
 } from '../../packages/core/src/types/agent'
 import type { Message } from '../../packages/core/src/types/event'
@@ -125,6 +127,57 @@ const learning = {
 } as unknown as AgentLearning
 
 describe('Agent runtime', () => {
+  it('returns and persists structured Provider failures without exposing credentials', async () => {
+    const db = await database()
+    const registry = new AgentToolRegistry()
+    const runtimeConfig = config()
+    runtimeConfig.recovery.maxCycles = 0
+    const provider: AgentModelProvider = {
+      name: 'fake',
+      async complete () {
+        throw new AgentProviderError(
+          '[agent][model] 请求失败 429: {"api_key":"sk-sensitive-value"}',
+          429,
+          true
+        )
+      },
+    }
+    const runtime = new AgentRuntime(
+      db,
+      registry,
+      new AgentPolicy(() => runtimeConfig),
+      provider,
+      learning,
+      () => runtimeConfig
+    )
+    const events: AgentStreamEvent[] = []
+
+    const result = await runtime.runTurn({
+      threadKey: 'structured-provider-error',
+      actor,
+      content: '触发 Provider 错误',
+      onEvent: event => events.push(event),
+    })
+
+    expect(result.state).toBe('failed')
+    expect(result.errorInfo).toEqual({
+      code: 'USAGE_LIMIT_EXCEEDED',
+      source: 'provider',
+      retryable: true,
+      httpStatusCode: 429,
+    })
+    expect(result.content).not.toContain('sk-sensitive-value')
+    expect(events.find(event => event.type === 'turn.failed')?.data).toEqual(
+      expect.objectContaining({ errorInfo: result.errorInfo })
+    )
+    const persisted = await db.listTurnEvents(result.threadId)
+    expect(persisted.find(event => event.type === 'turn.failed')?.data).toEqual(
+      expect.objectContaining({ errorInfo: result.errorInfo })
+    )
+    expect(JSON.stringify(persisted)).not.toContain('sk-sensitive-value')
+    await db.close()
+  })
+
   it('keeps a Web news request interactive while building its verification plan', async () => {
     const db = await database()
     const registry = new AgentToolRegistry()

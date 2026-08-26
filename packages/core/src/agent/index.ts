@@ -28,6 +28,7 @@ import type { AgentEvolutionPipeline } from './evolution'
 import { restartDirect } from '@/utils/system/restart'
 import { AgentInstructionStore } from './prompt/instructions'
 import { configureAgentHookTimeout } from '@/hooks/agent'
+import { configureAgentSandbox } from './execution/sandbox'
 
 export interface AgentServices {
   database: AgentDatabase
@@ -121,6 +122,14 @@ export const initAgent = async () => {
 
     const config = agentConfig()
     configureAgentHookTimeout(config.execution.hookTimeoutMs)
+    const sandbox = configureAgentSandbox(agentConfig)
+    const sandboxStatus = await sandbox.doctor()
+    if (!sandboxStatus.hardIsolation && config.execution.minimumIsolation === 'os') {
+      throw new Error(sandboxStatus.reason || 'Agent 要求操作系统级隔离，但 Sandbox doctor 未通过')
+    }
+    if (!sandboxStatus.hardIsolation && config.execution.sandbox.mode === 'auto') {
+      logger.warn(`[agent][sandbox] ${sandboxStatus.reason || '硬隔离不可用，已兼容降级'}`)
+    }
     await database.pruneTurnEvents(config.journal?.eventRetentionDays ?? 7)
     const provider = new AgentProviderRegistry(agentConfig)
     services.providers = provider

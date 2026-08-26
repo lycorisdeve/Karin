@@ -4,6 +4,7 @@ import type {
   AgentToolResultEnvelope,
 } from '@/types/agent'
 import type { AgentToolRegistry } from '../tools/registry'
+import { agentSandboxStatus } from './sandbox'
 
 export class AgentExecutionGateway {
   constructor (
@@ -23,6 +24,18 @@ export class AgentExecutionGateway {
         startedAt: now,
         completedAt: now,
         idempotent: false,
+        sandbox: (() => {
+          const status = agentSandboxStatus()
+          return status
+            ? {
+              backend: status.backend,
+              mode: status.mode,
+              network: status.network,
+              hardIsolation: status.hardIsolation,
+              reason: status.reason,
+            }
+            : undefined
+        })(),
       },
       evidence: [],
     }
@@ -48,7 +61,8 @@ export class AgentExecutionGateway {
     }
     if (
       config.minimumIsolation === 'os' &&
-      !['core-inline', 'mcp-remote'].includes(isolation)
+      !['core-inline', 'mcp-remote'].includes(isolation) &&
+      !agentSandboxStatus()?.hardIsolation
     ) {
       return this.denial(name, `Tool ${name} 没有可用的操作系统级隔离后端`)
     }

@@ -11,8 +11,10 @@ import type {
   AgentDeliveryReceipt,
   AgentDelegateBatchResult,
   AgentDelegateBatchTask,
+  AgentErrorInfo,
   AgentModelMessage,
   AgentModelProvider,
+  AgentModelResponse,
   AgentStreamEvent,
   AgentTaskPlan,
   AgentTaskList,
@@ -37,6 +39,7 @@ import { AgentEvolutionPipeline } from '../evolution'
 import { AgentContextEngine } from '../context/engine'
 import { AgentMessageLifecycle } from '../delivery/lifecycle'
 import { AgentRunJournal } from './journal'
+import { normalizeAgentError } from './errors'
 import {
   AgentTurnRecovery,
   type AgentVerificationResult,
@@ -69,6 +72,10 @@ interface ExecutionState {
   superseded: boolean
   loadedSkillTools: Set<string>
   currentCallableTools: string[]
+  legacySummary: string
+  contextWindowTokens?: number
+  calibrationKey: string
+  contextRetryUsed: boolean
   finishPromise?: Promise<AgentTurnResult>
   removeParentAbortListener?: () => void
 }
@@ -210,6 +217,11 @@ export class AgentRuntime {
           : `Karin 重启后无法确认以下操作是否已执行：${item.unsafeTools.join('、')}。` +
             '为避免重复副作用，系统没有自动重放，请人工核对后继续。',
         error: item.safe ? '由恢复 Turn 接管' : '存在未知的非幂等副作用',
+        errorInfo: {
+          code: item.safe ? 'INTERRUPTED' : 'OTHER',
+          source: 'runtime',
+          retryable: item.safe,
+        },
         publishFinal: !item.safe,
       })
       this.events.broadcast(oldFinal.event)
@@ -770,18 +782,20 @@ export class AgentRuntime {
       hookContext,
     })
     const messages: AgentModelMessage[] = [
-      { role: 'system', content: system },
+      { role: 'system', content: system, protected: true },
       ...modelHistory.map(message => ({
         role: message.role,
         content: message.content,
         name: message.name,
         toolCallId: message.toolCallId,
         toolCalls: message.toolCalls.length ? message.toolCalls : undefined,
+        contextId: message.id,
       })),
     ]
     if (input.resume) {
       messages.splice(1, 0, {
         role: 'system',
+        protected: true,
         content: [
           '本轮从用户补充消息中恢复；必须合并原任务与补充内容。',
           `原始目标：${input.resume.rootContent}`,
@@ -856,6 +870,10 @@ export class AgentRuntime {
       superseded: false,
       loadedSkillTools: new Set(),
       currentCallableTools: [],
+      legacySummary: summary,
+      contextWindowTokens: selectedProvider?.contextWindowTokens,
+      calibrationKey,
+      contextRetryUsed: false,
       removeParentAbortListener,
     }
     this.activeTurns.set(turnId, state)
@@ -903,6 +921,7 @@ export class AgentRuntime {
     state.plan = planResult.plan
     state.messages.splice(1, 0, {
       role: 'system',
+      protected: true,
       content: [
         '本轮确定性完成条件（这是可见的验证契约，不是隐藏任务计划）：',
         ...state.plan.goals.flatMap(goal => [
@@ -1012,7 +1031,7 @@ export class AgentRuntime {
             return this.finish(state, 'failed', content, content)
           }
           if (budget.warning) {
-            state.messages.push({ role: 'system', content: budget.warning })
+            state.messages.push({ role: 'system', content: budget.warning, protected: true })
             await this.emit(state, 'execution.budget', {
               status: 'warning',
               ...budget,
@@ -1030,19 +1049,104 @@ export class AgentRuntime {
               ['delivery', 'media', 'tool'].includes(postcondition.kind)
             )
           )
-          state.modelCalls++
           const callableTools = budget.remaining > 0 ? this.availableTools(state) : []
           state.currentCallableTools = callableTools.map(tool => tool.name)
+          const modelTools = callableTools.map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+          }))
+          const preparedRequest = await this.contextEngine.prepareRequest({
+            threadId: state.thread.id,
+            messages: state.messages,
+            tools: modelTools,
+            legacySummary: state.legacySummary,
+            contextWindowTokens: state.contextWindowTokens,
+            calibrationKey: state.calibrationKey,
+            summarize: async (cold, schema) => {
+              if (state.modelCalls >= maxModelCalls) {
+                throw new Error('上下文压缩模型调用超过本轮模型调用上限')
+              }
+              state.modelCalls++
+              const compactionStartedAt = Date.now()
+              let compacted: AgentModelResponse
+              try {
+                compacted = await this.provider.complete({
+                  providerId: state.thread.modelProviderId || undefined,
+                  model: state.thread.modelName || '',
+                  messages: [{
+                    role: 'system',
+                    content: [
+                      '把下面冷历史压缩为 ContextCheckpointV1。',
+                      '保留目标、约束、决定与证据、已完成操作及回执、待办、产物、失败和未决问题。',
+                      '不要添加历史中不存在的事实。只返回符合 Schema 的 JSON。',
+                    ].join('\n'),
+                  }, ...cold],
+                  tools: [],
+                  responseSchema: {
+                    name: 'context_checkpoint_v1',
+                    schema,
+                    strict: true,
+                  },
+                  signal: state.controller.signal,
+                })
+              } catch (error) {
+                await this.database.addUsage(
+                  state.thread.id,
+                  state.turnId,
+                  this.provider.name,
+                  state.thread.modelName || '',
+                  undefined,
+                  undefined,
+                  {
+                    latencyMs: Date.now() - compactionStartedAt,
+                    purpose: 'compaction',
+                  }
+                )
+                throw error
+              }
+              await this.database.addUsage(
+                state.thread.id,
+                state.turnId,
+                compacted.provider || this.provider.name,
+                compacted.model || '',
+                compacted.usage?.inputTokens,
+                compacted.usage?.outputTokens,
+                {
+                  retries: compacted.retries,
+                  fallbackFrom: compacted.fallbackFrom,
+                  retryReasons: compacted.retryReasons,
+                  latencyMs: compacted.latencyMs,
+                  purpose: 'compaction',
+                }
+              )
+              const json = compacted.content.trim()
+                .replace(/^```(?:json)?\s*/i, '')
+                .replace(/\s*```$/, '')
+              return JSON.parse(json)
+            },
+          })
+          state.messages = preparedRequest.messages
+          if (preparedRequest.compacted) {
+            state.legacySummary = preparedRequest.checkpoint
+              ? preparedRequest.checkpoint.legacySummary
+              : state.legacySummary
+            await this.emit(state, 'context.compacted', {
+              strategy: preparedRequest.strategy,
+              budget: preparedRequest.budget,
+            })
+          }
+          if (state.modelCalls >= maxModelCalls) {
+            const content = `执行已达到最大 ${maxModelCalls} 次模型调用，已安全停止。`
+            return this.finish(state, 'failed', content, content)
+          }
+          state.modelCalls++
           const response = await this.provider.complete(
             {
               providerId: state.thread.modelProviderId || undefined,
               model: state.thread.modelName || '',
               messages: state.messages,
-              tools: callableTools.map(tool => ({
-                name: tool.name,
-                description: tool.description,
-                inputSchema: tool.inputSchema,
-              })),
+              tools: modelTools,
               toolChoice: state.needsTaskPlan && !state.tasks ? 'required' : undefined,
               signal: state.controller.signal,
             },
@@ -1071,6 +1175,7 @@ export class AgentRuntime {
               fallbackFrom: response.fallbackFrom,
               retryReasons: response.retryReasons,
               latencyMs: response.latencyMs,
+              purpose: 'turn',
             }
           )
           this.contextEngine.observeUsage(
@@ -1090,11 +1195,18 @@ export class AgentRuntime {
             )
             : null
           state.latestAssistant = response.content
-          state.messages.push({
+          const assistantMessage: AgentModelMessage = {
             role: 'assistant',
             content: response.content,
             toolCalls: response.toolCalls.length ? response.toolCalls : undefined,
-          })
+            protected: response.toolCalls.some(call => {
+              try {
+                return this.registry.get(call.name)?.tool.idempotent !== true
+              } catch {
+                return true
+              }
+            }),
+          }
           const assistantMedia = preVerification?.completed &&
             !state.input.automated &&
             (
@@ -1114,7 +1226,7 @@ export class AgentRuntime {
               assistantMedia
             )
             : []
-          await this.database.addMessage(
+          assistantMessage.contextId = await this.database.addMessage(
             state.thread.id,
             state.turnId,
             'assistant',
@@ -1124,6 +1236,7 @@ export class AgentRuntime {
               attachments: assistantAttachments,
             }
           )
+          state.messages.push(assistantMessage)
 
           if (!response.toolCalls.length) {
             const verification = preVerification!
@@ -1149,6 +1262,7 @@ export class AgentRuntime {
                   state.messages.push({
                     role: 'system',
                     content: this.completionGuard.recoveryPrompt(completion),
+                    protected: true,
                   })
                   continue
                 }
@@ -1214,6 +1328,7 @@ export class AgentRuntime {
             state.messages.push({
               role: 'system',
               content: state.discoveryQuery,
+              protected: true,
             })
             continue
           }
@@ -1256,12 +1371,51 @@ export class AgentRuntime {
       }
     } catch (error) {
       const interrupted = state.controller.signal.aborted
-      const message = (error as Error).message
-      const timedOut = /模型请求超时|aborted due to timeout|TimeoutError/i.test(message)
+      const normalizedError = normalizeAgentError(error, { interrupted })
+      const { message } = normalizedError
+      if (
+        !interrupted &&
+        normalizedError.info.code === 'CONTEXT_WINDOW_EXCEEDED' &&
+        !state.contextRetryUsed
+      ) {
+        state.contextRetryUsed = true
+        try {
+          const tools = this.availableTools(state).map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+          }))
+          const prepared = await this.contextEngine.prepareRequest({
+            threadId: state.thread.id,
+            messages: state.messages,
+            tools,
+            legacySummary: state.legacySummary,
+            contextWindowTokens: state.contextWindowTokens,
+            calibrationKey: state.calibrationKey,
+            forceDeterministic: true,
+          })
+          state.messages = prepared.messages
+          await this.emit(state, 'context.compacted', {
+            strategy: prepared.strategy || 'deterministic',
+            forcedBy: 'CONTEXT_WINDOW_EXCEEDED',
+            budget: prepared.budget,
+          })
+          return this.continueState(state)
+        } catch (compactionError) {
+          await this.emit(state, 'context.compacted', {
+            strategy: 'deterministic',
+            forcedBy: 'CONTEXT_WINDOW_EXCEEDED',
+            failed: true,
+            error: (compactionError as Error).message,
+          })
+        }
+      }
+      const timedOut = normalizedError.info.code === 'MODEL_TIMEOUT'
       const recovery = this.getConfig().recovery
       if (
         !interrupted &&
         !timedOut &&
+        normalizedError.info.code !== 'CONTEXT_WINDOW_EXCEEDED' &&
         recovery.enabled &&
         state.recoveryCycle < recovery.maxCycles &&
         Date.now() - state.recoveryStartedAt < recovery.maxDurationMs
@@ -1282,7 +1436,7 @@ export class AgentRuntime {
           }
         )
         await this.emit(state, 'recovery.started', event)
-        state.messages.push({ role: 'system', content: state.discoveryQuery })
+        state.messages.push({ role: 'system', content: state.discoveryQuery, protected: true })
         return this.continueState(state)
       }
       if (!interrupted && !timedOut && state.plan) {
@@ -1303,7 +1457,8 @@ export class AgentRuntime {
           : timedOut
             ? '模型响应超时，Provider 重试与回退均未成功。请稍后重试，或调高该 Provider 的超时时间。'
             : `Agent 执行失败：${message}`,
-        message
+        message,
+        normalizedError.info
       )
     }
   }
@@ -1671,16 +1826,30 @@ export class AgentRuntime {
     error?: string
   ) {
     const content = error ? JSON.stringify({ ok: false, error }) : safeJson({ ok: true, output })
-    state.messages.push({
+    const message: AgentModelMessage = {
       role: 'tool',
       name: call.name,
       toolCallId: call.id,
       content,
-    })
-    await this.database.addMessage(state.thread.id, state.turnId, 'tool', content, {
-      name: call.name,
-      toolCallId: call.id,
-    })
+      protected: (() => {
+        try {
+          return this.registry.get(call.name)?.tool.idempotent !== true
+        } catch {
+          return true
+        }
+      })(),
+    }
+    message.contextId = await this.database.addMessage(
+      state.thread.id,
+      state.turnId,
+      'tool',
+      content,
+      {
+        name: call.name,
+        toolCallId: call.id,
+      }
+    )
+    state.messages.push(message)
     await this.database.completeToolCall(call.id, output, error)
   }
 
@@ -2264,10 +2433,11 @@ export class AgentRuntime {
     state: ExecutionState,
     status: 'completed' | 'failed' | 'interrupted',
     content: string,
-    error?: string
+    error?: string,
+    errorInfo?: AgentErrorInfo
   ): Promise<AgentTurnResult> {
     if (state.finishPromise) return state.finishPromise
-    state.finishPromise = this.persistFinish(state, status, content, error)
+    state.finishPromise = this.persistFinish(state, status, content, error, errorInfo)
     return state.finishPromise
   }
 
@@ -2275,14 +2445,22 @@ export class AgentRuntime {
     state: ExecutionState,
     status: 'completed' | 'failed' | 'interrupted',
     content: string,
-    error?: string
+    error?: string,
+    errorInfo?: AgentErrorInfo
   ): Promise<AgentTurnResult> {
+    const resolvedErrorInfo = status === 'completed'
+      ? undefined
+      : errorInfo || normalizeAgentError(error || content, {
+        interrupted: status === 'interrupted',
+        source: 'runtime',
+      }).info
     const finalized = await this.database.finalizeTurn({
       threadId: state.thread.id,
       turnId: state.turnId,
       state: status,
       content,
       error,
+      errorInfo: resolvedErrorInfo,
       publishFinal: Boolean(content && !(status === 'interrupted' && state.superseded)),
     })
     this.activeTurns.delete(state.turnId)
@@ -2290,7 +2468,7 @@ export class AgentRuntime {
     state.removeParentAbortListener?.()
     const terminalEvent = {
       ...finalized.event,
-      data: { status, content, error },
+      data: { status, content, error, errorInfo: resolvedErrorInfo },
     }
     this.events.broadcast(terminalEvent)
     await state.input.onEvent?.(terminalEvent)
@@ -2300,12 +2478,14 @@ export class AgentRuntime {
       status,
       content,
       error,
+      errorInfo: resolvedErrorInfo,
     })
     if (status === 'failed') {
       await agentHookEmit('turnFailed', {
         threadId: state.thread.id,
         turnId: state.turnId,
         error,
+        errorInfo: resolvedErrorInfo,
       })
     }
 
@@ -2340,6 +2520,7 @@ export class AgentRuntime {
       state: status,
       content,
       finalMessageId: finalized.finalMessageId || undefined,
+      errorInfo: resolvedErrorInfo,
     }
   }
 

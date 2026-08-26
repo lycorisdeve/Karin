@@ -197,7 +197,7 @@ describe('versioned configuration and write-only secrets', () => {
       },
     } as never)
 
-    expect(migrated.version).toBe(10)
+    expect(migrated.version).toBe(11)
     expect(migrated.context).toMatchObject({
       defaultWindowTokens: 65536,
       softLimitRatio: 0.5,
@@ -244,7 +244,7 @@ describe('versioned configuration and write-only secrets', () => {
       },
     }
     const migrated = migrateAgentConfig(legacy as never)
-    expect(migrated.version).toBe(10)
+    expect(migrated.version).toBe(11)
     expect(migrated.policy.hardDeny).toEqual([])
     expect(migrated.policy.defaults.destructive).toBe('ask')
 

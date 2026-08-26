@@ -124,6 +124,11 @@
       "development": "./module/sqlite3.ts",
       "default": "./dist/module/sqlite3.mjs"
     },
+    "./agent/sandbox": {
+      "types": "./dist/agent/execution/sandbox.d.ts",
+      "development": "./src/agent/execution/sandbox.ts",
+      "default": "./dist/agent/execution/sandbox.mjs"
+    },
     "./log4js": {
       "types": "./dist/module/log4js.d.ts",
       "development": "./module/log4js.ts",
@@ -197,6 +202,10 @@
     "ws": "npm:@karinjs/ws@1.0.4",
     "yaml": "2.7.0"
   },
+  "optionalDependencies": {
+    "@karinjs/sandbox-win32-arm64": "workspace:*",
+    "@karinjs/sandbox-win32-x64": "workspace:*"
+  },
   "devDependencies": {
     "@karinjs/node-pty": "^1.1.3",
     "@karinjs/onebot": "workspace:*",
@@ -215,5 +224,5 @@
     "access": "public",
     "registry": "https://registry.npmjs.org"
   },
-  "time": "2026-08-12T06:16:32.705Z"
+  "time": "2026-08-26T07:30:47.951Z"
 }

@@ -1335,7 +1335,8 @@ export class AgentLearning {
               const output = await this.scriptRuntime.execute(
                 normalized,
                 input,
-                context.signal
+                context.signal,
+                context
               )
               await this.database.audit(
                 context.actor.id,

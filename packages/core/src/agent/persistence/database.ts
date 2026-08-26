@@ -11,6 +11,7 @@ import type {
   AgentEvolutionMetrics,
   AgentEvolutionState,
   AgentEvolutionTarget,
+  AgentErrorInfo,
   AgentMessageRole,
   AgentPolicyDecision,
   AgentThreadState,
@@ -29,6 +30,7 @@ import type {
   AgentPersonaDefinition,
   AgentPersonaRecord,
   AgentPersonaVersion,
+  ContextCheckpointV1,
 } from '@/types/agent'
 
 export interface AgentContextSummaryRecord {
@@ -38,6 +40,10 @@ export interface AgentContextSummaryRecord {
   content: string
   estimatedTokens: number
   sourceMessageIds: string[]
+  format: 'legacy-text' | 'checkpoint-v1'
+  checkpoint: ContextCheckpointV1 | null
+  coveredThroughMessageId: string | null
+  sourceCount: number
   createdAt: number
 }
 
@@ -818,6 +824,27 @@ const migrations = [
       ON memory_sources(memory_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_personas_default
       ON agent_personas(is_default, enabled);
+    `,
+  },
+  {
+    version: 15,
+    sql: `
+      ALTER TABLE agent_context_summaries
+      ADD COLUMN format TEXT NOT NULL DEFAULT 'legacy-text';
+      ALTER TABLE agent_context_summaries
+      ADD COLUMN checkpoint_json TEXT;
+      ALTER TABLE agent_context_summaries
+      ADD COLUMN covered_through_message_id TEXT;
+      ALTER TABLE agent_context_summaries
+      ADD COLUMN source_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'turn';
+
+      CREATE TABLE IF NOT EXISTS agent_context_compaction_leases (
+        thread_id TEXT PRIMARY KEY,
+        token TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+      );
     `,
   },
 ]
@@ -1610,6 +1637,10 @@ export class AgentDatabase {
     content: string
     estimatedTokens: number
     sourceMessageIds: string[]
+    format?: 'legacy-text' | 'checkpoint-v1'
+    checkpoint?: ContextCheckpointV1 | null
+    coveredThroughMessageId?: string | null
+    sourceCount?: number
   }): Promise<AgentContextSummaryRecord> {
     return this.transaction(async () => {
       const id = randomUUID()
@@ -1618,8 +1649,9 @@ export class AgentDatabase {
       await this.run(
         `INSERT INTO agent_context_summaries(
           id, thread_id, parent_id, content, estimated_tokens,
-          source_message_ids_json, created_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+          source_message_ids_json, format, checkpoint_json,
+          covered_through_message_id, source_count, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           input.threadId,
@@ -1627,6 +1659,10 @@ export class AgentDatabase {
           content,
           Math.max(0, input.estimatedTokens),
           JSON.stringify(input.sourceMessageIds),
+          input.format || 'legacy-text',
+          input.checkpoint ? JSON.stringify(input.checkpoint) : null,
+          input.coveredThroughMessageId || null,
+          Math.max(0, input.sourceCount ?? input.sourceMessageIds.length),
           now,
         ]
       )
@@ -1641,6 +1677,10 @@ export class AgentDatabase {
         content,
         estimatedTokens: Math.max(0, input.estimatedTokens),
         sourceMessageIds: input.sourceMessageIds,
+        format: input.format || 'legacy-text',
+        checkpoint: input.checkpoint || null,
+        coveredThroughMessageId: input.coveredThroughMessageId || null,
+        sourceCount: Math.max(0, input.sourceCount ?? input.sourceMessageIds.length),
         createdAt: now,
       }
     })
@@ -1660,8 +1700,42 @@ export class AgentDatabase {
       content: String(row.content),
       estimatedTokens: Number(row.estimated_tokens),
       sourceMessageIds: parseJson<string[]>(row.source_message_ids_json as string, []),
+      format: row.format === 'checkpoint-v1' ? 'checkpoint-v1' : 'legacy-text',
+      checkpoint: parseJson<ContextCheckpointV1 | null>(row.checkpoint_json as string, null),
+      coveredThroughMessageId: row.covered_through_message_id
+        ? String(row.covered_through_message_id)
+        : null,
+      sourceCount: Number(row.source_count) || 0,
       createdAt: Number(row.created_at),
     }
+  }
+
+  async acquireContextCompactionLease (threadId: string, ttlMs = 30_000) {
+    const token = randomUUID()
+    const now = Date.now()
+    return this.transaction(async () => {
+      await this.run(
+        'DELETE FROM agent_context_compaction_leases WHERE thread_id = ? AND expires_at <= ?',
+        [threadId, now]
+      )
+      try {
+        await this.run(
+          `INSERT INTO agent_context_compaction_leases(thread_id, token, expires_at)
+           VALUES(?, ?, ?)`,
+          [threadId, token, now + Math.max(1000, ttlMs)]
+        )
+        return token
+      } catch {
+        return null
+      }
+    })
+  }
+
+  async releaseContextCompactionLease (threadId: string, token: string) {
+    await this.run(
+      'DELETE FROM agent_context_compaction_leases WHERE thread_id = ? AND token = ?',
+      [threadId, token]
+    )
   }
 
   async setThreadModel (
@@ -4199,6 +4273,7 @@ export class AgentDatabase {
     state: 'completed' | 'failed' | 'interrupted'
     content: string
     error?: string
+    errorInfo?: AgentErrorInfo
     publishFinal: boolean
   }) {
     return this.transaction(async () => {
@@ -4249,7 +4324,11 @@ export class AgentDatabase {
           input.threadId,
           input.turnId,
           type,
-          JSON.stringify({ status: input.state, error: input.error }),
+          JSON.stringify({
+            status: input.state,
+            error: input.error,
+            errorInfo: input.errorInfo,
+          }),
           now,
         ]
       )
@@ -4260,7 +4339,11 @@ export class AgentDatabase {
           threadId: input.threadId,
           turnId: input.turnId,
           type,
-          data: { status: input.state, error: input.error },
+          data: {
+            status: input.state,
+            error: input.error,
+            errorInfo: input.errorInfo,
+          },
           createdAt: now,
         } satisfies AgentStreamEvent,
       }
@@ -4639,13 +4722,14 @@ export class AgentDatabase {
       fallbackFrom?: string[]
       retryReasons?: string[]
       latencyMs?: number
+      purpose?: 'turn' | 'compaction'
     } = {}
   ) {
     await this.run(
       `INSERT INTO usage(
         id, thread_id, turn_id, provider, model, input_tokens, output_tokens,
-        retry_count, fallback_json, retry_reasons_json, latency_ms, created_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        retry_count, fallback_json, retry_reasons_json, latency_ms, purpose, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         randomUUID(),
         threadId,
@@ -4658,6 +4742,7 @@ export class AgentDatabase {
         JSON.stringify(metadata.fallbackFrom || []),
         JSON.stringify(metadata.retryReasons || []),
         metadata.latencyMs || null,
+        metadata.purpose || 'turn',
         Date.now(),
       ]
     )
