@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.1.0-beta.0](https://github.com/lycorisdeve/Karin/compare/create-karin-v2.0.0-beta.0...create-karin-v2.1.0-beta.0) (2026-08-26)
+
+
+### ✨ Features
+
+* **cli-Internal:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **cli:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **core:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **create-karin:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* introduce Karin Agent framework ([a526daf](https://github.com/lycorisdeve/Karin/commit/a526dafa35337c2c78c05bfd0c19a47e171cced5))
+* **karin-plugin-js:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **karin-plugin-ts:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **onebot:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **pm2:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **types:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **web:** add PluginWebConfigPage component for custom plugin configuration ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **web:** add PluginWebConfigPage component for custom plugin configuration ([#654](https://github.com/lycorisdeve/Karin/issues/654)) ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* 为PluginWebConfigPage添加sandbox属性以增强安全性 ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* 更新resolveConfigPage逻辑，确保正确处理页面配置 ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+
+
+### 🐛 Bug Fixes
+
+* ci ([#659](https://github.com/lycorisdeve/Karin/issues/659)) ([f3f169f](https://github.com/lycorisdeve/Karin/commit/f3f169fa896427f70e4dbaaaa580598ca76c8dd3))
+* 优化PluginRow组件配置入口判断逻辑 ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* 修复警告被错误当错Error抛出 close [#618](https://github.com/lycorisdeve/Karin/issues/618) ([#620](https://github.com/lycorisdeve/Karin/issues/620)) ([a392d40](https://github.com/lycorisdeve/Karin/commit/a392d40fcb76d7e398ff28d54674b7c919e49234))
+* 更新构建脚本以简化构建过程，移除不必要的配置 ([#657](https://github.com/lycorisdeve/Karin/issues/657)) ([6caa72f](https://github.com/lycorisdeve/Karin/commit/6caa72f6c84aa926affed1389fa519c0fe12e13c))
+
+
+### 🎫 Chores
+
+* release main ([#621](https://github.com/lycorisdeve/Karin/issues/621)) ([8d2125c](https://github.com/lycorisdeve/Karin/commit/8d2125c9552230d4d776fcc26f53eb099594a8f3))
+* release main ([#622](https://github.com/lycorisdeve/Karin/issues/622)) ([4556539](https://github.com/lycorisdeve/Karin/commit/4556539f3ebc8e43c67ea86fd680d2fa943f0e07))
+* release main ([#656](https://github.com/lycorisdeve/Karin/issues/656)) ([62753fe](https://github.com/lycorisdeve/Karin/commit/62753fe94c0108d6ea4b710e85dcd1d6e6a23884))
+* release main ([#658](https://github.com/lycorisdeve/Karin/issues/658)) ([c013a1f](https://github.com/lycorisdeve/Karin/commit/c013a1fce606c284dbb58b757e6a4f3d432a839c))
+* release main ([#660](https://github.com/lycorisdeve/Karin/issues/660)) ([d58ed6d](https://github.com/lycorisdeve/Karin/commit/d58ed6d92efef0cee319f2b63c90541f139caebe))
+
 ## [1.3.2](https://github.com/KarinJS/Karin/compare/create-karin-v1.3.1...create-karin-v1.3.2) (2026-06-11)
 
 

@@ -1,5 +1,73 @@
 # 更新日志
 
+## [2.1.0-beta.0](https://github.com/lycorisdeve/Karin/compare/core-v2.0.0-beta.0...core-v2.1.0-beta.0) (2026-08-26)
+
+
+### ✨ Features
+
+* add `outside-top` labelPlacement support for Input (HeroUI v2.8.0) ([#626](https://github.com/lycorisdeve/Karin/issues/626)) ([e762c57](https://github.com/lycorisdeve/Karin/commit/e762c573bd943944b530e6c67fc98753a1e4dfad))
+* **agent:** add task-driven runtime architecture ([b1008af](https://github.com/lycorisdeve/Karin/commit/b1008af4694bbca15d899898717fd926281c71f5))
+* **agent:** add v11 runtime sandbox ([34c51da](https://github.com/lycorisdeve/Karin/commit/34c51da17fa7df7bcb8055b0e16d881f6a464bfd))
+* **agent:** upgrade runtime harness to v10 ([7616aff](https://github.com/lycorisdeve/Karin/commit/7616aff772cfae103c1aa7ccb3772826d61ed722))
+* **cli-Internal:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **cli:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **core:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **create-karin:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* expand Agent runtime and channel support ([f3dd75b](https://github.com/lycorisdeve/Karin/commit/f3dd75bb739815447ceff49ded155b3a5e9e0f2a))
+* handle bot_offline notice event in OneBot adapter ([#623](https://github.com/lycorisdeve/Karin/issues/623)) ([61b5a7d](https://github.com/lycorisdeve/Karin/commit/61b5a7d7b7b6059f040de6bd9c8704422aa04a8a))
+* introduce Karin Agent framework ([a526daf](https://github.com/lycorisdeve/Karin/commit/a526dafa35337c2c78c05bfd0c19a47e171cced5))
+* **karin-plugin-js:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **karin-plugin-ts:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **onebot:** add LICENSE and tsdown configuration files ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **pm2:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **types:** add LICENSE file ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **web:** add Agent customization and delivery feedback ([0027371](https://github.com/lycorisdeve/Karin/commit/0027371c8c86c386e4d86f8af07795788ea76d76))
+* **web:** add appearance themes and classic layout ([fed85c5](https://github.com/lycorisdeve/Karin/commit/fed85c55406125c6193ae7e0e1e79396c9644ad7))
+* **web:** add extended adapter configuration ([2f301bc](https://github.com/lycorisdeve/Karin/commit/2f301bcfcc39f890097b19dea2a2b334c7302d1f))
+* **web:** add PluginWebConfigPage component for custom plugin configuration ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **web:** add PluginWebConfigPage component for custom plugin configuration ([#654](https://github.com/lycorisdeve/Karin/issues/654)) ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* **web:** enhance Agent workspace and Markdown ([665f202](https://github.com/lycorisdeve/Karin/commit/665f2027fb85f60675d39ff606ec7dd887974582))
+* **web:** expose Agent v11 sandbox controls ([27a35b3](https://github.com/lycorisdeve/Karin/commit/27a35b3bc95c810a5f16d21691824531510e5e18))
+* **web:** surface Agent task runtime state ([9946a22](https://github.com/lycorisdeve/Karin/commit/9946a22cdc532cda1d932b9659d66ea11daf2186))
+* 为PluginWebConfigPage添加sandbox属性以增强安全性 ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* 更新resolveConfigPage逻辑，确保正确处理页面配置 ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+
+
+### 🐛 Bug Fixes
+
+* ci ([#659](https://github.com/lycorisdeve/Karin/issues/659)) ([f3f169f](https://github.com/lycorisdeve/Karin/commit/f3f169fa896427f70e4dbaaaa580598ca76c8dd3))
+* close [#615](https://github.com/lycorisdeve/Karin/issues/615); 适配合并转发的外显参数 ([#616](https://github.com/lycorisdeve/Karin/issues/616)) ([f1129c9](https://github.com/lycorisdeve/Karin/commit/f1129c94317102b213148474afbdc1222b4170c5))
+* debug log level from .env not applied on startup ([#624](https://github.com/lycorisdeve/Karin/issues/624)) ([df39819](https://github.com/lycorisdeve/Karin/commit/df39819777975fba925ad30bd90b22aab62d25ec))
+* ffmpeg initialization priority order ([#629](https://github.com/lycorisdeve/Karin/issues/629)) ([5510219](https://github.com/lycorisdeve/Karin/commit/5510219de2dc199d1dfe71dd024524b9cf45ff87))
+* fix ([#661](https://github.com/lycorisdeve/Karin/issues/661)) ([ab4c96d](https://github.com/lycorisdeve/Karin/commit/ab4c96d7b951f14028ab64c628088b12a5b6d3eb))
+* getRkey returns undefined due to missing backward compatibility ([#639](https://github.com/lycorisdeve/Karin/issues/639)) ([87f1184](https://github.com/lycorisdeve/Karin/commit/87f1184e6c005e6dbe5283180b5a256378066967))
+* TypeError: data.find is not a function on first startup after npx karin init ([#625](https://github.com/lycorisdeve/Karin/issues/625)) ([96e85d8](https://github.com/lycorisdeve/Karin/commit/96e85d8a47e7f90fc8e97dc58e50d7de2f11f518))
+* web配置组件，手风琴子项内部分配置组件无法正常渲染嵌套字段 ([#664](https://github.com/lycorisdeve/Karin/issues/664)) ([03ff932](https://github.com/lycorisdeve/Karin/commit/03ff932e9f901e4a95cbb08b4ebc34aad9051215))
+* 上下文(ctx)方法添加 `超时后是否抛出错误` 选项，默认 true ([#634](https://github.com/lycorisdeve/Karin/issues/634)) ([9f2ac76](https://github.com/lycorisdeve/Karin/commit/9f2ac7679770878495825e7d450fff31857a9c51))
+* 优化PluginRow组件配置入口判断逻辑 ([faa725b](https://github.com/lycorisdeve/Karin/commit/faa725b36300a400c137ed9f625c34321a2198a0))
+* 优化获取web.config路径的逻辑，简化代码结构 ([#663](https://github.com/lycorisdeve/Karin/issues/663)) ([6ce06d5](https://github.com/lycorisdeve/Karin/commit/6ce06d536f9e86250ef9b8fe448da21fe2de94ac))
+* 修复获取所有bot列表接口返回Bot数量的问题 ([#666](https://github.com/lycorisdeve/Karin/issues/666)) ([5c095ef](https://github.com/lycorisdeve/Karin/commit/5c095efa2cba8b2e4018fe7276a5b9a62cfd3fa1))
+* 插件开发调用checkPkgUpdate判xxx插件未安装 ([#645](https://github.com/lycorisdeve/Karin/issues/645)) ([cb7dfbf](https://github.com/lycorisdeve/Karin/commit/cb7dfbfbe68a5b7ceda26ff829c606b908df7970))
+* 更新适配器平台、标准、协议和通信方式的类型定义，添加新选项 ([#636](https://github.com/lycorisdeve/Karin/issues/636)) ([295dc1a](https://github.com/lycorisdeve/Karin/commit/295dc1a6def09014815d38b7bac115fd0c39e62a))
+
+
+### 🎫 Chores
+
+* **core:** add kkk plugin dependency ([939b448](https://github.com/lycorisdeve/Karin/commit/939b4488aae9dc22b2ab16472d023e0f45fb17c4))
+* ignore local artifacts ([480be8a](https://github.com/lycorisdeve/Karin/commit/480be8a3b743bc2e2a2ba729019fe86fc02852d3))
+* release main ([#617](https://github.com/lycorisdeve/Karin/issues/617)) ([157cc6a](https://github.com/lycorisdeve/Karin/commit/157cc6a13ac7c67b18448e6c92ea5eb33f732846))
+* release main ([#627](https://github.com/lycorisdeve/Karin/issues/627)) ([be4b1b6](https://github.com/lycorisdeve/Karin/commit/be4b1b6a2f3cd1208abea82a19742fb428148cfc))
+* release main ([#630](https://github.com/lycorisdeve/Karin/issues/630)) ([7945050](https://github.com/lycorisdeve/Karin/commit/79450508f363b2f7c5976bba31d3dbb3829653dd))
+* release main ([#635](https://github.com/lycorisdeve/Karin/issues/635)) ([6b16f4c](https://github.com/lycorisdeve/Karin/commit/6b16f4c932fdcde21ee0697ebf17ce590177177b))
+* release main ([#637](https://github.com/lycorisdeve/Karin/issues/637)) ([55754bb](https://github.com/lycorisdeve/Karin/commit/55754bb1009e1f97a82be68d468707b24c315d15))
+* release main ([#640](https://github.com/lycorisdeve/Karin/issues/640)) ([36a7776](https://github.com/lycorisdeve/Karin/commit/36a7776e2f0a2666669a4546e9112e79f77acb48))
+* release main ([#646](https://github.com/lycorisdeve/Karin/issues/646)) ([b2eef43](https://github.com/lycorisdeve/Karin/commit/b2eef436feec18768930373e85ca104cc181d8e9))
+* release main ([#656](https://github.com/lycorisdeve/Karin/issues/656)) ([62753fe](https://github.com/lycorisdeve/Karin/commit/62753fe94c0108d6ea4b710e85dcd1d6e6a23884))
+* release main ([#660](https://github.com/lycorisdeve/Karin/issues/660)) ([d58ed6d](https://github.com/lycorisdeve/Karin/commit/d58ed6d92efef0cee319f2b63c90541f139caebe))
+* release main ([#662](https://github.com/lycorisdeve/Karin/issues/662)) ([a707017](https://github.com/lycorisdeve/Karin/commit/a7070175cef1f013d191204339f8a529aa55d33f))
+* release main ([#665](https://github.com/lycorisdeve/Karin/issues/665)) ([35d4442](https://github.com/lycorisdeve/Karin/commit/35d4442bad76f31e8f51387a39c178b31cc9fbad))
+* release main ([#667](https://github.com/lycorisdeve/Karin/issues/667)) ([99f15d9](https://github.com/lycorisdeve/Karin/commit/99f15d98a435c07f38c70a4e3ae80d4837b72c14))
+
 ## [1.16.4](https://github.com/KarinJS/Karin/compare/core-v1.16.3...core-v1.16.4) (2026-07-23)
 
 
