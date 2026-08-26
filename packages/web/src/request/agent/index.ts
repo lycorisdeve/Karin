@@ -11,8 +11,18 @@ export interface AgentStatus {
     platform: string
     processIsolation: boolean
     hardIsolation: boolean
-    detectedBackends: Array<'bwrap' | 'seatbelt'>
-    reason: string
+    detectedBackends: Array<'bwrap' | 'seatbelt' | 'windows'>
+    backend: 'none' | 'bwrap' | 'seatbelt' | 'windows'
+    configuredBackend: 'auto' | 'bwrap' | 'seatbelt' | 'windows'
+    mode: 'hard' | 'fallback' | 'off'
+    network: 'deny' | 'inherit'
+    reason?: string
+    lastDoctor?: {
+      checkedAt: number
+      passed: boolean
+      checks: Record<string, boolean>
+      reason?: string
+    }
   }
   scriptRuntime: {
     available: boolean
@@ -50,7 +60,7 @@ export interface AgentProviderProfile {
 }
 
 export interface AgentConfig {
-  version: 10
+  version: 11
   enabled: boolean
   providers: AgentProviderProfile[]
   routing: { primary: string; fallback: string[] }
@@ -67,6 +77,8 @@ export interface AgentConfig {
     hardLimitRatio: number
     protectedRecentMessages: number
     summaryTargetTokens: number
+    semanticCompaction: boolean
+    reservedOutputTokens: number
   }
   journal: {
     recoveryAttempts: number
@@ -125,6 +137,13 @@ export interface AgentConfig {
     hookTimeoutMs: number
     maxModelCalls: number
     maxTurnDurationMs: number
+    sandbox: {
+      mode: 'auto' | 'off'
+      backend: 'auto' | 'bwrap' | 'seatbelt' | 'windows'
+      readRoots: string[]
+      writeRoots: string[]
+      networkDefault: 'deny'
+    }
   }
   recovery: {
     enabled: boolean
@@ -150,6 +169,11 @@ export interface AgentConfig {
       url?: string
       headers?: Record<string, string>
       env?: Record<string, string>
+      sandbox?: {
+        readRoots?: string[]
+        writeRoots?: string[]
+        network?: 'deny' | 'inherit'
+      }
     }>
   }
   scriptRuntime: {

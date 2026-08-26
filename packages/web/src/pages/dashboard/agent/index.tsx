@@ -4606,6 +4606,116 @@ export default function AgentDashboard () {
                       className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
                     />
                   </label>
+                  <label className='flex items-center gap-2 text-sm'>
+                    <input
+                      type='checkbox'
+                      checked={agentConfig.context.semanticCompaction}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        context: {
+                          ...agentConfig.context,
+                          semanticCompaction: event.target.checked,
+                        },
+                      })}
+                    />
+                    模型结构化上下文压缩
+                  </label>
+                  <label className='text-xs text-default-500'>输出预留 Token
+                    <input
+                      type='number' min={256} max={131072}
+                      value={agentConfig.context.reservedOutputTokens}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        context: {
+                          ...agentConfig.context,
+                          reservedOutputTokens: Number(event.target.value),
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>沙箱模式
+                    <select
+                      value={agentConfig.execution.sandbox.mode}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          sandbox: {
+                            ...agentConfig.execution.sandbox,
+                            mode: event.target.value as 'auto' | 'off',
+                          },
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    >
+                      <option value='auto'>自动检测并启用</option>
+                      <option value='off'>关闭</option>
+                    </select>
+                  </label>
+                  <label className='text-xs text-default-500'>沙箱后端
+                    <select
+                      value={agentConfig.execution.sandbox.backend}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          sandbox: {
+                            ...agentConfig.execution.sandbox,
+                            backend: event.target.value as 'auto' | 'bwrap' | 'seatbelt' | 'windows',
+                          },
+                        },
+                      })}
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    >
+                      <option value='auto'>自动</option>
+                      <option value='bwrap'>Linux bwrap</option>
+                      <option value='seatbelt'>macOS Seatbelt</option>
+                      <option value='windows'>Windows Helper</option>
+                    </select>
+                  </label>
+                  <label className='text-xs text-default-500'>允许读取根目录（每行一个绝对路径）
+                    <textarea
+                      rows={3}
+                      value={agentConfig.execution.sandbox.readRoots.join('\n')}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          sandbox: {
+                            ...agentConfig.execution.sandbox,
+                            readRoots: event.target.value
+                              .split(/\r?\n/)
+                              .map(value => value.trim())
+                              .filter(Boolean),
+                          },
+                        },
+                      })}
+                      placeholder='留空表示仅项目 cwd'
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
+                  <label className='text-xs text-default-500'>允许写入根目录（每行一个绝对路径）
+                    <textarea
+                      rows={3}
+                      value={agentConfig.execution.sandbox.writeRoots.join('\n')}
+                      onChange={event => setAgentConfig({
+                        ...agentConfig,
+                        execution: {
+                          ...agentConfig.execution,
+                          sandbox: {
+                            ...agentConfig.execution.sandbox,
+                            writeRoots: event.target.value
+                              .split(/\r?\n/)
+                              .map(value => value.trim())
+                              .filter(Boolean),
+                          },
+                        },
+                      })}
+                      placeholder='留空表示仅项目 cwd'
+                      className='mt-1 w-full rounded-xl border border-default-200 bg-default-50 p-2 text-sm'
+                    />
+                  </label>
                   <label className='text-xs text-default-500'>执行兼容模式
                     <select
                       value={agentConfig.execution.isolationMode}
@@ -4668,8 +4778,14 @@ export default function AgentDashboard () {
                     />
                   </label>
                   <p className='md:col-span-2 text-xs text-default-500'>
-                    “进程隔离”不等于安全沙箱；选择操作系统硬隔离时，无可用后端将失败关闭。
+                    实际沙箱：{status?.isolation
+                    ? `${status.isolation.backend} / ${status.isolation.mode} / network=${status.isolation.network}`
+                    : '尚未检测'}。只有越界写、断网和进程树自检全部通过才标记为硬隔离；
+                    选择操作系统硬隔离时，无可用后端将失败关闭。
                     {status?.isolation?.reason ? ` 当前主机：${status.isolation.reason}` : ''}
+                    {status?.isolation?.lastDoctor
+                      ? ` 最近自检：${status.isolation.lastDoctor.passed ? '通过' : '失败'}，${new Date(status.isolation.lastDoctor.checkedAt).toLocaleString()}。`
+                      : ''}
                   </p>
                 </div>
 
