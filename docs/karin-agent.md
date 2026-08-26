@@ -18,7 +18,7 @@ Karin Agent 是 `node-karin` Core 内置模块，不更改 npm 包名、CLI 名�
 
 ```json
 {
-  "version": 10,
+  "version": 11,
   "enabled": true,
   "providers": [{
     "id": "openai",
@@ -37,7 +37,9 @@ Karin Agent 是 `node-karin` Core 内置模块，不更改 npm 包名、CLI 名�
     "softLimitRatio": 0.5,
     "hardLimitRatio": 0.85,
     "protectedRecentMessages": 12,
-    "summaryTargetTokens": 4096
+    "summaryTargetTokens": 4096,
+    "semanticCompaction": true,
+    "reservedOutputTokens": 4096
   },
   "memory": {
     "retrieval": {
@@ -53,12 +55,19 @@ Karin Agent 是 `node-karin` Core 内置模块，不更改 npm 包名、CLI 名�
     "minimumIsolation": "none",
     "hookTimeoutMs": 5000,
     "maxModelCalls": 40,
-    "maxTurnDurationMs": 300000
+    "maxTurnDurationMs": 300000,
+    "sandbox": {
+      "mode": "auto",
+      "backend": "auto",
+      "readRoots": [],
+      "writeRoots": [],
+      "networkDefault": "deny"
+    }
   }
 }
 ```
 
-v9 配置会在读取时迁移到 v10。Provider 默认继续使用 `chat-completions`；需要 OpenAI
+旧配置会在读取时迁移到 v11。Provider 默认继续使用 `chat-completions`；需要 OpenAI
 Responses 兼容协议时将 `protocol` 设为 `responses`。迁移保留现有 Provider、密钥和路由，
 不会自动删除用户数据。
 
@@ -97,9 +106,12 @@ Harness Kernel > AGENT.md 版本 > 人物预设版本 > Skill 索引与会话摘
 模型上下文分为 stable、context 和 volatile 三层。stable 放 Kernel、工作章程、人物与 Thread
 固定 Skill 索引，不预注入 Skill 全文；volatile 每轮加入相关记忆、当前任务清单、时间和恢复
 信息。
-Context Engine 在预计输入达到上下文窗口 50% 时预压缩、85% 时强制压缩。摘要采用不可变
-版本并继承上一个摘要，最近消息、完整 Tool-call/result 对、活动任务和非幂等回执继续保留；
-`maxRecentMessages` 只作为估算或摘要失败时的降级上限。
+Context Engine 在每次模型调用前计算 System、历史、记忆、任务、Tool Schema、响应 Schema
+和输出预留的完整预算；预计输入达到上下文窗口 50% 时预压缩、85% 时强制压缩。默认使用当前
+Thread 的 Provider/Model 生成严格 `ContextCheckpointV1`，不带 Tool；Provider 失败或结构校验
+失败时使用确定性摘要。摘要采用不可变父子谱系，每代只记录本次折叠的消息 ID；最近消息、完整
+Tool-call/result 对、活动任务、待审批、Artifact 和非幂等回执继续保护。Provider 返回上下文
+超限时只执行一次强制确定性压缩和重试，仍失败则保留原结构化错误。
 
 最终回答前由 Completion Guard 检查任务状态和 Tool receipt。仍有 pending/in_progress、
 待审批、未满足的必要条件或行动缺少真实回执时，会要求模型继续执行，达到配置的纠正
@@ -115,6 +127,11 @@ Execution Budget 管理模型与 Tool 的循环。每轮比较任务状态、Too
 
 模型 Provider 超时会在重试和 fallback 均失败后返回中文可操作提示，不再向用户暴露原生
 `The operation was aborted due to timeout`。Tool 超时同样记录为包含 Tool 名称和毫秒数的失败回执。
+
+失败的 Runtime 返回值和 `turn.failed` 事件会附带可选的 `errorInfo`：稳定 `code`、错误来源
+`source`、是否适合重试的 `retryable`，以及可用时的 `httpStatusCode`。原有 `error` 字符串继续
+保留以兼容旧客户端；认证信息会在写入事件前脱敏。错误码覆盖上下文超限、用量限制、HTTP/SSE
+连接失败、鉴权失败、模型超时、运行预算耗尽和中断等常见场景。
 
 ## Tool
 
@@ -144,10 +161,25 @@ Artifact，模型只收到有效 JSON 预览和 Artifact ID。
 
 所有调用都经过 `AgentExecutionGateway`。隔离等级为 `core-inline`、`legacy-inline`、
 `process-isolated`、`generated-sandbox`、`mcp-remote` 或 `mcp-stdio`。默认兼容模式允许旧插件的
-`legacy-inline` 并在 WebUI 告警；严格模式拒绝。`karin.processTool()` 使用 JSON stdin/stdout、
-环境变量白名单、受限 cwd、无 Shell 拼接、输出上限和进程树终止。进程隔离不等于安全沙箱；
-Core 会探测 bwrap/Seatbelt，但当前未验证为硬隔离执行后端，因此配置要求 `os` 时失败关闭，
-不会在 UI 中宣称为安全沙箱。
+`legacy-inline` 并在 WebUI 告警；严格模式拒绝。`karin.processTool()`、Python Script/Generated
+Tool 与 MCP stdio 统一由 `SandboxRunner` 启动。Runner 会 realpath cwd 和目录，拒绝符号链接
+逃逸、NUL、Shell 拼接和未声明环境变量；插件声明只能缩小管理员允许的读写根目录。Linux/WSL
+使用 bwrap，macOS 使用 Seatbelt，Windows 从架构对应的可选包加载 Rust Helper。网络默认断开；
+Process Tool 只有声明 `external` 风险并通过策略审批后才能请求 `inherit`，MCP stdio 则由管理员
+配置授权。`auto` 在后端不可用或 doctor 失败时兼容降级并告警，`minimumIsolation=os` 失败关闭。
+只有越界写、断网和进程树终止自检全部通过才报告 `hardIsolation=true`；Receipt 同时记录实际
+backend、mode 和 network，避免与静态 `isolation` 来源分类混淆。兼容降级不会伪装成断网：
+未实际执行网络隔离时 Receipt 明确记录 `network=inherit`。当前 Windows Helper 优先尝试
+Restricted Token，并通过 suspended → Job Object → resume 避免启动逃逸；管理员 setup 与 doctor
+未建立并验证 ACL、专用低权限身份和出站阻断前，始终报告 `fallback`，不能满足
+`minimumIsolation=os`。
+
+运维命令：
+
+```text
+karin agent sandbox setup
+karin agent sandbox doctor
+```
 
 `karin.browser.search` 使用受控 HTTP/RSS 搜索，不依赖浏览器二进制。截图优先复用 Karin
 Render Registry 中已有的 Puppeteer/Snapka 渲染器；没有可用渲染器或渲染失败时，再降级到
