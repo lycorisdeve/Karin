@@ -1,6 +1,7 @@
 name: agent-sandbox
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - 'packages/core/src/agent/execution/**'
@@ -11,6 +12,7 @@ on:
     paths:
       - 'packages/core/src/agent/execution/**'
       - 'packages/sandbox-win32-*/**'
+      - '.github/workflows/agent-sandbox.yml'
 
 permissions:
   contents: read
@@ -45,6 +47,7 @@ jobs:
         with:
           name: ${{ matrix.package }}
           path: packages/${{ matrix.package }}/bin
+          if-no-files-found: error
 
   platform-integration:
     needs: native-helper
@@ -58,7 +61,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: pnpm/action-setup@v2
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
           run_install: true

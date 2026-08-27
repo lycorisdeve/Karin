@@ -10,7 +10,8 @@ on:
 
 # 设置权限
 permissions:
-  contents: write
+  contents: read
+  id-token: write
 
 jobs:
   publish-core:
@@ -20,29 +21,61 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
       # 安装pnpm
       - name: 配置pnpm
-        uses: pnpm/action-setup@v2
+        uses: pnpm/action-setup@v6
         with:
           version: 9
           run_install: true
+
+      # 更新版本号
+      - name: 验证并更新版本号
+        working-directory: packages/core
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          node -e "const v = process.env.RELEASE_VERSION; if (!/^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$/.test(v)) { throw new Error('版本号必须是合法 SemVer') }"
+          pnpm pkg set "version=$RELEASE_VERSION"
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            NPM_TAG="${RELEASE_VERSION#*-}"
+            NPM_TAG="${NPM_TAG%%.*}"
+          else
+            NPM_TAG=latest
+          fi
+          echo "npm-tag=$NPM_TAG" >> "$GITHUB_OUTPUT"
+        id: version
 
       # 构建项目
       - name: 构建项目
         run: pnpm build
 
-      # 更新版本号
-      - name: 更新版本号
-        run: cd packages/core && pnpm pkg set version=${{ inputs.version }} && pnpm pkg delete peerDependencies
+      - name: 复制 README
+        run: cp README.md packages/core
+
+      - name: 解析待发布包的 workspace 依赖
+        run: node scripts/prepare-npm-publish.mjs packages/core
+
+      - name: 检查 npm 凭据
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: test -n "$NODE_AUTH_TOKEN" || { echo '缺少 NPM_TOKEN Secret，无法发布 npm 包'; exit 1; }
 
       # 发布到npm
       - name: 发布到NPM
         id: publish-to-npm
-        uses: JS-DevTools/npm-publish@v3
+        uses: JS-DevTools/npm-publish@v4
         with:
           package: packages/core
           token: ${{ secrets.NPM_TOKEN }}
           access: public
+          tag: ${{ steps.version.outputs.npm-tag }}
+          provenance: true
 
       - name: 生成发布摘要
         run: |

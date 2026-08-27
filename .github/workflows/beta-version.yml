@@ -1,7 +1,7 @@
 name: beta-version
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, reopened, synchronize]
     branches:
       - main
@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   publish-temp:
@@ -20,11 +19,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # 获取完整历史记录，用于生成版本号
-          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
-          repository: ${{ github.event.pull_request.head.repo.full_name || '' }}
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: 安装pnpm
-        uses: pnpm/action-setup@v2
+        uses: pnpm/action-setup@v6
         with:
           version: 9
           run_install: true
@@ -49,68 +51,23 @@ jobs:
           echo "提交哈希: ${{ env.SHORT_COMMIT_HASH }}" >> $GITHUB_STEP_SUMMARY
           exit 1
 
-      - name: 发布临时NPM包
-        id: publish_pkg
+      - name: 打包临时 npm 包
         run: |
-          # 将标准输出和标准错误都重定向到文件
-          pnpm dlx pkg-pr-new publish --json output.json --comment=off --compact --packageManager=pnpm './packages/core' > pkg-output.txt 2>&1
-
-          # 显示输出内容以便在日志中查看
-          echo "命令输出内容："
-          cat pkg-output.txt
-
-          ACTUAL_INSTALL_URL=$(grep -oP 'https://pkg\.pr\.new/[^\s`]+' pkg-output.txt | head -n 1 || echo "")
-          if [ ! -z "$ACTUAL_INSTALL_URL" ]; then
-              PNPM_INSTALL_CMD="pnpm add ${ACTUAL_INSTALL_URL} -w"
-          else
-              # 尝试从npm格式提取
-              NPM_URL=$(grep -oP 'pnpm i \`\Khttps://pkg\.pr\.new/[^\`]+' pkg-output.txt | head -n 1 || echo "")
-              if [ ! -z "$NPM_URL" ]; then
-                  PNPM_INSTALL_CMD="pnpm add ${NPM_URL} -w"
-                  ACTUAL_INSTALL_URL="$NPM_URL"
-              else
-                  PNPM_INSTALL_CMD="未找到安装命令"
-                  ACTUAL_INSTALL_URL="未找到安装URL"
-              fi
-          fi
-
-          echo "pnpm_install_cmd=$PNPM_INSTALL_CMD" >> $GITHUB_OUTPUT
-          echo "install_url=$ACTUAL_INSTALL_URL" >> $GITHUB_OUTPUT
+          cp README.md packages/core
+          node scripts/prepare-npm-publish.mjs packages/core
+          mkdir -p preview-packages
+          npm pack packages/core --pack-destination preview-packages
 
       - name: 生成发布摘要
         run: |
-          # 在工作流摘要中添加信息
-          echo "## Published Packages :package:" >> $GITHUB_STEP_SUMMARY
+          echo "## Preview package :package:" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.publish_pkg.outputs.pnpm_install_cmd }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "提交: [${{ env.SHORT_COMMIT_HASH }}](${{ env.REPO_URL }})" >> $GITHUB_STEP_SUMMARY
+          echo "下载本次运行的 \`node-karin-preview-${{ env.SHORT_COMMIT_HASH }}\` artifact 后安装其中的 tgz 文件。" >> $GITHUB_STEP_SUMMARY
 
-          # 添加完整输出到摘要，方便查看
-          echo "## Complete output" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat pkg-output.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: 发布/更新 PR 评论
-        if: github.event_name == 'pull_request_target'
-        uses: thollander/actions-comment-pull-request@v3
-        with:
-          pr-number: ${{ github.event.pull_request_target.number }}
-          comment-tag: execution
-          mode: recreate
-          github-token: ${{ secrets.GITHUB_TOKEN  }}
-          message: |
-            你可以通过以下命令安装该版本：
-            ```
-            ${{ steps.publish_pkg.outputs.pnpm_install_cmd }}
-            ```
-
-      - name: 上传NPM包信息
+      - name: 上传临时 npm 包
         uses: actions/upload-artifact@v4
         with:
-          name: npm-package-info
-          path: |
-            pkg-output.txt
-            output.json
+          name: node-karin-preview-${{ env.SHORT_COMMIT_HASH }}
+          path: preview-packages/*.tgz
+          if-no-files-found: error
