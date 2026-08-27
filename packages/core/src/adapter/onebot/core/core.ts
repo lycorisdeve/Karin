@@ -386,7 +386,7 @@ export class AdapterOneBot<T extends OneBotType> extends AdapterBase {
       const messageSeq = (v as any).message_seq || v.message_id
 
       const data = {
-        time: Date.now(),
+        time: v.time,
         messageId,
         messageSeq,
         message_id: messageId,
@@ -867,7 +867,7 @@ export class AdapterOneBot<T extends OneBotType> extends AdapterBase {
       return
     }
 
-    if (this.adapter.name === 'NapCat.Onebot') {
+    if (this.adapter.name === 'NapCat.Onebot' || this.adapter.name === 'SnowLuma') {
       await this._onebot.nc_setMsgEmojiLike(+messageId, faceId + '', isSet)
       return
     }
