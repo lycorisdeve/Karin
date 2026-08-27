@@ -112,7 +112,7 @@ describe('Agent SandboxRunner', () => {
   )('passes the native backend self-test on Unix CI', async () => {
     const config = structuredClone(defaultConfig.agent) as AgentConfig
     const status = await new AgentSandboxRunner(() => config).doctor()
-    expect(status.lastDoctor?.checks).toMatchObject({
+    expect(status.lastDoctor?.checks, status.lastDoctor?.reason).toMatchObject({
       allowedWrite: true,
       outsideWriteDenied: true,
       networkDenied: true,

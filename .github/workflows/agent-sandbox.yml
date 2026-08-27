@@ -76,7 +76,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
-          bwrap --ro-bind /usr /usr --proc /proc --dev /dev --unshare-pid --unshare-net /usr/bin/true
+          bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+            --proc /proc --dev /dev --unshare-pid --unshare-net /usr/bin/true
       - run: pnpm exec vitest run tests/agent/sandbox.test.ts
         env:
           KARIN_SANDBOX_INTEGRATION: '1'

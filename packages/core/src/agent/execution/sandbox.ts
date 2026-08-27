@@ -355,7 +355,11 @@ export class AgentSandboxRunner {
       '(allow process*)',
       '(allow sysctl-read)',
       '(allow file-read-metadata)',
-      ...['/System', '/usr', '/bin', '/sbin', '/Library', '/opt', ...policy.readRoots]
+      ...[
+        '/System', '/usr', '/bin', '/sbin', '/Library', '/opt',
+        path.dirname(command),
+        ...policy.readRoots,
+      ]
         .filter(root => fs.existsSync(root))
         .map(root => `(allow file-read* (subpath "${seatbeltQuote(root)}"))`),
       ...policy.writeRoots.map(root =>
@@ -432,9 +436,17 @@ export class AgentSandboxRunner {
         ].join(';')],
         cwd: directory,
       })
+      let doctorStderr = ''
       const exit = await new Promise<number | null>((resolve, reject) => {
         const child = nodeSpawn(launch.command, launch.args, {
-          cwd: launch.cwd, env: launch.env, shell: false, windowsHide: true,
+          cwd: launch.cwd,
+          env: launch.env,
+          shell: false,
+          windowsHide: true,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        })
+        child.stderr?.on('data', chunk => {
+          doctorStderr = `${doctorStderr}${String(chunk)}`.slice(-4096)
         })
         child.once('error', reject)
         child.once('close', resolve)
@@ -494,8 +506,21 @@ export class AgentSandboxRunner {
         processTreeTerminated: !fs.existsSync(treeMarker),
         processExit: exit === 0,
       }
+      const passed = Object.values(checks).every(Boolean)
       this.lastDoctor = {
-        checkedAt: Date.now(), passed: Object.values(checks).every(Boolean), checks,
+        checkedAt: Date.now(),
+        passed,
+        checks,
+        reason: passed
+          ? undefined
+          : [
+              `自检失败项: ${Object.entries(checks)
+                .filter(([, value]) => !value)
+                .map(([name]) => name)
+                .join(', ')}`,
+              exit === 0 ? '' : `进程退出码: ${String(exit)}`,
+              doctorStderr.trim() ? `stderr: ${doctorStderr.trim()}` : '',
+          ].filter(Boolean).join('；'),
       }
     } catch (error) {
       this.lastDoctor = {
