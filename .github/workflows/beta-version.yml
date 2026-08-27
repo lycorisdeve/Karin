@@ -56,7 +56,7 @@ jobs:
           cp README.md packages/core
           node scripts/prepare-npm-publish.mjs packages/core
           mkdir -p preview-packages
-          npm pack packages/core --pack-destination preview-packages
+          npm pack ./packages/core --pack-destination preview-packages
 
       - name: 生成发布摘要
         run: |

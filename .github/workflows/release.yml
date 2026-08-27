@@ -268,17 +268,17 @@ jobs:
             core)
               cp README.md packages/core
               node scripts/prepare-npm-publish.mjs packages/core
-              npm pack packages/core --pack-destination release-artifacts
+              npm pack ./packages/core --pack-destination release-artifacts
               ASSET=$(find release-artifacts -maxdepth 1 -name 'node-karin-*.tgz' -print -quit)
               ;;
             cli)
               node scripts/prepare-npm-publish.mjs packages/cli
-              npm pack packages/cli --pack-destination release-artifacts
+              npm pack ./packages/cli --pack-destination release-artifacts
               ASSET=$(find release-artifacts -maxdepth 1 -name 'karinjs-cli-*.tgz' -print -quit)
               ;;
             create-karin)
               node scripts/prepare-npm-publish.mjs packages/create-karin
-              npm pack packages/create-karin --pack-destination release-artifacts
+              npm pack ./packages/create-karin --pack-destination release-artifacts
               ASSET=$(find release-artifacts -maxdepth 1 -name 'create-karin-*.tgz' -print -quit)
               ;;
             web)
@@ -286,11 +286,11 @@ jobs:
               tar -czf "$ASSET" -C packages/core/dist/web .
               ;;
             sandbox-win32-x64)
-              npm pack packages/sandbox-win32-x64 --pack-destination release-artifacts
+              npm pack ./packages/sandbox-win32-x64 --pack-destination release-artifacts
               ASSET=$(find release-artifacts -maxdepth 1 -name 'karinjs-sandbox-win32-x64-*.tgz' -print -quit)
               ;;
             sandbox-win32-arm64)
-              npm pack packages/sandbox-win32-arm64 --pack-destination release-artifacts
+              npm pack ./packages/sandbox-win32-arm64 --pack-destination release-artifacts
               ASSET=$(find release-artifacts -maxdepth 1 -name 'karinjs-sandbox-win32-arm64-*.tgz' -print -quit)
               ;;
           esac
