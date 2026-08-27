@@ -2,6 +2,14 @@
   "name": "@karinjs/sandbox-win32-arm64",
   "version": "2.0.0-beta.0",
   "description": "Karin Agent Windows process-containment helper for arm64",
+  "homepage": "https://github.com/lycorisdeve/Karin",
+  "bugs": {
+    "url": "https://github.com/lycorisdeve/Karin/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lycorisdeve/Karin.git"
+  },
   "license": "MIT",
   "os": ["win32"],
   "cpu": ["arm64"],

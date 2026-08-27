@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "description": "node-karin cli",
   "keywords": [],
-  "homepage": "https://github.com/KarinJS/Karin",
+  "homepage": "https://github.com/lycorisdeve/Karin",
   "bugs": {
-    "url": "https://github.com/KarinJS/Karin/issues"
+    "url": "https://github.com/lycorisdeve/Karin/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KarinJS/Karin.git"
+    "url": "git+https://github.com/lycorisdeve/Karin.git"
   },
   "license": "MIT",
   "author": "shijin",
