@@ -1,0 +1,97 @@
+name: auto-release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 为变更组件创建 Tag 并调度 Release
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            BEFORE_SHA="$(git rev-parse "$GITHUB_SHA^")"
+          fi
+          git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" > changed-files.txt
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          dispatched=0
+
+          dispatch_release() {
+            local component="$1"
+            local package_json="$2"
+            local version
+            local tag
+
+            version="$(node -p "require('./$package_json').version")"
+            if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "组件 $component 的版本不是合法 SemVer: $version"
+              exit 1
+            fi
+
+            tag="$component-v$version"
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              if gh release view "$tag" >/dev/null 2>&1; then
+                echo "$tag 的 Release 已存在，跳过重复发布"
+                return
+              fi
+              echo "$tag 已存在但 Release 缺失，重新调度发布"
+            else
+              git tag "$tag" "$GITHUB_SHA"
+              git push origin "refs/tags/$tag"
+            fi
+
+            gh workflow run release.yml \
+              --ref main \
+              -f "component=$component" \
+              -f "version=$version" \
+              -f 'dry_run=false'
+            echo "已调度 $tag"
+            dispatched=$((dispatched + 1))
+          }
+
+          if grep -Eq '^packages/(core|cli-Internal)/' changed-files.txt; then
+            dispatch_release core packages/core/package.json
+          fi
+          if grep -Eq '^packages/cli/' changed-files.txt; then
+            dispatch_release cli packages/cli/package.json
+          fi
+          if grep -Eq '^packages/create-karin/' changed-files.txt; then
+            dispatch_release create-karin packages/create-karin/package.json
+          fi
+          if grep -Eq '^packages/web/' changed-files.txt; then
+            dispatch_release web packages/web/package.json
+          fi
+          if grep -Eq '^packages/sandbox-win32-x64/' changed-files.txt; then
+            dispatch_release sandbox-win32-x64 packages/sandbox-win32-x64/package.json
+          fi
+          if grep -Eq '^packages/sandbox-win32-arm64/' changed-files.txt; then
+            dispatch_release sandbox-win32-arm64 packages/sandbox-win32-arm64/package.json
+          fi
+
+          if [[ "$dispatched" -eq 0 ]]; then
+            echo '没有需要发布的新组件版本'
+          fi
