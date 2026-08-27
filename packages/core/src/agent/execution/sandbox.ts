@@ -349,15 +349,49 @@ export class AgentSandboxRunner {
     policy: CompiledPolicy,
     env: NodeJS.ProcessEnv
   ): Promise<AgentSandboxLaunch> {
+    const commandPath = fs.realpathSync(command)
+    const commandRoot = path.dirname(path.dirname(commandPath))
     const profile = [
       '(version 1)',
       '(deny default)',
-      '(allow process*)',
+      '(allow process-exec)',
+      '(allow process-fork)',
+      '(allow process-info* (target same-sandbox))',
+      '(allow signal (target same-sandbox))',
+      '(allow mach-priv-task-port (target same-sandbox))',
+      '(allow user-preference-read)',
+      '(allow mach-lookup',
+      '  (global-name "com.apple.logd")',
+      '  (global-name "com.apple.system.logger")',
+      '  (global-name "com.apple.system.notification_center")',
+      '  (global-name "com.apple.system.opendirectoryd.libinfo")',
+      '  (global-name "com.apple.system.opendirectoryd.membership")',
+      '  (global-name "com.apple.bsd.dirhelper")',
+      '  (global-name "com.apple.securityd.xpc")',
+      ')',
+      '(allow ipc-posix-shm)',
+      '(allow ipc-posix-sem)',
+      '(allow iokit-open',
+      '  (iokit-registry-entry-class "IOSurfaceRootUserClient")',
+      '  (iokit-registry-entry-class "RootDomainUserClient")',
+      '  (iokit-user-client-class "IOSurfaceSendRight")',
+      ')',
+      '(allow iokit-get-properties)',
       '(allow sysctl-read)',
       '(allow file-read-metadata)',
+      '(allow file-ioctl',
+      '  (literal "/dev/null")',
+      '  (literal "/dev/zero")',
+      '  (literal "/dev/random")',
+      '  (literal "/dev/urandom")',
+      ')',
+      '(allow file-read-data file-write-data (literal "/dev/null"))',
+      '(allow file-read-data file-write-data (literal "/dev/zero"))',
+      '(allow file-read-data (literal "/dev/random"))',
+      '(allow file-read-data (literal "/dev/urandom"))',
       ...[
-        '/System', '/usr', '/bin', '/sbin', '/Library', '/opt',
-        path.dirname(command),
+        '/System', '/usr', '/bin', '/sbin', '/Library', '/opt', '/private/etc',
+        '/private/var/db/timezone', commandRoot,
         ...policy.readRoots,
       ]
         .filter(root => fs.existsSync(root))
@@ -429,7 +463,7 @@ export class AgentSandboxRunner {
         args: ['-e', [
           'const fs=require(\'node:fs\')',
           `fs.writeFileSync(${JSON.stringify(path.join(directory, 'inside'))},'ok')`,
-          `try{fs.writeFileSync(${JSON.stringify(outside)},'bad');process.exit(9)}catch{}`,
+          `try{fs.writeFileSync(${JSON.stringify(outside)},'bad')}catch{}`,
           'fetch(\'http://1.1.1.1\',{signal:AbortSignal.timeout(1200)})' +
             '.then(()=>process.exit(8)).catch(()=>fs.writeFileSync(' +
             `${JSON.stringify(networkMarker)},'ok'))`,
@@ -437,6 +471,7 @@ export class AgentSandboxRunner {
         cwd: directory,
       })
       let doctorStderr = ''
+      let doctorSignal: NodeJS.Signals | null = null
       const exit = await new Promise<number | null>((resolve, reject) => {
         const child = nodeSpawn(launch.command, launch.args, {
           cwd: launch.cwd,
@@ -449,7 +484,10 @@ export class AgentSandboxRunner {
           doctorStderr = `${doctorStderr}${String(chunk)}`.slice(-4096)
         })
         child.once('error', reject)
-        child.once('close', resolve)
+        child.once('close', (code, signal) => {
+          doctorSignal = signal
+          resolve(code)
+        })
       }).finally(() => launch.cleanup?.())
       const treeLaunch = await this.prepare({
         command: process.execPath,
@@ -519,6 +557,7 @@ export class AgentSandboxRunner {
                 .map(([name]) => name)
                 .join(', ')}`,
               exit === 0 ? '' : `进程退出码: ${String(exit)}`,
+              doctorSignal ? `终止信号: ${doctorSignal}` : '',
               doctorStderr.trim() ? `stderr: ${doctorStderr.trim()}` : '',
           ].filter(Boolean).join('；'),
       }
