@@ -26,6 +26,11 @@ on:
         description: 已存在 Tag 对应的 SemVer（例如 2.1.0-beta.0）
         required: true
         type: string
+      dry_run:
+        description: 仅构建、打包并上传 Action 产物，不发布 npm 或 GitHub Release
+        required: true
+        default: true
+        type: boolean
 
 concurrency:
   group: release-${{ github.ref_name }}-${{ inputs.component }}-${{ inputs.version }}
@@ -42,10 +47,12 @@ jobs:
       component: ${{ steps.meta.outputs.component }}
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
-      package-path: ${{ steps.meta.outputs.package-path }}
-      package-name: ${{ steps.meta.outputs.package-name }}
-      npm-package: ${{ steps.meta.outputs.npm-package }}
-      rust-target: ${{ steps.meta.outputs.rust-target }}
+      package_path: ${{ steps.meta.outputs.package_path }}
+      package_name: ${{ steps.meta.outputs.package_name }}
+      npm_package: ${{ steps.meta.outputs.npm_package }}
+      rust_target: ${{ steps.meta.outputs.rust_target }}
+      checkout_ref: ${{ steps.meta.outputs.checkout_ref }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
     steps:
       - name: 解析发布目标
         id: meta
@@ -53,13 +60,22 @@ jobs:
         env:
           DISPATCH_COMPONENT: ${{ inputs.component }}
           DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
             COMPONENT="$DISPATCH_COMPONENT"
             VERSION="$DISPATCH_VERSION"
             TAG="$COMPONENT-v$VERSION"
+            DRY_RUN="$DISPATCH_DRY_RUN"
+            if [[ "$DRY_RUN" == 'true' ]]; then
+              CHECKOUT_REF="$GITHUB_SHA"
+            else
+              CHECKOUT_REF="$TAG"
+            fi
           else
             TAG="$GITHUB_REF_NAME"
+            CHECKOUT_REF="$TAG"
+            DRY_RUN='false'
             case "$TAG" in
               sandbox-win32-arm64-v*) COMPONENT='sandbox-win32-arm64' ;;
               sandbox-win32-x64-v*) COMPONENT='sandbox-win32-x64' ;;
@@ -119,18 +135,20 @@ jobs:
           echo "component=$COMPONENT" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "package-path=$PACKAGE_PATH" >> "$GITHUB_OUTPUT"
-          echo "package-name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
-          echo "npm-package=$NPM_PACKAGE" >> "$GITHUB_OUTPUT"
-          echo "rust-target=$RUST_TARGET" >> "$GITHUB_OUTPUT"
+          echo "package_path=$PACKAGE_PATH" >> "$GITHUB_OUTPUT"
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "npm_package=$NPM_PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "rust_target=$RUST_TARGET" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.meta.outputs.tag }}
+          ref: ${{ steps.meta.outputs.checkout_ref }}
 
       - name: 校验 Tag 与包版本
         env:
-          PACKAGE_PATH: ${{ steps.meta.outputs.package-path }}
+          PACKAGE_PATH: ${{ steps.meta.outputs.package_path }}
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
           PACKAGE_VERSION=$(node -p "require('./$PACKAGE_PATH/package.json').version")
@@ -146,21 +164,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ needs.prepare.outputs.rust-target }}
+          targets: ${{ needs.prepare.outputs.rust_target }}
 
       - name: 构建 Windows Sandbox Helper
-        working-directory: ${{ needs.prepare.outputs.package-path }}
-        run: cargo build --release --locked --target ${{ needs.prepare.outputs.rust-target }}
+        working-directory: ${{ needs.prepare.outputs.package_path }}
+        run: cargo build --release --locked --target ${{ needs.prepare.outputs.rust_target }}
 
       - name: 准备 Windows Sandbox Helper
         shell: pwsh
         env:
-          PACKAGE_PATH: ${{ needs.prepare.outputs.package-path }}
-          RUST_TARGET: ${{ needs.prepare.outputs.rust-target }}
+          PACKAGE_PATH: ${{ needs.prepare.outputs.package_path }}
+          RUST_TARGET: ${{ needs.prepare.outputs.rust_target }}
         run: |
           New-Item -ItemType Directory -Force "$env:PACKAGE_PATH/bin"
           Copy-Item "$env:PACKAGE_PATH/target/$env:RUST_TARGET/release/karin-sandbox.exe" "$env:PACKAGE_PATH/bin/karin-sandbox.exe"
@@ -168,11 +186,16 @@ jobs:
       - name: Authenticode 签名
         shell: pwsh
         env:
-          PACKAGE_PATH: ${{ needs.prepare.outputs.package-path }}
+          PACKAGE_PATH: ${{ needs.prepare.outputs.package_path }}
+          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
           WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
           WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE)) {
+            if ($env:DRY_RUN -eq 'true') {
+              Write-Warning 'dry-run 未配置签名证书，跳过 Authenticode 签名'
+              exit 0
+            }
             throw '缺少 WINDOWS_SIGNING_CERTIFICATE，拒绝发布未签名 Sandbox Helper'
           }
           $certificatePath = Join-Path $env:RUNNER_TEMP 'karin-sandbox-signing.pfx'
@@ -191,7 +214,7 @@ jobs:
       - name: 生成 SHA256
         shell: pwsh
         env:
-          PACKAGE_PATH: ${{ needs.prepare.outputs.package-path }}
+          PACKAGE_PATH: ${{ needs.prepare.outputs.package_path }}
         run: |
           $hash = (Get-FileHash "$env:PACKAGE_PATH/bin/karin-sandbox.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content "$env:PACKAGE_PATH/bin/karin-sandbox.exe.sha256" "$hash  karin-sandbox.exe"
@@ -199,23 +222,25 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.prepare.outputs.component }}
-          path: ${{ needs.prepare.outputs.package-path }}/bin
+          path: ${{ needs.prepare.outputs.package_path }}/bin
           if-no-files-found: error
 
   publish:
     runs-on: ubuntu-latest
     needs: [prepare, build-sandbox]
     if: ${{ always() && needs.prepare.result == 'success' && (needs.build-sandbox.result == 'success' || needs.build-sandbox.result == 'skipped') }}
+    outputs:
+      npm_published: ${{ steps.npm_publish.outputs.published }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
 
       - uses: actions/download-artifact@v4
         if: ${{ startsWith(needs.prepare.outputs.component, 'sandbox-win32-') }}
         with:
           name: ${{ needs.prepare.outputs.component }}
-          path: ${{ needs.prepare.outputs.package-path }}/bin
+          path: ${{ needs.prepare.outputs.package_path }}/bin
 
       - uses: actions/setup-node@v4
         with:
@@ -235,7 +260,7 @@ jobs:
         shell: bash
         env:
           COMPONENT: ${{ needs.prepare.outputs.component }}
-          PACKAGE_PATH: ${{ needs.prepare.outputs.package-path }}
+          PACKAGE_PATH: ${{ needs.prepare.outputs.package_path }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           mkdir -p release-artifacts
@@ -272,22 +297,38 @@ jobs:
           test -n "$ASSET" && test -f "$ASSET"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
-      - name: 检查 npm 凭据
-        if: ${{ needs.prepare.outputs.npm-package == 'true' }}
+      - name: 上传打包产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.prepare.outputs.component }}-${{ needs.prepare.outputs.version }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+      - name: 检查 npm 发布能力
+        id: npm_auth
+        if: ${{ needs.prepare.outputs.npm_package == 'true' && needs.prepare.outputs.dry_run != 'true' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: test -n "$NODE_AUTH_TOKEN" || { echo '缺少 NPM_TOKEN Secret，无法发布 npm 包'; exit 1; }
+        run: |
+          if [[ -n "$NODE_AUTH_TOKEN" ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::warning::未配置 NPM_TOKEN，跳过 npm 发布；GitHub Release 仍会继续'
+          fi
 
       - name: 发布 npm 包
-        if: ${{ needs.prepare.outputs.npm-package == 'true' }}
+        id: npm_publish
+        if: ${{ needs.prepare.outputs.npm_package == 'true' && needs.prepare.outputs.dry_run != 'true' && steps.npm_auth.outputs.available == 'true' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          PACKAGE_NAME: ${{ needs.prepare.outputs.package-name }}
+          PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           PACKAGE_ASSET: ${{ steps.pack.outputs.asset }}
         run: |
           if npm view "$PACKAGE_NAME@$RELEASE_VERSION" version --silent 2>/dev/null | grep -Fxq "$RELEASE_VERSION"; then
             echo "$PACKAGE_NAME@$RELEASE_VERSION 已发布，跳过重复发布"
+            echo 'published=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [[ "$RELEASE_VERSION" == *-* ]]; then
@@ -297,15 +338,17 @@ jobs:
             NPM_TAG='latest'
           fi
           npm publish "$PACKAGE_ASSET" --access public --provenance --tag "$NPM_TAG"
+          echo 'published=true' >> "$GITHUB_OUTPUT"
 
       - name: 创建或更新当前仓库 Release
+        if: ${{ needs.prepare.outputs.dry_run != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           PACKAGE_ASSET: ${{ steps.pack.outputs.asset }}
           COMPONENT: ${{ needs.prepare.outputs.component }}
-          PACKAGE_PATH: ${{ needs.prepare.outputs.package-path }}
+          PACKAGE_PATH: ${{ needs.prepare.outputs.package_path }}
         run: |
           ASSETS=("$PACKAGE_ASSET")
           if [[ "$COMPONENT" == sandbox-win32-* ]]; then
@@ -318,12 +361,25 @@ jobs:
             gh release create "$RELEASE_TAG" "${ASSETS[@]}" --verify-tag --title "$RELEASE_TAG" --generate-notes
           fi
 
+      - name: 生成 dry-run 摘要
+        if: ${{ needs.prepare.outputs.dry_run == 'true' }}
+        env:
+          COMPONENT: ${{ needs.prepare.outputs.component }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          PACKAGE_ASSET: ${{ steps.pack.outputs.asset }}
+        run: |
+          echo '## Release dry-run 通过' >> "$GITHUB_STEP_SUMMARY"
+          echo "- 组件：\`$COMPONENT\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本：\`$RELEASE_VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 产物：\`$PACKAGE_ASSET\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '- 未创建 Tag、npm 包或 GitHub Release' >> "$GITHUB_STEP_SUMMARY"
+
   sync-registry:
     runs-on: ubuntu-latest
     needs: [prepare, publish]
-    if: ${{ needs.prepare.outputs.npm-package == 'true' }}
+    if: ${{ needs.publish.outputs.npm_published == 'true' }}
     steps:
       - name: 同步 npmmirror
         env:
-          PACKAGE_NAME: ${{ needs.prepare.outputs.package-name }}
+          PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
         run: curl --fail-with-body --retry 3 -X PUT "https://registry-direct.npmmirror.com/-/package/$PACKAGE_NAME/syncs"
